@@ -12,7 +12,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { RATING_CATEGORIES, useCountryRating, useUpsertCountryRating } from "@/lib/queries/ratings";
+import {
+  PERSONAL_RATING_OPTIONS,
+  RATING_CATEGORIES,
+  useCountryRating,
+  useUpsertCountryRating,
+} from "@/lib/queries/ratings";
 import type { Tables } from "@/lib/supabase/types";
 
 type RatingKey = (typeof RATING_CATEGORIES)[number]["key"];
@@ -54,7 +59,7 @@ export function CountryRatingsSection({ countryId }: CountryRatingsSectionProps)
   if (isLoading) return <Skeleton className="h-64 rounded-xl" />;
 
   return (
-    <section className="glass-card space-y-4 p-4">
+    <section className="section-card space-y-4 p-4">
       <div className="flex items-center justify-between">
         <h2 className="font-heading text-lg font-semibold">דירוג אישי</h2>
         {rating?.overall != null && (
@@ -77,7 +82,7 @@ export function CountryRatingsSection({ countryId }: CountryRatingsSectionProps)
                 <SelectValue placeholder="—" />
               </SelectTrigger>
               <SelectContent>
-                {[1, 2, 3, 4, 5].map((n) => (
+                {PERSONAL_RATING_OPTIONS.map((n) => (
                   <SelectItem key={n} value={n.toString()}>
                     {n}
                   </SelectItem>

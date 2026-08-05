@@ -6,6 +6,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { STATUS_LABELS } from "@/components/map/status-colors";
+import { CountryCitiesMap } from "@/components/country/country-cities-map";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,9 +15,11 @@ import { useCitiesByCountry, useUpsertCity } from "@/lib/queries/cities";
 
 interface CountryCitiesSectionProps {
   countryId: string;
+  countryName: string;
+  iso: string;
 }
 
-export function CountryCitiesSection({ countryId }: CountryCitiesSectionProps) {
+export function CountryCitiesSection({ countryId, countryName, iso }: CountryCitiesSectionProps) {
   const { data: cities, isLoading } = useCitiesByCountry(countryId);
   const upsertCity = useUpsertCity();
   const [showForm, setShowForm] = useState(false);
@@ -44,17 +47,19 @@ export function CountryCitiesSection({ countryId }: CountryCitiesSectionProps) {
   }
 
   return (
-    <section className="space-y-3">
+    <section className="flex min-h-full flex-col gap-3">
+      <CountryCitiesMap countryId={countryId} countryName={countryName} iso={iso} />
+
       <div className="flex items-center justify-between">
         <h2 className="font-heading text-lg font-semibold">ערים</h2>
         <Button variant="secondary" size="sm" className="gap-1.5" onClick={() => setShowForm((s) => !s)}>
           <Plus className="size-4" />
-          הוספת עיר
+          הוספת עיר ידנית
         </Button>
       </div>
 
       {showForm && (
-        <form onSubmit={handleAdd} className="glass-card flex flex-wrap items-end gap-2 p-3">
+        <form onSubmit={handleAdd} className="section-card flex flex-wrap items-end gap-2 p-3">
           <div className="min-w-[140px] flex-1 space-y-1">
             <label className="text-xs text-muted-foreground">שם</label>
             <Input value={name} onChange={(e) => setName(e.target.value)} required />
@@ -81,7 +86,7 @@ export function CountryCitiesSection({ countryId }: CountryCitiesSectionProps) {
             <li key={city.id}>
               <Link
                 href={`/cities/${city.id}`}
-                className="glass-card flex items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/50"
+                className="section-card flex items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/50"
               >
                 <span className="flex items-center gap-2 text-sm font-medium">
                   <MapPin className="size-4 text-primary" />
@@ -93,7 +98,7 @@ export function CountryCitiesSection({ countryId }: CountryCitiesSectionProps) {
           ))}
         </ul>
       ) : (
-        <div className="glass-card px-4 py-8 text-center text-sm text-muted-foreground">
+        <div className="section-card px-4 py-8 text-center text-sm text-muted-foreground">
           לא נוספו ערים עדיין.
         </div>
       )}

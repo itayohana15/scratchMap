@@ -1,11 +1,13 @@
 "use client";
 
-import { ArrowRight, Star } from "lucide-react";
+import { ArrowRight, Bot, Star } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { STATUS_LABELS } from "@/components/map/status-colors";
+import { CountryAiRecommendations } from "@/components/shared/country-ai-recommendations";
+import { CountryBanner } from "@/components/shared/country-banner";
 import { StatusSelect } from "@/components/shared/status-select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,15 +24,6 @@ interface CountryDetailPanelProps {
   iso3: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
-
-function countryFlag(iso: string) {
-  const normalizedIso = iso.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(normalizedIso)) return "🏳️";
-
-  return String.fromCodePoint(
-    ...Array.from(normalizedIso, (char) => 127397 + char.charCodeAt(0))
-  );
 }
 
 export function CountryDetailPanel({
@@ -71,15 +64,10 @@ export function CountryDetailPanel({
       <SheetContent side="right" className="w-full sm:max-w-md">
         {iso && (
           <>
-            <SheetHeader>
-              <div className="flex items-center gap-2">
-                <span className="text-2xl leading-none" aria-hidden="true">
-                  {countryFlag(iso)}
-                </span>
-                <SheetTitle className="text-2xl font-semibold">
-                  {country?.name ?? displayName}
-                </SheetTitle>
-              </div>
+            <CountryBanner isoA2={iso} countryName={country?.name ?? displayName} className="h-44 shrink-0" />
+
+            <SheetHeader className="pt-0">
+              <SheetTitle className="sr-only">{country?.name ?? displayName}</SheetTitle>
               {country && (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Badge variant="secondary">{STATUS_LABELS[country.status]}</Badge>
@@ -97,16 +85,28 @@ export function CountryDetailPanel({
               {isLoading ? (
                 <Skeleton className="h-32 rounded-xl" />
               ) : !country ? (
-                <div className="glass-card flex flex-col items-center gap-3 px-4 py-8 text-center">
-                  <p className="text-sm text-muted-foreground">
-                    {displayName} עדיין לא ברשימה שלך.
-                  </p>
-                  <StatusSelect
-                    value={pendingStatus}
-                    onChange={handleAddCountry}
-                    disabled={upsertCountry.isPending}
-                  />
-                </div>
+                <>
+                  <div className="glass-card flex flex-col items-center gap-3 px-4 py-8 text-center">
+                    <p className="text-sm text-muted-foreground">
+                      {displayName} עדיין לא ברשימה שלך.
+                    </p>
+                    <StatusSelect
+                      value={pendingStatus}
+                      onChange={handleAddCountry}
+                      disabled={upsertCountry.isPending}
+                    />
+                  </div>
+
+                  <Separator />
+
+                  <section>
+                    <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+                      <Bot className="size-3.5 text-primary" />
+                      המלצות AI
+                    </h3>
+                    <CountryAiRecommendations isoA2={iso} countryName={displayName} compact />
+                  </section>
+                </>
               ) : (
                 <>
                   <section>
@@ -145,6 +145,16 @@ export function CountryDetailPanel({
                         ? `${cities.length} ערים נוספו`
                         : "לא נוספו ערים עדיין."}
                     </p>
+                  </section>
+
+                  <Separator />
+
+                  <section>
+                    <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+                      <Bot className="size-3.5 text-primary" />
+                      המלצות AI
+                    </h3>
+                    <CountryAiRecommendations isoA2={iso} countryName={country.name} compact />
                   </section>
                 </>
               )}

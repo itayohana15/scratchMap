@@ -138,15 +138,15 @@ create table public.country_ratings (
   id              uuid primary key default gen_random_uuid(),
   user_id         uuid null,
   country_id      uuid not null references public.countries(id) on delete cascade,
-  nature          smallint null check (nature between 1 and 5),
-  food            smallint null check (food between 1 and 5),
-  transportation  smallint null check (transportation between 1 and 5),
-  safety          smallint null check (safety between 1 and 5),
-  cleanliness     smallint null check (cleanliness between 1 and 5),
-  value_for_money smallint null check (value_for_money between 1 and 5),
-  nightlife       smallint null check (nightlife between 1 and 5),
-  friendliness    smallint null check (friendliness between 1 and 5),
-  overall numeric(3,2) generated always as (
+  nature          smallint null check (nature between 1 and 10),
+  food            smallint null check (food between 1 and 10),
+  transportation  smallint null check (transportation between 1 and 10),
+  safety          smallint null check (safety between 1 and 10),
+  cleanliness     smallint null check (cleanliness between 1 and 10),
+  value_for_money smallint null check (value_for_money between 1 and 10),
+  nightlife       smallint null check (nightlife between 1 and 10),
+  friendliness    smallint null check (friendliness between 1 and 10),
+  overall numeric(4,2) generated always as (
     round(
       (
         coalesce(nature, 0) + coalesce(food, 0) + coalesce(transportation, 0) +

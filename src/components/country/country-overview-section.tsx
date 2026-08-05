@@ -12,9 +12,13 @@ import type { Status, Tables } from "@/lib/supabase/types";
 
 interface CountryOverviewSectionProps {
   country: Tables<"countries">;
+  showStatus?: boolean;
 }
 
-export function CountryOverviewSection({ country }: CountryOverviewSectionProps) {
+export function CountryOverviewSection({
+  country,
+  showStatus = true,
+}: CountryOverviewSectionProps) {
   const upsertCountry = useUpsertCountry();
   const [overview, setOverview] = useState(country.overview ?? "");
   const [favoriteMemory, setFavoriteMemory] = useState(country.favorite_memory ?? "");
@@ -40,20 +44,22 @@ export function CountryOverviewSection({ country }: CountryOverviewSectionProps)
 
   return (
     <div className="space-y-4">
-      <div className="glass-card flex flex-wrap items-center justify-between gap-3 p-4">
-        <div>
-          <p className="text-sm text-muted-foreground">סטטוס</p>
-          <StatusSelect value={country.status} onChange={handleStatusChange} disabled={upsertCountry.isPending} />
-        </div>
-        {country.rating != null && (
-          <div className="flex items-center gap-1.5 text-sm">
-            <Star className="size-4 fill-current text-amber-500" />
-            {country.rating.toFixed(1)}
+      {showStatus && (
+        <div className="section-card flex flex-wrap items-center justify-between gap-3 p-4">
+          <div>
+            <p className="text-sm text-muted-foreground">סטטוס</p>
+            <StatusSelect value={country.status} onChange={handleStatusChange} disabled={upsertCountry.isPending} />
           </div>
-        )}
-      </div>
+          {country.rating != null && (
+            <div className="flex items-center gap-1.5 text-sm">
+              <Star className="size-4 fill-current text-amber-500" />
+              {country.rating.toFixed(1)}
+            </div>
+          )}
+        </div>
+      )}
 
-      <div className="glass-card space-y-3 p-4">
+      <div className="section-card space-y-3 p-4">
         <div className="space-y-1.5">
           <label className="text-sm font-medium">סקירה כללית</label>
           <Textarea

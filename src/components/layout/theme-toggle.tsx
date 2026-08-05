@@ -13,20 +13,20 @@ export function ThemeToggle() {
   useEffect(() => setMounted(true), []);
 
   if (!mounted) {
-    return <Button variant="ghost" size="icon" aria-hidden className="opacity-0" />;
+    return <Button variant="ghost" size="icon-lg" aria-hidden className="opacity-0" />;
   }
 
   return (
     <Button
       variant="ghost"
-      size="icon"
+      size="icon-lg"
       aria-label="החלף ערכת נושא"
       onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
     >
       {resolvedTheme === "dark" ? (
-        <Sun className="size-4" />
+        <Sun className="size-5" />
       ) : (
-        <Moon className="size-4" />
+        <Moon className="size-5" />
       )}
     </Button>
   );

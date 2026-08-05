@@ -36,7 +36,7 @@ export function CityMarkers({ map, cities, isDark, onCityClick }: CityMarkersPro
         el.type = "button";
         el.setAttribute("aria-label", city.name);
         el.className =
-          "size-4 rounded-full border-2 border-white shadow-lg shadow-black/30 transition-transform hover:scale-125 dark:border-neutral-900";
+          "size-4 rounded-full border-2 border-white shadow-lg shadow-black/30 dark:border-neutral-900";
         el.style.backgroundColor = statusColor(city.status, isDark);
         el.style.cursor = "pointer";
         el.style.animation = `city-marker-pop 0.35s ease-out ${index * 40}ms backwards`;

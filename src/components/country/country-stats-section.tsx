@@ -33,7 +33,7 @@ export function CountryStatsSection({ countryId }: CountryStatsSectionProps) {
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
       {tiles.map((tile) => (
-        <div key={tile.label} className="glass-card p-4">
+        <div key={tile.label} className="section-card p-4">
           <p className="text-2xl font-semibold">{tile.value}</p>
           <p className="text-xs text-muted-foreground">{tile.label}</p>
         </div>

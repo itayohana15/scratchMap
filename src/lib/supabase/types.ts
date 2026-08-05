@@ -312,6 +312,26 @@ export interface Database {
           },
         ];
       };
+      ai_recommendations: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          iso_a2: string;
+          content: unknown;
+          model: string;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["ai_recommendations"]["Row"],
+            "id" | "user_id" | "created_at" | "updated_at"
+          >
+        > &
+          Pick<Database["public"]["Tables"]["ai_recommendations"]["Row"], "iso_a2" | "content" | "model">;
+        Update: Partial<Database["public"]["Tables"]["ai_recommendations"]["Insert"]>;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

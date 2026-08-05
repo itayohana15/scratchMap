@@ -146,6 +146,14 @@
   @apply rounded-3xl border border-white/20 bg-white/70 shadow-2xl shadow-black/10 backdrop-blur-2xl dark:border-white/10 dark:bg-neutral-900/60 dark:shadow-black/30;
 }
 
+/* Solid "modern card" used across the country page redesign: rounded,
+   bordered, soft-shadow, white/solid background with a gentle hover lift —
+   distinct from glass-card's frosted look which stays reserved for surfaces
+   that sit directly on top of photos elsewhere in the app. */
+@utility section-card {
+  @apply rounded-[20px] border border-border/60 bg-card shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_-12px_rgba(0,0,0,0.12)] transition-all duration-300 ease-out hover:-translate-y-0.5 hover:shadow-[0_4px_12px_rgba(0,0,0,0.06),0_16px_40px_-16px_rgba(0,0,0,0.18)] dark:border-white/10 dark:bg-neutral-900/70 dark:shadow-black/40;
+}
+
 @keyframes city-marker-pop {
   from {
     opacity: 0;

@@ -27,7 +27,7 @@ export function CountryNotesSection({ country }: CountryNotesSectionProps) {
   }
 
   return (
-    <section className="glass-card space-y-3 p-4">
+    <section className="section-card space-y-3 p-4">
       <h2 className="font-heading text-lg font-semibold">הערות אישיות</h2>
       <Textarea
         value={notes}

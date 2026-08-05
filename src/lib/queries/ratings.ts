@@ -20,6 +20,8 @@ export const RATING_CATEGORIES = [
   { key: "friendliness", label: "ידידותיות" },
 ] as const;
 
+export const PERSONAL_RATING_OPTIONS = Array.from({ length: 10 }, (_, index) => index + 1);
+
 export function useCountryRating(countryId: string | undefined) {
   const supabase = createClient();
 
