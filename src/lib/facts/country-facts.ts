@@ -3,11 +3,14 @@
 import { useQuery } from "@tanstack/react-query";
 
 export interface CountryFacts {
+  englishName: string;
   capital: string | null;
   population: number | null;
   area: number | null;
   continent: string | null;
   currency: string | null;
+  currencyCode: string | null;
+  currencySymbol: string | null;
   languages: string[];
 }
 

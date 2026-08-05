@@ -1,12 +1,12 @@
 "use client";
 
-import { Compass } from "lucide-react";
+import { Compass, Settings } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { MobileNav } from "@/components/layout/mobile-nav";
 import { navLinks } from "@/components/layout/nav-links";
-import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export function Navbar() {
@@ -47,7 +47,16 @@ export function Navbar() {
             })}
           </nav>
         </div>
-        <ThemeToggle />
+        <Button
+          variant="ghost"
+          size="icon-lg"
+          aria-label="הגדרות"
+          nativeButton={false}
+          className={cn(pathname.startsWith("/settings") && "bg-primary/10 text-primary")}
+          render={<Link href="/settings" />}
+        >
+          <Settings className="size-5" />
+        </Button>
       </div>
     </header>
   );

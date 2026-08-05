@@ -13,6 +13,9 @@ interface CountryBannerProps {
   className?: string;
   showCaption?: boolean;
   overlay?: ReactNode;
+  showFlagOverlay?: boolean;
+  flagOverlayClassName?: string;
+  scrimClassName?: string;
 }
 
 export function CountryBanner({
@@ -21,6 +24,9 @@ export function CountryBanner({
   className,
   showCaption = true,
   overlay,
+  showFlagOverlay = true,
+  flagOverlayClassName,
+  scrimClassName,
 }: CountryBannerProps) {
   const { data, isLoading, isError } = useCountryPhoto(isoA2);
   const [photoLoaded, setPhotoLoaded] = useState(false);
@@ -49,16 +55,23 @@ export function CountryBanner({
         real color crossfade (the flag's own pixels dissolving into the
         photo) rather than a hard cut against empty transparent space.
       */}
-      <div
-        className="absolute inset-y-0 right-0 h-full w-[45%] bg-cover bg-center"
-        style={{
-          backgroundImage: `url(${flagUrl})`,
-          maskImage: "linear-gradient(to left, black 0%, black 60%, transparent 100%)",
-          WebkitMaskImage: "linear-gradient(to left, black 0%, black 60%, transparent 100%)",
-        }}
-      />
+      {showFlagOverlay && (
+        <div
+          className={cn("absolute inset-y-0 right-0 h-full w-[45%] bg-cover bg-center", flagOverlayClassName)}
+          style={{
+            backgroundImage: `url(${flagUrl})`,
+            maskImage: "linear-gradient(to left, black 0%, black 60%, transparent 100%)",
+            WebkitMaskImage: "linear-gradient(to left, black 0%, black 60%, transparent 100%)",
+          }}
+        />
+      )}
 
-      <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/5 to-transparent" />
+      <div
+        className={cn(
+          "absolute inset-0 bg-gradient-to-t from-black/75 via-black/5 to-transparent",
+          scrimClassName
+        )}
+      />
 
       {overlay && <div className="absolute inset-0 z-10">{overlay}</div>}
 

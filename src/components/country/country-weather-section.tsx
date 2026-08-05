@@ -111,6 +111,10 @@ export function CountryWeatherSection({ lat, lon }: CountryWeatherSectionProps) 
           </div>
         ))}
       </div>
+
+      <p className="text-xs text-muted-foreground">
+        מקור: Open-Meteo · נמדד ב-{format(new Date(data.current.observedAt), "d בMMM, HH:mm", { locale: he })}
+      </p>
     </div>
   );
 }

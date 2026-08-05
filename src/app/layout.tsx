@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { Geist_Mono, Rubik } from "next/font/google";
 
 import { Navbar } from "@/components/layout/navbar";
 import { Toaster } from "@/components/ui/sonner";
@@ -8,16 +7,6 @@ import { QueryProvider } from "@/providers/query-provider";
 import { ThemeProvider } from "@/providers/theme-provider";
 
 import "./globals.css";
-
-const rubik = Rubik({
-  variable: "--font-geist-sans",
-  subsets: ["hebrew", "latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   title: {
@@ -34,9 +23,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="he" dir="rtl" suppressHydrationWarning>
-      <body
-        className={`${rubik.variable} ${geistMono.variable} min-h-screen bg-background font-sans antialiased`}
-      >
+      <body className="min-h-screen bg-background font-sans antialiased">
         <ThemeProvider
           attribute="class"
           defaultTheme="system"

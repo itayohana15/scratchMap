@@ -31,11 +31,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ iso
   }
 
   return NextResponse.json({
+    englishName: raw.name,
     capital: raw.capital[0] ?? null,
     population: raw.population,
     area: raw.area,
     continent: CONTINENT_LABELS_HE[raw.region] ?? raw.region,
     currency: raw.currencies[0] ? `${raw.currencies[0].name} (${raw.currencies[0].symbol})` : null,
+    currencyCode: raw.currencies[0]?.code ?? null,
+    currencySymbol: raw.currencies[0]?.symbol ?? null,
     languages: raw.languages,
   });
 }

@@ -12,7 +12,8 @@ export type TripWorkspaceTab =
   | "journal"
   | "photos"
   | "summary"
-  | "practical";
+  | "practical"
+  | "currency";
 
 export type RecommendationCategory =
   | "attraction"
@@ -74,6 +75,12 @@ export interface TripRecommendation {
   lat: number | null;
   lon: number | null;
   source: "saved" | "manual" | "api" | "database" | "ai";
+  // Populated only when a real source provides them (e.g. an OSM wikipedia
+  // tag) — never guessed, so most recommendations will leave these null.
+  wikipediaUrl: string | null;
+  website: string | null;
+  wheelchairAccessible: boolean | null;
+  isFree: boolean | null;
 }
 
 export interface TripItineraryItem {
@@ -105,6 +112,10 @@ export interface TripItineraryItem {
   alternativeSuggestion: string;
   bookingWarning: string;
   spontaneous: boolean;
+  // Personal travel log — always user-entered, never inferred.
+  personalRating: number | null;
+  wouldVisitAgain: boolean | null;
+  actualDurationMinutes: number | null;
 }
 
 export interface TripItineraryDay {
@@ -287,6 +298,7 @@ export const WORKSPACE_TAB_LABELS: Record<TripWorkspaceTab, string> = {
   photos: "תמונות",
   summary: "סיכום",
   practical: "מידע שימושי",
+  currency: "המרת מטבע",
 };
 
 export const RECOMMENDATION_CATEGORY_LABELS: Record<RecommendationCategory, string> = {
@@ -349,6 +361,7 @@ export const DEFAULT_TAB_ORDER: TripWorkspaceTab[] = [
   "photos",
   "summary",
   "practical",
+  "currency",
 ];
 
 const PACE_ACTIVITY_LIMITS: Record<TripPreferences["tripPace"], number> = {
@@ -380,6 +393,7 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
       "photos",
       "summary",
       "practical",
+      "currency",
     ];
   }
 
@@ -395,6 +409,7 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
       "map",
       "itinerary",
       "practical",
+      "currency",
     ];
   }
 
@@ -452,6 +467,9 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     alternativeSuggestion: "",
     bookingWarning: "",
     spontaneous: false,
+    personalRating: null,
+    wouldVisitAgain: null,
+    actualDurationMinutes: null,
   };
 }
 
@@ -575,6 +593,34 @@ export function normalizeWorkspace(
     itineraryDays: days,
     journalEntries: ensureJournalEntriesForDays(workspace.journalEntries ?? [], days),
   };
+}
+
+export interface ItineraryPlacement {
+  day: TripItineraryDay;
+  dayIndex: number;
+  item: TripItineraryItem;
+  itemIndex: number;
+}
+
+// Finds where a recommendation already lives in the itinerary, if anywhere.
+// Matches by recommendationId first; falls back to name+coordinates since
+// API-sourced recommendation ids aren't guaranteed stable across requests.
+export function findItineraryPlacement(
+  workspace: CountryTripWorkspaceState,
+  recommendation: Pick<TripRecommendation, "id" | "name" | "lat" | "lon">
+): ItineraryPlacement | null {
+  for (let dayIndex = 0; dayIndex < workspace.itineraryDays.length; dayIndex += 1) {
+    const day = workspace.itineraryDays[dayIndex];
+    const itemIndex = day.items.findIndex(
+      (item) =>
+        item.recommendationId === recommendation.id ||
+        (item.name === recommendation.name && item.lat === recommendation.lat && item.lon === recommendation.lon)
+    );
+    if (itemIndex !== -1) {
+      return { day, dayIndex, item: day.items[itemIndex], itemIndex };
+    }
+  }
+  return null;
 }
 
 export function buildMapLink(name: string, lat: number | null, lon: number | null) {

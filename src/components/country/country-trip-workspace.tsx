@@ -6,11 +6,12 @@ import type { Feature, MultiPolygon, Polygon } from "geojson";
 import {
   BedDouble,
   Bot,
+  CalendarDays,
   CircleCheck,
-  Clock3,
   DollarSign,
   Filter,
   ImagePlus,
+  MapPin,
   NotebookPen,
   Plus,
   Route,
@@ -25,10 +26,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { generateCountryAiItinerary } from "@/lib/ai/country-itinerary";
+import { AttractionModal } from "@/components/country/attraction-modal";
 import { CountryCitiesSection } from "@/components/country/country-cities-section";
+import { CountryCurrencyConverter } from "@/components/country/country-currency-converter";
 import { CountryNotesSection } from "@/components/country/country-notes-section";
 import { CountryOverviewSection } from "@/components/country/country-overview-section";
 import { CountryQuickFacts } from "@/components/country/country-quick-facts";
+import { CountrySafetyInfo } from "@/components/country/country-safety-info";
 import { CountryRatingsSection } from "@/components/country/country-ratings-section";
 import { CountryStatsSection } from "@/components/country/country-stats-section";
 import { CountryWeatherSection } from "@/components/country/country-weather-section";
@@ -39,6 +43,13 @@ import { CountryAiRecommendations } from "@/components/shared/country-ai-recomme
 import { PlacesSection } from "@/components/shared/places-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
@@ -80,7 +91,7 @@ import {
   type TripWorkspaceTab,
 } from "@/lib/trip-workspace";
 import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
-import { useRecommendedPlaces } from "@/lib/places/country-places";
+import { fetchCategoryRecommendations, useCategoryRecommendations } from "@/lib/places/country-places";
 import { cn } from "@/lib/utils";
 
 type WorkspaceController = ReturnType<typeof useCountryTripWorkspace>;
@@ -96,21 +107,70 @@ interface CountryTripWorkspaceContentProps {
 }
 
 const ALL_CATEGORIES = Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[];
+const API_RECOMMENDATION_COUNT = 10;
 const SLOT_OPTIONS: DayPart[] = ["morning", "lunch", "afternoon", "dinner", "evening", "night"];
 
-function guessRecommendationCategory(name: string) {
-  const value = name.toLowerCase();
-  if (value.includes("museum")) return "museum";
-  if (value.includes("park") || value.includes("beach") || value.includes("desert") || value.includes("mount")) {
-    return "nature";
-  }
-  if (value.includes("mall") || value.includes("market")) return "shopping";
-  if (value.includes("night") || value.includes("bar")) return "nightlife";
-  return "attraction";
+function createEmptyRecommendationDraft(): TripRecommendation {
+  return {
+    id: createId("saved-rec"),
+    name: "",
+    category: "attraction",
+    location: "",
+    shortDescription: "",
+    estimatedDurationMinutes: 120,
+    approximatePrice: null,
+    openingHours: "",
+    recommendedTimeOfDay: "morning",
+    reservationRequired: false,
+    mapLink: "",
+    imageUrl: "",
+    imageQuery: "",
+    lat: null,
+    lon: null,
+    source: "manual",
+    wikipediaUrl: null,
+    website: null,
+    wheelchairAccessible: null,
+    isFree: null,
+  };
 }
 
-function RecommendationImage({ recommendation }: { recommendation: TripRecommendation }) {
+function getRecommendationPriceLabel(category: RecommendationCategory) {
+  switch (category) {
+    case "restaurant":
+    case "cafe":
+      return "עלות ממוצעת";
+    case "attraction":
+    case "museum":
+    case "nature":
+    case "family":
+    case "hidden_gem":
+    case "day_trip":
+    case "seasonal_event":
+      return "מחיר כרטיס";
+    case "hotel":
+      return "מחיר ללילה";
+    case "transportation":
+      return "עלות נסיעה";
+    default:
+      return "עלות משוערת";
+  }
+}
+
+export function RecommendationImage({
+  recommendation,
+  className,
+  imageClassName,
+}: {
+  recommendation: TripRecommendation;
+  className?: string;
+  imageClassName?: string;
+}) {
   const [src, setSrc] = useState(recommendation.imageUrl);
+
+  useEffect(() => {
+    setSrc(recommendation.imageUrl);
+  }, [recommendation.id, recommendation.imageUrl]);
 
   useEffect(() => {
     if (src || !recommendation.imageQuery) return;
@@ -130,16 +190,24 @@ function RecommendationImage({ recommendation }: { recommendation: TripRecommend
   }, [recommendation.imageQuery, src]);
 
   return src ? (
-    <div className="h-32 w-full overflow-hidden rounded-xl shadow-sm">
+    <div className={cn("h-32 w-full overflow-hidden rounded-xl shadow-sm", className)}>
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={src}
-        alt=""
-        className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-105"
+        alt={recommendation.name}
+        className={cn(
+          "h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-105",
+          imageClassName
+        )}
       />
     </div>
   ) : (
-    <div className="flex h-32 w-full items-center justify-center rounded-xl bg-gradient-to-br from-primary/15 via-primary/8 to-transparent text-xs text-muted-foreground">
+    <div
+      className={cn(
+        "flex h-32 w-full items-center justify-center rounded-xl bg-gradient-to-br from-primary/15 via-primary/8 to-transparent text-xs text-muted-foreground",
+        className
+      )}
+    >
       תמונה תיטען אוטומטית
     </div>
   );
@@ -195,44 +263,27 @@ function toRecommendationFromPlace(
     lat: place.latitude,
     lon: place.longitude,
     source: "database",
+    wikipediaUrl: null,
+    website: null,
+    wheelchairAccessible: null,
+    isFree: null,
   };
 }
 
 function buildLiveRecommendations(
   workspace: CountryTripWorkspaceState,
-  recommendedPlaces: { label: string; name: string; lat: number; lon: number }[] | undefined,
+  apiRecommendations: TripRecommendation[] | undefined,
   attractionPlaces: Tables<"places">[] | undefined,
   restaurantPlaces: Tables<"places">[] | undefined,
-  hotelPlaces: Tables<"places">[] | undefined,
-  countryName: string
+  hotelPlaces: Tables<"places">[] | undefined
 ) {
-  const fromApi: TripRecommendation[] =
-    recommendedPlaces?.map((place, index) => ({
-      id: `api-${index}-${place.name}`,
-      name: place.name,
-      category: guessRecommendationCategory(place.name),
-      location: countryName,
-      shortDescription: place.label,
-      estimatedDurationMinutes: 120,
-      approximatePrice: null,
-      openingHours: "",
-      recommendedTimeOfDay: "morning",
-      reservationRequired: false,
-      mapLink: buildMapLink(place.name, place.lat, place.lon),
-      imageUrl: "",
-      imageQuery: place.name,
-      lat: place.lat,
-      lon: place.lon,
-      source: "api",
-    })) ?? [];
-
   const fromDb = [
     ...(attractionPlaces ?? []).map((place) => toRecommendationFromPlace(place, "attraction")),
     ...(restaurantPlaces ?? []).map((place) => toRecommendationFromPlace(place, "restaurant")),
     ...(hotelPlaces ?? []).map((place) => toRecommendationFromPlace(place, "hotel")),
   ];
 
-  const merged = [...workspace.recommendations, ...fromApi, ...fromDb];
+  const merged = [...workspace.recommendations, ...(apiRecommendations ?? []), ...fromDb];
   const seen = new Map<string, TripRecommendation>();
   for (const recommendation of merged) {
     const key = `${recommendation.name.toLowerCase()}::${recommendation.location.toLowerCase()}`;
@@ -795,46 +846,50 @@ export function CountryTripWorkspaceContent({
   workspaceController,
 }: CountryTripWorkspaceContentProps) {
   const { workspace, actions, hydrated } = workspaceController;
-  const { data: recommendedPlaces } = useRecommendedPlaces(iso);
   const { data: attractionPlaces } = usePlacesForCountry(country.id, "attraction");
   const { data: restaurantPlaces } = usePlacesForCountry(country.id, "restaurant");
   const { data: hotelPlaces } = usePlacesForCountry(country.id, "hotel");
+  const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
+  const [activeRecommendationCategory, setActiveRecommendationCategory] =
+    useState<RecommendationCategory>("attraction");
+  const [apiRecommendationsByCategory, setApiRecommendationsByCategory] = useState<
+    Partial<Record<RecommendationCategory, TripRecommendation[]>>
+  >({});
+  const [shouldWarmAllRecommendationCategories, setShouldWarmAllRecommendationCategories] =
+    useState(activeTab === "map" || activeTab === "recommendations");
+  const {
+    data: currentCategoryResult,
+    isLoading: currentCategoryLoading,
+    isFetching: currentCategoryFetching,
+  } = useCategoryRecommendations(
+    iso,
+    activeRecommendationCategory,
+    API_RECOMMENDATION_COUNT,
+    workspace.preferences.startDate,
+    workspace.preferences.endDate
+  );
+  const currentCategoryRecommendations = currentCategoryResult?.places;
+  const currentCategoryMeta = currentCategoryResult?.meta;
 
   const liveRecommendations = useMemo(
     () =>
       buildLiveRecommendations(
         workspace,
-        recommendedPlaces,
+        Object.values(apiRecommendationsByCategory).flat(),
         attractionPlaces,
         restaurantPlaces,
-        hotelPlaces,
-        country.name
+        hotelPlaces
       ),
-    [attractionPlaces, country.name, hotelPlaces, recommendedPlaces, restaurantPlaces, workspace]
+    [apiRecommendationsByCategory, attractionPlaces, hotelPlaces, restaurantPlaces, workspace]
   );
 
-  const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
-  const [activeRecommendationCategory, setActiveRecommendationCategory] =
-    useState<RecommendationCategory>("attraction");
   const [mapFilters, setMapFilters] = useState<RecommendationCategory[]>(ALL_CATEGORIES);
-  const [recommendationDraft, setRecommendationDraft] = useState<TripRecommendation>({
-    id: createId("saved-rec"),
-    name: "",
-    category: "attraction",
-    location: "",
-    shortDescription: "",
-    estimatedDurationMinutes: 120,
-    approximatePrice: null,
-    openingHours: "",
-    recommendedTimeOfDay: "morning",
-    reservationRequired: false,
-    mapLink: "",
-    imageUrl: "",
-    imageQuery: "",
-    lat: null,
-    lon: null,
-    source: "manual",
-  });
+  const [selectedRecommendation, setSelectedRecommendation] = useState<TripRecommendation | null>(
+    null
+  );
+  const [recommendationDialogOpen, setRecommendationDialogOpen] = useState(false);
+  const [recommendationDraft, setRecommendationDraft] =
+    useState<TripRecommendation>(createEmptyRecommendationDraft);
 
   useEffect(() => {
     if (!workspace.itineraryDays.some((day) => day.id === selectedDayId)) {
@@ -842,12 +897,96 @@ export function CountryTripWorkspaceContent({
     }
   }, [selectedDayId, workspace.itineraryDays]);
 
+  useEffect(() => {
+    if (activeTab === "map" || activeTab === "recommendations") {
+      setShouldWarmAllRecommendationCategories(true);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    setApiRecommendationsByCategory({});
+  }, [iso, workspace.preferences.endDate, workspace.preferences.startDate]);
+
+  useEffect(() => {
+    if (!currentCategoryRecommendations) return;
+    setApiRecommendationsByCategory((current) => ({
+      ...current,
+      [activeRecommendationCategory]: currentCategoryRecommendations,
+    }));
+  }, [activeRecommendationCategory, currentCategoryRecommendations]);
+
+  useEffect(() => {
+    if (!shouldWarmAllRecommendationCategories || !iso) return;
+
+    const categoriesToWarm = ALL_CATEGORIES.filter(
+      (category) =>
+        category !== activeRecommendationCategory && !apiRecommendationsByCategory[category]
+    );
+    if (categoriesToWarm.length === 0) return;
+
+    let cancelled = false;
+
+    Promise.allSettled(
+      categoriesToWarm.map(async (category) => {
+        const result = await fetchCategoryRecommendations(
+          iso,
+          category,
+          API_RECOMMENDATION_COUNT,
+          workspace.preferences.startDate || undefined,
+          workspace.preferences.endDate || undefined
+        );
+        return [category, result.places] as const;
+      })
+    ).then((results) => {
+      if (cancelled) return;
+
+      setApiRecommendationsByCategory((current) => {
+        let changed = false;
+        const next = { ...current };
+
+        for (const result of results) {
+          if (result.status !== "fulfilled") continue;
+          const [category, recommendations] = result.value;
+          if (next[category] !== recommendations) {
+            next[category] = recommendations;
+            changed = true;
+          }
+        }
+
+        return changed ? next : current;
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeRecommendationCategory,
+    apiRecommendationsByCategory,
+    iso,
+    shouldWarmAllRecommendationCategories,
+    workspace.preferences.endDate,
+    workspace.preferences.startDate,
+  ]);
+
   const todayDay = findTodayDay(workspace);
   const nextPlannedActivity = nextActivity(todayDay);
-  const selectedDay = workspace.itineraryDays.find((day) => day.id === selectedDayId) ?? workspace.itineraryDays[0];
+  const selectedDay =
+    workspace.itineraryDays.find((day) => day.id === selectedDayId) ?? workspace.itineraryDays[0];
   const filteredRecommendations = liveRecommendations.filter(
     (recommendation) => recommendation.category === activeRecommendationCategory
   );
+  const activeRecommendationDetails = useMemo(() => {
+    if (!selectedRecommendation) return null;
+    return (
+      liveRecommendations.find(
+        (recommendation) =>
+          recommendation.id === selectedRecommendation.id ||
+          (recommendation.name === selectedRecommendation.name &&
+            recommendation.location === selectedRecommendation.location)
+      ) ?? selectedRecommendation
+    );
+  }, [liveRecommendations, selectedRecommendation]);
   const budgetComparison = buildTripComparison(workspace);
   const tripStatistics = buildTripStatistics(workspace);
   const activeTabOrder = getTabOrderForStatus(workspace.tripStatus);
@@ -898,24 +1037,8 @@ export function CountryTripWorkspaceContent({
         ),
     };
     actions.addOrUpdateRecommendation(normalized);
-    setRecommendationDraft({
-      id: createId("saved-rec"),
-      name: "",
-      category: "attraction",
-      location: "",
-      shortDescription: "",
-      estimatedDurationMinutes: 120,
-      approximatePrice: null,
-      openingHours: "",
-      recommendedTimeOfDay: "morning",
-      reservationRequired: false,
-      mapLink: "",
-      imageUrl: "",
-      imageQuery: "",
-      lat: null,
-      lon: null,
-      source: "manual",
-    });
+    setRecommendationDraft(createEmptyRecommendationDraft());
+    setRecommendationDialogOpen(false);
     toast.success("המלצה נשמרה ל-workspace");
   }
 
@@ -1813,9 +1936,46 @@ export function CountryTripWorkspaceContent({
       >
         <SectionShell
           title="Recommendations"
-          description="אטרקציות, אוכל, טבע, שופינג, family, hidden gems וטיולי יום עם הוספה מהירה למסלול."
+          description="מקומות אמיתיים שמגיעים ממקורות מפה פתוחים, ובמקומות שחסר בהם מידע אנחנו משלימים עם חיפוש חכם על שמות אמיתיים וממופים."
         >
           <div className="space-y-4">
+            <div className="section-card flex flex-col gap-4 p-4 xl:flex-row xl:items-center xl:justify-between">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <CalendarDays className="size-4 text-primary" />
+                  <p className="text-sm font-medium">תאריכי הטיול</p>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  התאריכים עוזרים גם לבניית המסלול וגם להתאמת ההמלצות לעונה, במיוחד כשמקור המפה הפתוח מחזיר מעט מדי תוצאות.
+                </p>
+              </div>
+              <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Input
+                    type="date"
+                    value={workspace.preferences.startDate}
+                    onChange={(event) =>
+                      actions.updatePreferences({ startDate: event.target.value })
+                    }
+                  />
+                  <Input
+                    type="date"
+                    value={workspace.preferences.endDate}
+                    onChange={(event) =>
+                      actions.updatePreferences({ endDate: event.target.value })
+                    }
+                  />
+                </div>
+                <Button
+                  className="gap-1.5 lg:min-w-40"
+                  onClick={() => setRecommendationDialogOpen(true)}
+                >
+                  <Plus className="size-4" />
+                  הוספת המלצה
+                </Button>
+              </div>
+            </div>
+
             <div className="flex flex-wrap gap-2">
               {ALL_CATEGORIES.map((category) => (
                 <Button
@@ -1825,277 +1985,433 @@ export function CountryTripWorkspaceContent({
                   onClick={() => setActiveRecommendationCategory(category)}
                 >
                   {RECOMMENDATION_CATEGORY_LABELS[category]}
+                  {apiRecommendationsByCategory[category] ? ` · ${apiRecommendationsByCategory[category]!.length}` : ""}
                 </Button>
               ))}
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_360px]">
-              <div className="space-y-4">
-                {filteredRecommendations.length > 0 ? (
-                  <div className="grid gap-4 md:grid-cols-2">
-                    {filteredRecommendations.map((recommendation) => (
-                      <article key={recommendation.id} className="section-card group overflow-hidden p-4">
-                        <RecommendationImage recommendation={recommendation} />
-                        <div className="mt-4 space-y-3">
-                          <div className="flex flex-wrap items-start justify-between gap-2">
-                            <div>
-                              <p className="font-heading text-lg font-semibold">
-                                {recommendation.name}
-                              </p>
-                              <p className="text-xs text-muted-foreground">
-                                {RECOMMENDATION_CATEGORY_LABELS[recommendation.category]}{" "}
-                                {recommendation.location ? `· ${recommendation.location}` : ""}
-                              </p>
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
+                <span>
+                  {RECOMMENDATION_CATEGORY_LABELS[activeRecommendationCategory]}:{" "}
+                  {filteredRecommendations.length} תוצאות פעילות
+                </span>
+                {currentCategoryMeta?.available && currentCategoryMeta.source && (
+                  <span className="text-xs">
+                    מקור: {currentCategoryMeta.source} · עודכן{" "}
+                    {new Date(currentCategoryMeta.retrievedAt).toLocaleDateString("he-IL")}
+                  </span>
+                )}
+              </div>
+
+              {currentCategoryLoading || currentCategoryFetching ? (
+                <div className="grid gap-4 xl:grid-cols-2">
+                  {Array.from({ length: 4 }).map((_, index) => (
+                    <Skeleton key={index} className="h-[28rem] rounded-[2rem]" />
+                  ))}
+                </div>
+              ) : filteredRecommendations.length > 0 ? (
+                <div className="grid gap-4 xl:grid-cols-2">
+                  {filteredRecommendations.map((recommendation) => (
+                    <article
+                      key={recommendation.id}
+                      role="button"
+                      tabIndex={0}
+                      className="section-card group flex min-h-[31rem] cursor-pointer flex-col overflow-hidden p-5 transition-transform duration-200 hover:-translate-y-1 hover:shadow-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                      onClick={() => setSelectedRecommendation(recommendation)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelectedRecommendation(recommendation);
+                        }
+                      }}
+                    >
+                      <RecommendationImage
+                        recommendation={recommendation}
+                        className="h-40 rounded-[1.5rem]"
+                      />
+                      <div className="mt-4 flex flex-1 flex-col space-y-4">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="space-y-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge>{RECOMMENDATION_CATEGORY_LABELS[recommendation.category]}</Badge>
+                              <Badge variant="outline">
+                                {recommendation.reservationRequired ? "דורש הזמנה" : "גמיש"}
+                              </Badge>
+                              <Badge variant="secondary">
+                                {recommendation.recommendedTimeOfDay === "any"
+                                  ? "כל היום"
+                                  : DAY_PART_LABELS[recommendation.recommendedTimeOfDay]}
+                              </Badge>
                             </div>
-                            <Badge variant="outline">
-                              {recommendation.reservationRequired ? "דורש הזמנה" : "גמיש"}
-                            </Badge>
-                          </div>
-                          <p className="text-sm text-muted-foreground">
-                            {recommendation.shortDescription || "אין תיאור עדיין."}
-                          </p>
-                          <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
-                            <span>
-                              <Clock3 className="me-1 inline size-3.5" />
-                              {recommendation.estimatedDurationMinutes
-                                ? `${recommendation.estimatedDurationMinutes} דק'`
-                                : "משך לא הוגדר"}
-                            </span>
-                            <span>
-                              <DollarSign className="me-1 inline size-3.5" />
-                              {formatCurrency(recommendation.approximatePrice)}
-                            </span>
-                            <span>מומלץ: {recommendation.recommendedTimeOfDay === "any" ? "כל היום" : DAY_PART_LABELS[recommendation.recommendedTimeOfDay]}</span>
-                            <span>{recommendation.openingHours || "שעות פתיחה לא הוגדרו"}</span>
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            <Button
-                              size="sm"
-                              className="gap-1.5"
-                              onClick={() =>
-                                actions.addRecommendationToDay(selectedDayId, recommendation)
-                              }
-                            >
-                              <Plus className="size-4" />
-                              הוסף למסלול
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              onClick={() => actions.addOrUpdateRecommendation(recommendation)}
-                            >
-                              שמור ב-workspace
-                            </Button>
-                            {recommendation.mapLink && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                nativeButton={false}
-                                render={
-                                  <a
-                                    href={recommendation.mapLink}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  />
-                                }
-                              >
-                                פתח מפה
-                              </Button>
-                            )}
+                            <p className="font-heading text-2xl font-semibold leading-tight">
+                              {recommendation.name}
+                            </p>
+                            <p className="flex items-center gap-1 text-sm text-muted-foreground">
+                              <MapPin className="size-4 shrink-0" />
+                              {recommendation.location || "מיקום מדויק עדיין לא הוגדר"}
+                            </p>
                           </div>
                         </div>
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="section-card p-4 text-sm text-muted-foreground">
-                    אין עדיין המלצות בקטגוריה הזו. אפשר להוסיף ידנית מימין או להיעזר במפה וב־AI.
-                  </div>
-                )}
 
-                <div className="grid gap-4 lg:grid-cols-3">
-                  <PlacesSection
-                    countryId={country.id}
-                    kind="restaurant"
-                    title="מסעדות שמורות"
-                    emptyHint="עדיין אין מסעדות שמורות במסד הנתונים."
-                  />
-                  <PlacesSection
-                    countryId={country.id}
-                    kind="hotel"
-                    title="מלונות שמורים"
-                    emptyHint="עדיין אין מלונות שמורים במסד הנתונים."
-                  />
-                  <PlacesSection
-                    countryId={country.id}
-                    kind="attraction"
-                    title="אטרקציות שמורות"
-                    emptyHint="עדיין אין אטרקציות שמורות במסד הנתונים."
-                  />
+                        <p className="text-sm leading-7 text-muted-foreground">
+                          {recommendation.shortDescription ||
+                            "אין עדיין תיאור, אבל כבר אפשר לפתוח את הפרטים ולשלב את המקום במסלול."}
+                        </p>
+
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
+                            <p className="text-[11px] font-medium tracking-[0.16em] text-muted-foreground uppercase">
+                              זמן מומלץ
+                            </p>
+                            <p className="mt-2 text-sm font-medium">
+                              {recommendation.recommendedTimeOfDay === "any"
+                                ? "כל היום"
+                                : DAY_PART_LABELS[recommendation.recommendedTimeOfDay]}
+                            </p>
+                          </div>
+                          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
+                            <p className="text-[11px] font-medium tracking-[0.16em] text-muted-foreground uppercase">
+                              {getRecommendationPriceLabel(recommendation.category)}
+                            </p>
+                            <p className="mt-2 text-sm font-medium">
+                              {formatCurrency(recommendation.approximatePrice)}
+                            </p>
+                          </div>
+                          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
+                            <p className="text-[11px] font-medium tracking-[0.16em] text-muted-foreground uppercase">
+                              שעות פתיחה
+                            </p>
+                            <p className="mt-2 text-sm font-medium">
+                              {recommendation.openingHours || "לא הוגדרו"}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div
+                          className="mt-auto flex flex-wrap gap-2"
+                          onClick={(event) => event.stopPropagation()}
+                          onKeyDown={(event) => event.stopPropagation()}
+                        >
+                          <Button
+                            size="sm"
+                            className="gap-1.5"
+                            onClick={() =>
+                              actions.addRecommendationToDay(selectedDayId, recommendation)
+                            }
+                          >
+                            <Plus className="size-4" />
+                            הוסף למסלול
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => actions.addOrUpdateRecommendation(recommendation)}
+                          >
+                            שמור ב-workspace
+                          </Button>
+                          {recommendation.mapLink && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              nativeButton={false}
+                              render={
+                                <a
+                                  href={recommendation.mapLink}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                />
+                              }
+                            >
+                              פתח מפה
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    </article>
+                  ))}
                 </div>
+              ) : currentCategoryMeta?.available === false ? (
+                <div className="section-card p-4 text-sm text-muted-foreground">
+                  כרגע לא הצלחנו להביא תוצאות לקטגוריה &quot;{RECOMMENDATION_CATEGORY_LABELS[activeRecommendationCategory]}&quot;,
+                  גם לא ממקור מפה פתוח וגם לא מהשלמת החיפוש החכמה. נסו קטגוריה אחרת או הוסיפו ידנית מהכפתור למעלה.
+                </div>
+              ) : (
+                <div className="section-card p-4 text-sm text-muted-foreground">
+                  לא נמצאו תוצאות לקטגוריה הזו כרגע. נסו קטגוריה אחרת, תאריכים אחרים, או הוסיפו המלצה ידנית מהכפתור למעלה.
+                </div>
+              )}
+
+              <AttractionModal
+                recommendation={activeRecommendationDetails}
+                open={Boolean(activeRecommendationDetails)}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    setSelectedRecommendation(null);
+                  }
+                }}
+                workspace={workspace}
+                actions={actions}
+                selectedDayId={selectedDayId}
+                countryName={country.name}
+                isoA2={iso}
+              />
+
+              <div className="grid gap-4 lg:grid-cols-3">
+                <PlacesSection
+                  countryId={country.id}
+                  kind="restaurant"
+                  title="מסעדות שמורות"
+                  emptyHint="עדיין אין מסעדות שמורות במסד הנתונים."
+                />
+                <PlacesSection
+                  countryId={country.id}
+                  kind="hotel"
+                  title="מלונות שמורים"
+                  emptyHint="עדיין אין מלונות שמורים במסד הנתונים."
+                />
+                <PlacesSection
+                  countryId={country.id}
+                  kind="attraction"
+                  title="אטרקציות שמורות"
+                  emptyHint="עדיין אין אטרקציות שמורות במסד הנתונים."
+                />
               </div>
 
-              <div className="section-card space-y-3 p-4">
-                <div className="flex items-center gap-2">
-                  <Plus className="size-4 text-primary" />
-                  <h3 className="font-medium">המלצה ידנית חדשה</h3>
-                </div>
-                <Input
-                  value={recommendationDraft.name}
-                  onChange={(event) =>
-                    setRecommendationDraft((current) => ({
-                      ...current,
-                      name: event.target.value,
-                    }))
+              <Dialog
+                open={recommendationDialogOpen}
+                onOpenChange={(open) => {
+                  setRecommendationDialogOpen(open);
+                  if (!open) {
+                    setRecommendationDraft(createEmptyRecommendationDraft());
                   }
-                  placeholder="שם המקום"
-                />
-                <Select
-                  value={recommendationDraft.category}
-                  onValueChange={(value) =>
-                    setRecommendationDraft((current) => ({
-                      ...current,
-                      category: value as RecommendationCategory,
-                    }))
-                  }
-                >
-                  <SelectTrigger size="sm">
-                    <span>{RECOMMENDATION_CATEGORY_LABELS[recommendationDraft.category]}</span>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ALL_CATEGORIES.map((category) => (
-                      <SelectItem key={category} value={category}>
-                        {RECOMMENDATION_CATEGORY_LABELS[category]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Input
-                  value={recommendationDraft.location}
-                  onChange={(event) =>
-                    setRecommendationDraft((current) => ({
-                      ...current,
-                      location: event.target.value,
-                    }))
-                  }
-                  placeholder="מיקום"
-                />
-                <Textarea
-                  value={recommendationDraft.shortDescription}
-                  onChange={(event) =>
-                    setRecommendationDraft((current) => ({
-                      ...current,
-                      shortDescription: event.target.value,
-                    }))
-                  }
-                  rows={3}
-                  placeholder="תיאור קצר"
-                />
-                <div className="grid grid-cols-2 gap-2">
-                  <Input
-                    type="number"
-                    value={recommendationDraft.estimatedDurationMinutes ?? ""}
-                    onChange={(event) =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        estimatedDurationMinutes: event.target.value
-                          ? Number(event.target.value)
-                          : null,
-                      }))
-                    }
-                    placeholder="משך"
-                  />
-                  <Input
-                    type="number"
-                    value={recommendationDraft.approximatePrice ?? ""}
-                    onChange={(event) =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        approximatePrice: event.target.value
-                          ? Number(event.target.value)
-                          : null,
-                      }))
-                    }
-                    placeholder="מחיר"
-                  />
-                </div>
-                <Input
-                  value={recommendationDraft.openingHours}
-                  onChange={(event) =>
-                    setRecommendationDraft((current) => ({
-                      ...current,
-                      openingHours: event.target.value,
-                    }))
-                  }
-                  placeholder="שעות פתיחה"
-                />
-                <div className="grid grid-cols-2 gap-2">
-                  <Input
-                    type="number"
-                    value={recommendationDraft.lat ?? ""}
-                    onChange={(event) =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        lat: event.target.value ? Number(event.target.value) : null,
-                      }))
-                    }
-                    placeholder="Lat"
-                  />
-                  <Input
-                    type="number"
-                    value={recommendationDraft.lon ?? ""}
-                    onChange={(event) =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        lon: event.target.value ? Number(event.target.value) : null,
-                      }))
-                    }
-                    placeholder="Lon"
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <Select
-                    value={recommendationDraft.recommendedTimeOfDay}
-                    onValueChange={(value) =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        recommendedTimeOfDay: value as TripRecommendation["recommendedTimeOfDay"],
-                      }))
-                    }
-                  >
-                    <SelectTrigger size="sm">
-                      <span>
-                        {recommendationDraft.recommendedTimeOfDay === "any"
-                          ? "כל היום"
-                          : DAY_PART_LABELS[recommendationDraft.recommendedTimeOfDay]}
-                      </span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="any">כל היום</SelectItem>
-                      {SLOT_OPTIONS.map((slot) => (
-                        <SelectItem key={slot} value={slot}>
-                          {DAY_PART_LABELS[slot]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    variant={recommendationDraft.reservationRequired ? "default" : "outline"}
-                    onClick={() =>
-                      setRecommendationDraft((current) => ({
-                        ...current,
-                        reservationRequired: !current.reservationRequired,
-                      }))
-                    }
-                  >
-                    {recommendationDraft.reservationRequired ? "דורש הזמנה" : "ללא הזמנה"}
-                  </Button>
-                </div>
-                <Button className="w-full gap-1.5" onClick={submitRecommendationDraft}>
-                  <Save className="size-4" />
-                  שמירת המלצה
-                </Button>
-              </div>
+                }}
+              >
+                <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+                  <DialogHeader>
+                    <DialogTitle>הוספת המלצה ידנית</DialogTitle>
+                    <DialogDescription>
+                      אפשר להוסיף מקום אישי, מסעדה, אטרקציה או כל עצירה שתרצו לשמור
+                      לתוך ה־workspace.
+                    </DialogDescription>
+                  </DialogHeader>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2 md:col-span-2">
+                      <Label>שם המקום</Label>
+                      <Input
+                        value={recommendationDraft.name}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                        placeholder="שם המקום"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>קטגוריה</Label>
+                      <Select
+                        value={recommendationDraft.category}
+                        onValueChange={(value) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            category: value as RecommendationCategory,
+                          }))
+                        }
+                      >
+                        <SelectTrigger size="sm">
+                          <span>
+                            {RECOMMENDATION_CATEGORY_LABELS[recommendationDraft.category]}
+                          </span>
+                        </SelectTrigger>
+                        <SelectContent>
+                          {ALL_CATEGORIES.map((category) => (
+                            <SelectItem key={category} value={category}>
+                              {RECOMMENDATION_CATEGORY_LABELS[category]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>מיקום</Label>
+                      <Input
+                        value={recommendationDraft.location}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            location: event.target.value,
+                          }))
+                        }
+                        placeholder="עיר, אזור או כתובת"
+                      />
+                    </div>
+
+                    <div className="space-y-2 md:col-span-2">
+                      <Label>תיאור קצר</Label>
+                      <Textarea
+                        value={recommendationDraft.shortDescription}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            shortDescription: event.target.value,
+                          }))
+                        }
+                        rows={4}
+                        placeholder="למה המקום הזה שווה עצירה?"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>משך משוער</Label>
+                      <Input
+                        type="number"
+                        value={recommendationDraft.estimatedDurationMinutes ?? ""}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            estimatedDurationMinutes: event.target.value
+                              ? Number(event.target.value)
+                              : null,
+                          }))
+                        }
+                        placeholder="בדקות"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>מחיר משוער</Label>
+                      <Input
+                        type="number"
+                        value={recommendationDraft.approximatePrice ?? ""}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            approximatePrice: event.target.value
+                              ? Number(event.target.value)
+                              : null,
+                          }))
+                        }
+                        placeholder="מחיר"
+                      />
+                    </div>
+
+                    <div className="space-y-2 md:col-span-2">
+                      <Label>שעות פתיחה</Label>
+                      <Input
+                        value={recommendationDraft.openingHours}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            openingHours: event.target.value,
+                          }))
+                        }
+                        placeholder="למשל 09:00-18:00"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Lat</Label>
+                      <Input
+                        type="number"
+                        value={recommendationDraft.lat ?? ""}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            lat: event.target.value ? Number(event.target.value) : null,
+                          }))
+                        }
+                        placeholder="Lat"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Lon</Label>
+                      <Input
+                        type="number"
+                        value={recommendationDraft.lon ?? ""}
+                        onChange={(event) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            lon: event.target.value ? Number(event.target.value) : null,
+                          }))
+                        }
+                        placeholder="Lon"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>זמן מומלץ</Label>
+                      <Select
+                        value={recommendationDraft.recommendedTimeOfDay}
+                        onValueChange={(value) =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            recommendedTimeOfDay:
+                              value as TripRecommendation["recommendedTimeOfDay"],
+                          }))
+                        }
+                      >
+                        <SelectTrigger size="sm">
+                          <span>
+                            {recommendationDraft.recommendedTimeOfDay === "any"
+                              ? "כל היום"
+                              : DAY_PART_LABELS[
+                                  recommendationDraft.recommendedTimeOfDay
+                                ]}
+                          </span>
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="any">כל היום</SelectItem>
+                          {SLOT_OPTIONS.map((slot) => (
+                            <SelectItem key={slot} value={slot}>
+                              {DAY_PART_LABELS[slot]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>הזמנה מראש</Label>
+                      <Button
+                        className="w-full"
+                        variant={recommendationDraft.reservationRequired ? "default" : "outline"}
+                        onClick={() =>
+                          setRecommendationDraft((current) => ({
+                            ...current,
+                            reservationRequired: !current.reservationRequired,
+                          }))
+                        }
+                      >
+                        {recommendationDraft.reservationRequired
+                          ? "דורש הזמנה"
+                          : "ללא הזמנה"}
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap justify-end gap-2 border-t pt-4">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setRecommendationDialogOpen(false);
+                        setRecommendationDraft(createEmptyRecommendationDraft());
+                      }}
+                    >
+                      ביטול
+                    </Button>
+                    <Button className="gap-1.5" onClick={submitRecommendationDraft}>
+                      <Save className="size-4" />
+                      שמירת המלצה
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
             </div>
           </div>
         </SectionShell>
@@ -2596,11 +2912,21 @@ export function CountryTripWorkspaceContent({
         >
           <div className="space-y-6">
             <CountryWeatherSection lat={centerLat} lon={centerLon} />
+            <CountrySafetyInfo isoA2={iso} />
             <div className="section-card p-4">
               <CountryAiRecommendations isoA2={iso} countryName={country.name} />
             </div>
             <CountryCitiesSection countryId={country.id} countryName={country.name} iso={iso} />
           </div>
+        </SectionShell>
+      </TabsContent>
+
+      <TabsContent value="currency" className={cn("pt-0", activeTab !== "currency" && "hidden")}>
+        <SectionShell
+          title="המרת מטבע"
+          description="שערי חליפין עדכניים מול המטבע המקומי, מתעדכנים אוטומטית כל יום."
+        >
+          <CountryCurrencyConverter isoA2={iso} countryName={country.name} />
         </SectionShell>
       </TabsContent>
     </>

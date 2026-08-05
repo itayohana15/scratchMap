@@ -9,6 +9,7 @@ export interface CountryWeather {
     humidity: number;
     windSpeed: number;
     weatherCode: number;
+    observedAt: string;
   };
   daily: {
     date: string;
@@ -20,6 +21,7 @@ export interface CountryWeather {
 
 interface OpenMeteoResponse {
   current: {
+    time: string;
     temperature_2m: number;
     apparent_temperature: number;
     relative_humidity_2m: number;
@@ -47,6 +49,7 @@ async function fetchCountryWeather(lat: number, lon: number): Promise<CountryWea
       humidity: Math.round(data.current.relative_humidity_2m),
       windSpeed: Math.round(data.current.wind_speed_10m),
       weatherCode: data.current.weather_code,
+      observedAt: data.current.time,
     },
     daily: data.daily.time.map((date, i) => ({
       date,

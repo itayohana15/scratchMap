@@ -200,6 +200,33 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
           ),
         }));
       },
+      // Marks a recommendation as visited even if it was never added to the
+      // itinerary — adds it (to the given day) and completes it atomically
+      // so the attraction modal's "mark visited" button works either way.
+      markRecommendationVisited(dayId: string, recommendation: TripRecommendation) {
+        updateWorkspace((current) => ({
+          ...current,
+          itineraryDays: current.itineraryDays.map((day) =>
+            day.id === dayId
+              ? {
+                  ...day,
+                  items: [
+                    ...day.items,
+                    {
+                      ...recommendationToItineraryItem(
+                        recommendation,
+                        recommendation.recommendedTimeOfDay === "any"
+                          ? "morning"
+                          : recommendation.recommendedTimeOfDay
+                      ),
+                      completed: true,
+                    },
+                  ],
+                }
+              : day
+          ),
+        }));
+      },
       updateItem(dayId: string, itemId: string, patch: Partial<TripItineraryItem>) {
         updateWorkspace((current) => ({
           ...current,
