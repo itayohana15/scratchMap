@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getCountryItinerary, updateCountryItinerary, deleteCountryItinerary } from "@/lib/server/country-itineraries";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { CountryTripWorkspaceState } from "@/lib/trip-workspace";
 
 export async function GET(
@@ -9,7 +9,7 @@ export async function GET(
   { params }: { params: Promise<{ iso: string; itineraryId: string }> }
 ) {
   const { itineraryId } = await params;
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   try {
     const itinerary = await getCountryItinerary(supabase, itineraryId);
@@ -45,7 +45,7 @@ export async function PATCH(
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const supabase = await createClient();
+  const supabase = createAdminClient();
   const { data: country } = await supabase
     .from("countries")
     .select("name")
@@ -77,7 +77,7 @@ export async function DELETE(
   { params }: { params: Promise<{ iso: string; itineraryId: string }> }
 ) {
   const { itineraryId } = await params;
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   try {
     await deleteCountryItinerary(supabase, itineraryId);

@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type {
+  CountryItineraryGenerationSuccessPayload,
   CountryItineraryRecord,
   CountryItineraryVersionRecord,
 } from "@/lib/itineraries";
@@ -19,6 +20,20 @@ export const countryItineraryKeys = {
   versions: (iso: string, itineraryId: string) =>
     ["country-itineraries", iso.toUpperCase(), itineraryId, "versions"] as const,
 };
+
+export interface GenerateCountryItineraryResult {
+  itinerary: CountryItineraryRecord;
+  success: CountryItineraryGenerationSuccessPayload;
+}
+
+function upsertItineraryList(
+  current: CountryItineraryRecord[] | undefined,
+  itinerary: CountryItineraryRecord
+) {
+  return [itinerary, ...(current ?? []).filter((item) => item.id !== itinerary.id)].sort((a, b) =>
+    b.updatedAt.localeCompare(a.updatedAt)
+  );
+}
 
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -75,16 +90,20 @@ export function useGenerateCountryItinerary(iso: string) {
 
   return useMutation({
     mutationFn: async (payload: AiItineraryRequest) => {
-      const data = await parseJson<{ itinerary: CountryItineraryRecord }>(
+      const data = await parseJson<GenerateCountryItineraryResult>(
         await fetch(`/api/countries/${iso.toLowerCase()}/itineraries`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         })
       );
-      return data.itinerary;
+      return data;
     },
-    onSuccess: (itinerary) => {
+    onSuccess: ({ itinerary }) => {
+      queryClient.setQueryData<CountryItineraryRecord[]>(
+        countryItineraryKeys.byIso(iso),
+        (current) => upsertItineraryList(current, itinerary)
+      );
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
       queryClient.setQueryData(countryItineraryKeys.detail(iso, itinerary.id), itinerary);
     },

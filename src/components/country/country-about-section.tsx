@@ -24,6 +24,7 @@ import type {
   CountryAttraction,
   CountryBudgetTier,
   CountryDestination,
+  CountryFoodSpot,
   CountryNamedNote,
   CountryTimelineEntry,
 } from "@/lib/ai/country-knowledge";
@@ -324,6 +325,36 @@ function AttractionCard({ attraction }: { attraction: CountryAttraction }) {
   );
 }
 
+function FoodSpotCard({ spot }: { spot: CountryFoodSpot }) {
+  const mapHref = buildMapLink(`${spot.name} ${spot.cityOrArea}`.trim(), null, null);
+
+  return (
+    <article className="rounded-[24px] border border-border/70 bg-background/75 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h4 className="text-base font-semibold text-foreground">{spot.name}</h4>
+          {spot.cityOrArea && <p className="mt-1 text-sm text-muted-foreground">{spot.cityOrArea}</p>}
+        </div>
+        {spot.type && (
+          <Badge variant="secondary" className="shrink-0 rounded-full px-3 py-1">
+            {spot.type}
+          </Badge>
+        )}
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        {valueLine("מה לנסות", spot.whatToTry)}
+        {valueLine("למה להגיע", spot.whyGo)}
+        {valueLine("טווח מחירים", spot.priceLevel)}
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        {mapHref && <LinkChip href={mapHref}>חיפוש במפה</LinkChip>}
+      </div>
+    </article>
+  );
+}
+
 function HubSection({
   title,
   description,
@@ -565,7 +596,7 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
 
       <HubSection
         title="אוכל ושתייה"
-        description="מה אוכלים, כמה זה עולה, ואיך להיכנס נכון לתרבות האוכל המקומית."
+        description="מה אוכלים, כמה זה עולה, איפה באמת שווה לאכול, ואיך להיכנס נכון לתרבות האוכל המקומית."
         icon={UtensilsCrossed}
       >
         <div className="space-y-5">
@@ -584,6 +615,22 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
             {valueLine("ארוחה זוגית", data.foodGuide.typicalMealPrices.dinnerForTwo)}
             {valueLine("ידידותי לצמחונים/טבעונים", data.foodGuide.vegetarianVeganFriendliness)}
           </div>
+
+          {data.foodGuide.recommendedSpots.length > 0 && (
+            <div className="space-y-4">
+              <div>
+                <h4 className="text-base font-semibold text-foreground">מקומות אוכל שכדאי לחפש</h4>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  מסעדות, שווקים, רחובות אוכל ואזורים קולינריים שבאמת שווה לתכנן סביבם עצירה.
+                </p>
+              </div>
+              <div className="grid gap-4 xl:grid-cols-2">
+                {data.foodGuide.recommendedSpots.map((spot) => (
+                  <FoodSpotCard key={`${spot.name}-${spot.cityOrArea}`} spot={spot} />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </HubSection>
 

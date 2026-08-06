@@ -71,6 +71,17 @@ export interface CountryItineraryVersionRecord {
   createdAt: string;
 }
 
+export interface CountryItineraryGenerationSuccessPayload {
+  itineraryId: string;
+  countryCode: string;
+  countryName: string;
+  startDate: string | null;
+  endDate: string | null;
+  totalDays: number;
+  estimatedTotalCost: number | null;
+  status: CountryItineraryStatus;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -462,4 +473,20 @@ export function formatItineraryVersionLabel(version: number, createdAt: string) 
   const parsed = parseISO(createdAt);
   const suffix = isValid(parsed) ? format(parsed, "d בMMM yyyy, HH:mm", { locale: he }) : createdAt;
   return `גרסה ${version} · ${suffix}`;
+}
+
+export function buildCountryItinerarySuccessPayload(
+  itinerary: CountryItineraryRecord,
+  countryName: string
+): CountryItineraryGenerationSuccessPayload {
+  return {
+    itineraryId: itinerary.id,
+    countryCode: itinerary.isoA2,
+    countryName,
+    startDate: itinerary.startDate,
+    endDate: itinerary.endDate,
+    totalDays: itinerary.daysCount,
+    estimatedTotalCost: itinerary.costSummary.totalEstimatedCost,
+    status: itinerary.status,
+  };
 }

@@ -70,6 +70,15 @@ export interface CountryMealPriceGuide {
   dinnerForTwo: string;
 }
 
+export interface CountryFoodSpot {
+  name: string;
+  type: string;
+  cityOrArea: string;
+  whatToTry: string;
+  whyGo: string;
+  priceLevel: string;
+}
+
 export interface CountryFoodHub {
   nationalDishes: string[];
   streetFood: string[];
@@ -77,6 +86,7 @@ export interface CountryFoodHub {
   drinks: string[];
   localSpecialties: string[];
   foodEtiquette: string[];
+  recommendedSpots: CountryFoodSpot[];
   typicalMealPrices: CountryMealPriceGuide;
   vegetarianVeganFriendliness: string;
 }
@@ -368,6 +378,18 @@ function normalizeCity(value: unknown): CountryCityGuide {
   };
 }
 
+function normalizeFoodSpot(value: unknown): CountryFoodSpot {
+  const record = isRecord(value) ? value : {};
+  return {
+    name: toText(record.name),
+    type: toText(record.type),
+    cityOrArea: toText(record.cityOrArea),
+    whatToTry: toText(record.whatToTry),
+    whyGo: toText(record.whyGo),
+    priceLevel: toText(record.priceLevel),
+  };
+}
+
 function normalizeItinerary(value: unknown): CountryItineraryIdea {
   const record = isRecord(value) ? value : {};
   return {
@@ -479,6 +501,9 @@ function normalizeFoodGuide(value: unknown): CountryFoodHub {
     drinks: toTextArray(record.drinks),
     localSpecialties: toTextArray(record.localSpecialties),
     foodEtiquette: toTextArray(record.foodEtiquette),
+    recommendedSpots: toRecordArray(record.recommendedSpots)
+      .map(normalizeFoodSpot)
+      .filter((item) => item.name),
     typicalMealPrices: normalizeMealPrices(record.typicalMealPrices),
     vegetarianVeganFriendliness: toText(record.vegetarianVeganFriendliness),
   };
@@ -582,6 +607,7 @@ export function hasRichCountryAiRecommendation(value: unknown): boolean {
     isRecord(value.geography) &&
     isRecord(value.peopleCulture) &&
     isRecord(value.foodGuide) &&
+    Array.isArray(value.foodGuide.recommendedSpots) &&
     Array.isArray(value.topDestinations) &&
     Array.isArray(value.topAttractions) &&
     isRecord(value.bestTime) &&

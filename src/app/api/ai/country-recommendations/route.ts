@@ -62,6 +62,19 @@ const NAMED_NOTE_SCHEMA = {
   required: ["name", "note"],
 };
 
+const FOOD_SPOT_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    name: stringField("Specific place name in Hebrew or standard well-known local spelling."),
+    type: stringField("Type in Hebrew such as מסעדה, שוק, רובע קולינרי, רחוב אוכל, בית קפה."),
+    cityOrArea: stringField("City, neighborhood, or area where the place is found."),
+    whatToTry: stringField("What the traveler should order or focus on there."),
+    whyGo: stringField("Why this place is worth planning around."),
+    priceLevel: stringField("Short price guidance in Hebrew."),
+  },
+  required: ["name", "type", "cityOrArea", "whatToTry", "whyGo", "priceLevel"],
+};
+
 const DESTINATION_SCHEMA = {
   type: Type.OBJECT,
   properties: {
@@ -323,6 +336,10 @@ const RECOMMENDATION_SCHEMA = {
         drinks: stringArrayField("Drinks to try.", "One drink in Hebrew."),
         localSpecialties: stringArrayField("Regional specialties.", "One specialty in Hebrew."),
         foodEtiquette: stringArrayField("Food etiquette tips.", "One etiquette point in Hebrew."),
+        recommendedSpots: objectArrayField(
+          "Six to eight real, specific food recommendations travelers can actually search for: famous restaurants, markets, food streets, culinary neighborhoods, or notable cafes.",
+          FOOD_SPOT_SCHEMA
+        ),
         typicalMealPrices: {
           type: Type.OBJECT,
           properties: {
@@ -341,6 +358,7 @@ const RECOMMENDATION_SCHEMA = {
         "drinks",
         "localSpecialties",
         "foodEtiquette",
+        "recommendedSpots",
         "typicalMealPrices",
         "vegetarianVeganFriendliness",
       ],
@@ -528,6 +546,8 @@ Important output rules:
 - "itineraryIdeas" must contain exactly 6 entries for 2, 3, 5, 7, 10, and 14 days.
 - "bestTime.months" must contain exactly 12 entries from ינואר through דצמבר.
 - "topAttractions" should contain 6 to 8 relevant categories, each with 2 or 3 attractions.
+- "foodGuide.recommendedSpots" must contain 6 to 8 specific, searchable food places or food areas with real names whenever possible.
+- In the food section, do not settle for generic phrases like "מסעדה מקומית" or "שוק מרכזי". Prefer actual restaurant names, famous markets, food streets, culinary districts, or well-known cafe institutions.
 - Keep descriptions grounded, realistic, and useful for travel planning and general learning.
 - Include approximate coordinates when they are commonly known.
 - If a category is not very relevant to the country, replace it with another strong category instead of forcing weak content.`,

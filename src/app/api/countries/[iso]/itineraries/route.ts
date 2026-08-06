@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 
 import { normalizeCountryAiRecommendation } from "@/lib/ai/country-knowledge";
+import { buildCountryItinerarySuccessPayload } from "@/lib/itineraries";
 import { listCountryItineraries, generateAndStoreCountryItinerary } from "@/lib/server/country-itineraries";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { AiItineraryRequest } from "@/lib/trip-workspace";
 
 export async function GET(
@@ -10,7 +11,7 @@ export async function GET(
   { params }: { params: Promise<{ iso: string }> }
 ) {
   const { iso } = await params;
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   try {
     const itineraries = await listCountryItineraries(supabase, iso);
@@ -35,7 +36,7 @@ export async function POST(
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   const { data: country, error: countryError } = await supabase
     .from("countries")
@@ -71,7 +72,10 @@ export async function POST(
       guide
     );
 
-    return NextResponse.json({ itinerary });
+    return NextResponse.json({
+      itinerary,
+      success: buildCountryItinerarySuccessPayload(itinerary, country.name),
+    });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Failed to generate itinerary" },

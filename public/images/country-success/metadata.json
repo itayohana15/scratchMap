@@ -1,0 +1,129 @@
+{
+  "updatedAt": "2026-08-06",
+  "licenseNote": "Artwork files are stored locally for the itinerary success popup. Check each record for attribution or acknowledgement requirements.",
+  "items": [
+    {
+      "countryCode": "JP",
+      "file": "jp.jpg",
+      "title": "Mount Fuji",
+      "artist": "Taikan Yokoyama",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Mount_Fuji_by_Taikan_Yokoyama,_watercolor_on_paper.jpg",
+      "sourceCollection": "Wikimedia Commons",
+      "license": "Public domain (PD-Japan / expired copyright)",
+      "licenseUrl": "https://commons.wikimedia.org/wiki/File:Mount_Fuji_by_Taikan_Yokoyama,_watercolor_on_paper.jpg",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "CN",
+      "file": "cn.jpg",
+      "title": "The Great Wall of China",
+      "artist": "Thomas Allom",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Allom_-_The_Great_Wall_of_China.jpg",
+      "sourceCollection": "Wikimedia Commons / Maastricht University Library",
+      "license": "Public domain (PDM 1.0)",
+      "licenseUrl": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "EG",
+      "file": "eg.jpg",
+      "title": "Egyptian Pyramids",
+      "artist": "Henry A. Bacon",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Henry_A._Bacon_-_'Egyptian_Pyramids',_watercolor_over_graphite,_1897.jpg",
+      "sourceCollection": "Wikimedia Commons / Honolulu Museum of Art",
+      "license": "Public domain (PDM 1.0)",
+      "licenseUrl": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "IN",
+      "file": "in.jpg",
+      "title": "Landscape with the Taj Mahal",
+      "artist": "Unknown",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Landscape_with_the_Taj_Mahal_LACMA_M.86.123.jpg",
+      "sourceCollection": "Wikimedia Commons / Los Angeles County Museum of Art",
+      "license": "Public domain (LACMA Public Domain High Resolution Image Available)",
+      "licenseUrl": "https://commons.wikimedia.org/wiki/File:Landscape_with_the_Taj_Mahal_LACMA_M.86.123.jpg",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "GR",
+      "file": "gr.jpg",
+      "title": "Athens - View of the Acropolis",
+      "artist": "August Löffler",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:August_L%C3%B6ffler_-_Athen_-_Blick_auf_die_Akropolis.jpg",
+      "sourceCollection": "Wikimedia Commons",
+      "license": "Public domain",
+      "licenseUrl": "https://commons.wikimedia.org/wiki/File:August_L%C3%B6ffler_-_Athen_-_Blick_auf_die_Akropolis.jpg",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "FR",
+      "file": "fr.jpg",
+      "title": "Eiffel Tower and the Seine",
+      "artist": "Pierre Bonnard",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Eiffel-tower-and-the-seine.jpg",
+      "sourceCollection": "Wikimedia Commons",
+      "license": "Public domain (PDM 1.0)",
+      "licenseUrl": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "IT",
+      "file": "it.jpg",
+      "title": "Venice",
+      "artist": "John Singer Sargent",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Venice_MET_APS2532.jpg",
+      "sourceCollection": "Wikimedia Commons / Metropolitan Museum of Art",
+      "license": "CC0 1.0",
+      "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "BR",
+      "file": "br.jpg",
+      "title": "Grey-breasted Mountain Toucan",
+      "artist": "Gossipguy",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Grey-breasted_Mountain_Toucan.jpg",
+      "sourceCollection": "Wikimedia Commons",
+      "license": "CC BY-SA 3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "attributionRequired": true,
+      "attributionText": "Gossipguy / Wikimedia Commons"
+    },
+    {
+      "countryCode": "AU",
+      "file": "au.jpg",
+      "title": "A kangaroo",
+      "artist": "Sarah Stone",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:SLNSW_797165_f_25_A_kangaroo.jpg",
+      "sourceCollection": "Wikimedia Commons / State Library of New South Wales",
+      "license": "Public domain (PD-Australia / PD-1996)",
+      "licenseUrl": "https://commons.wikimedia.org/wiki/File:SLNSW_797165_f_25_A_kangaroo.jpg",
+      "attributionRequired": false,
+      "acknowledgementRequested": "State Library of NSW requests acknowledgement when practical."
+    },
+    {
+      "countryCode": "GB",
+      "file": "gb.jpg",
+      "title": "Big Ben",
+      "artist": "Childe Hassam",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Childe_Hassam,_Big_Ben,_1897_and_1907,_NGA_180937.jpg",
+      "sourceCollection": "Wikimedia Commons / National Gallery of Art",
+      "license": "CC0 1.0",
+      "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "attributionRequired": false
+    },
+    {
+      "countryCode": "generic",
+      "file": "generic.jpg",
+      "title": "Peaceful watercolor landscape",
+      "artist": "Unknown",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Peaceful_watercolor_landscape.jpg",
+      "sourceCollection": "Wikimedia Commons / Digital Commonwealth",
+      "license": "Public domain (PDM 1.0)",
+      "licenseUrl": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "attributionRequired": false
+    }
+  ]
+}

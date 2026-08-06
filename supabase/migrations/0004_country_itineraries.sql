@@ -40,8 +40,6 @@ create trigger set_country_itineraries_updated_at before update on public.countr
   for each row execute function public.set_updated_at();
 
 alter table public.country_itineraries enable row level security;
-create policy "country_itineraries_anon_all_TEMP" on public.country_itineraries
-  for all to anon, authenticated using (true) with check (true);
 
 create table public.country_itinerary_versions (
   id                        uuid primary key default gen_random_uuid(),
@@ -60,5 +58,3 @@ create index country_itinerary_versions_itinerary_id_idx
   on public.country_itinerary_versions(itinerary_id, created_at desc);
 
 alter table public.country_itinerary_versions enable row level security;
-create policy "country_itinerary_versions_anon_all_TEMP" on public.country_itinerary_versions
-  for all to anon, authenticated using (true) with check (true);

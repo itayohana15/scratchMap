@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { normalizeCountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import { regenerateCountryItinerary } from "@/lib/server/country-itineraries";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { AiItineraryRequest } from "@/lib/trip-workspace";
 
 export async function POST(
@@ -22,7 +22,7 @@ export async function POST(
   }
 
   const scope = body.scope ?? "full";
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   const [{ data: country }, { data: guideRow }] = await Promise.all([
     supabase.from("countries").select("name").eq("iso_a2", iso.toUpperCase()).maybeSingle(),

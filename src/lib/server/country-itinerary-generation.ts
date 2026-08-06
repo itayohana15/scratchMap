@@ -272,6 +272,16 @@ function summarizeCountryKnowledge(knowledge: CountryAiRecommendation | null | u
         soloTravelSafety: knowledge.safety.soloTravelSafety,
         nightSafety: knowledge.safety.nightSafety,
       },
+      food: {
+        nationalDishes: knowledge.foodGuide.nationalDishes.slice(0, 4),
+        streetFood: knowledge.foodGuide.streetFood.slice(0, 4),
+        recommendedSpots: knowledge.foodGuide.recommendedSpots.slice(0, 6).map((spot) => ({
+          name: spot.name,
+          type: spot.type,
+          cityOrArea: spot.cityOrArea,
+          whatToTry: spot.whatToTry,
+        })),
+      },
       topDestinations: knowledge.topDestinations.slice(0, 8).map((item) => item.name),
       cities: knowledge.cities.slice(0, 6).map((item) => ({
         name: item.name,

@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
 
 import { archiveCountryItinerary } from "@/lib/server/country-itineraries";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 export async function POST(
   _request: Request,
   { params }: { params: Promise<{ iso: string; itineraryId: string }> }
 ) {
   const { iso, itineraryId } = await params;
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   const { data: country } = await supabase
     .from("countries")

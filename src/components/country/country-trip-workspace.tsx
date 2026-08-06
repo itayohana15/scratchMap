@@ -26,6 +26,7 @@ import { toast } from "sonner";
 import { AttractionModal } from "@/components/country/attraction-modal";
 import { CountryAboutSection } from "@/components/country/country-about-section";
 import { CountryItineraryHistorySection } from "@/components/country/country-itinerary-history-section";
+import { CountryItinerarySuccessDialog } from "@/components/country/country-itinerary-success-dialog";
 import { CountryCitiesSection } from "@/components/country/country-cities-section";
 import { CountryCurrencyConverter } from "@/components/country/country-currency-converter";
 import { CountryNotesSection } from "@/components/country/country-notes-section";
@@ -63,8 +64,15 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { TabsContent } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { createWorkspaceFromItineraryRecord } from "@/lib/itineraries";
-import { useGenerateCountryItinerary } from "@/lib/queries/country-itineraries";
+import {
+  createWorkspaceFromItineraryRecord,
+  type CountryItineraryGenerationSuccessPayload,
+  type CountryItineraryRecord,
+} from "@/lib/itineraries";
+import {
+  useGenerateCountryItinerary,
+  type GenerateCountryItineraryResult,
+} from "@/lib/queries/country-itineraries";
 import { usePlacesForCountry } from "@/lib/queries/places";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureProperties } from "@/lib/map/geo";
@@ -321,6 +329,16 @@ function buildLiveRecommendations(
 
 function journalForDay(workspace: CountryTripWorkspaceState, dayId: string) {
   return workspace.journalEntries.find((entry) => entry.dayId === dayId) ?? null;
+}
+
+function canOpenSuccessDialog(result: GenerateCountryItineraryResult) {
+  return Boolean(
+    result.success.itineraryId &&
+      result.success.countryCode &&
+      result.success.countryName &&
+      result.success.totalDays > 0 &&
+      result.itinerary.itineraryDays.length > 0
+  );
 }
 
 function plannedVsActualBadge(item: TripItineraryItem) {
@@ -867,6 +885,10 @@ export function CountryTripWorkspaceContent({
   const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
   const [aiGenerationStageIndex, setAiGenerationStageIndex] = useState(0);
   const [autoOpenItineraryId, setAutoOpenItineraryId] = useState<string | null>(null);
+  const [successDialogPayload, setSuccessDialogPayload] =
+    useState<CountryItineraryGenerationSuccessPayload | null>(null);
+  const latestGeneratedItineraryRef = useRef<CountryItineraryRecord | null>(null);
+  const lastShownSuccessItineraryIdRef = useRef<string | null>(null);
   const [activeRecommendationCategory, setActiveRecommendationCategory] =
     useState<RecommendationCategory>("attraction");
   const [apiRecommendationsByCategory, setApiRecommendationsByCategory] = useState<
@@ -1029,7 +1051,8 @@ export function CountryTripWorkspaceContent({
 
     try {
       setAiGenerationStageIndex(0);
-      const itinerary = await generateSavedItinerary.mutateAsync({
+      setSuccessDialogPayload(null);
+      const result = await generateSavedItinerary.mutateAsync({
         countryId: country.id,
         countryName: country.name,
         isoA2: iso.toUpperCase(),
@@ -1040,13 +1063,37 @@ export function CountryTripWorkspaceContent({
         bookings: workspace.bookings,
         existingDays: workspace.itineraryDays,
       });
-      actions.loadWorkspace(createWorkspaceFromItineraryRecord(itinerary, country.name));
-      setAutoOpenItineraryId(itinerary.id);
-      setSelectedDayId(itinerary.itineraryDays[0]?.id ?? "");
-      toast.success("המסלול נוצר, נשמר ונפתח בהיסטוריה");
+      actions.loadWorkspace(createWorkspaceFromItineraryRecord(result.itinerary, country.name));
+      latestGeneratedItineraryRef.current = result.itinerary;
+      setSelectedDayId(result.itinerary.itineraryDays[0]?.id ?? "");
+
+      if (
+        canOpenSuccessDialog(result) &&
+        lastShownSuccessItineraryIdRef.current !== result.success.itineraryId
+      ) {
+        lastShownSuccessItineraryIdRef.current = result.success.itineraryId;
+        setSuccessDialogPayload(result.success);
+        return;
+      }
+
+      toast.success("המסלול נוצר ונשמר בהיסטוריה");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "בניית המסלול נכשלה");
     }
+  }
+
+  function handleOpenGeneratedItinerary(itineraryId: string) {
+    setSuccessDialogPayload(null);
+    setAutoOpenItineraryId(itineraryId);
+  }
+
+  function handleContinueEditingGeneratedItinerary() {
+    const itinerary = latestGeneratedItineraryRef.current;
+    if (itinerary) {
+      actions.loadWorkspace(createWorkspaceFromItineraryRecord(itinerary, country.name));
+      setSelectedDayId(itinerary.itineraryDays[0]?.id ?? "");
+    }
+    setSuccessDialogPayload(null);
   }
 
   function toggleMapFilter(category: RecommendationCategory) {
@@ -2360,6 +2407,18 @@ export function CountryTripWorkspaceContent({
                   </div>
                 </DialogContent>
               </Dialog>
+
+              <CountryItinerarySuccessDialog
+                open={Boolean(successDialogPayload)}
+                success={successDialogPayload}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    setSuccessDialogPayload(null);
+                  }
+                }}
+                onOpenItinerary={handleOpenGeneratedItinerary}
+                onContinueEditing={handleContinueEditingGeneratedItinerary}
+              />
             </div>
           </div>
         </SectionShell>

@@ -23,6 +23,7 @@ import {
   type TripItineraryDay,
   type TripItineraryItem,
 } from "@/lib/trip-workspace";
+import { isMissingCountryItineraryStorageError, toCountryItineraryStorageError } from "@/lib/server/country-itinerary-storage";
 
 type DbClient = SupabaseClient<Database>;
 
@@ -75,7 +76,7 @@ async function insertVersion(
     snapshot: serializeSnapshot(itinerary),
     restored_from_version_id: restoredFromVersionId ?? null,
   });
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
 }
 
 function recomputeDayEstimates(
@@ -129,7 +130,7 @@ async function fetchItineraryRow(supabase: DbClient, itineraryId: string) {
     .select("*")
     .eq("id", itineraryId)
     .maybeSingle();
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
   if (!data) throw new Error("Itinerary not found");
   return data;
 }
@@ -141,7 +142,12 @@ export async function listCountryItineraries(supabase: DbClient, isoA2: string) 
     .eq("iso_a2", isoA2.toUpperCase())
     .is("deleted_at", null)
     .order("updated_at", { ascending: false });
-  if (error) throw error;
+  if (error) {
+    if (isMissingCountryItineraryStorageError(error)) {
+      return [];
+    }
+    throw toCountryItineraryStorageError(error);
+  }
   return (data ?? []).map(normalizeCountryItineraryRow);
 }
 
@@ -156,7 +162,12 @@ export async function listCountryItineraryVersions(supabase: DbClient, itinerary
     .select("*")
     .eq("itinerary_id", itineraryId)
     .order("version", { ascending: false });
-  if (error) throw error;
+  if (error) {
+    if (isMissingCountryItineraryStorageError(error)) {
+      return [];
+    }
+    throw toCountryItineraryStorageError(error);
+  }
   return (data ?? []).map(normalizeCountryItineraryVersionRow);
 }
 
@@ -205,7 +216,7 @@ export async function generateAndStoreCountryItinerary(
     })
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
 
   const itinerary = normalizeCountryItineraryRow(data);
   await insertVersion(supabase, itinerary, "ai", "initial generation");
@@ -284,7 +295,7 @@ export async function updateCountryItinerary(
     .eq("id", itineraryId)
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
 
   const itinerary = normalizeCountryItineraryRow(data);
   await insertVersion(
@@ -333,7 +344,7 @@ export async function duplicateCountryItinerary(
     })
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
 
   const duplicate = normalizeCountryItineraryRow(data);
   await insertVersion(supabase, duplicate, "duplicate", "duplicate itinerary");
@@ -358,7 +369,7 @@ export async function deleteCountryItinerary(supabase: DbClient, itineraryId: st
     .from("country_itineraries")
     .update({ deleted_at: new Date().toISOString() })
     .eq("id", itineraryId);
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
 }
 
 export async function restoreCountryItineraryVersion(
@@ -373,7 +384,7 @@ export async function restoreCountryItineraryVersion(
     .eq("id", versionId)
     .eq("itinerary_id", itineraryId)
     .maybeSingle();
-  if (error) throw error;
+  if (error) throw toCountryItineraryStorageError(error);
   if (!data) throw new Error("Version not found");
 
   const version = normalizeCountryItineraryVersionRow(data);

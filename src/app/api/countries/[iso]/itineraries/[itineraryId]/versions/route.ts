@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
 
 import { listCountryItineraryVersions } from "@/lib/server/country-itineraries";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ iso: string; itineraryId: string }> }
 ) {
   const { itineraryId } = await params;
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   try {
     const versions = await listCountryItineraryVersions(supabase, itineraryId);
