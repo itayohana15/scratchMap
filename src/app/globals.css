@@ -42,6 +42,13 @@
   --color-visited: var(--visited);
   --color-planned: var(--planned);
   --color-not-visited: var(--not-visited);
+  /* Theme-system additions — every theme in src/lib/themes sets these, so
+     any component using bg-surface / text-success / etc. re-themes for
+     free instead of needing per-component color logic. */
+  --color-surface: var(--surface);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-hover: var(--hover);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -89,6 +96,17 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Theme-system additions (defaults — Arctic Light values; every
+     [data-theme] block below overrides all of these). */
+  --surface: #f7f8fa;
+  --success: #248a3d;
+  --warning: #b9740a;
+  --hover: #eef4ff;
+  --shadow-tint: 15 23 42;
+  --scrollbar-thumb: #d4d7dd;
+  --scrollbar-track: transparent;
+  --selection-bg: #0071e3;
+  --selection-fg: #ffffff;
 }
 
 .dark {
@@ -126,6 +144,323 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  --surface: #111214;
+  --success: #34d399;
+  --warning: #f59e0b;
+  --hover: #232427;
+  --shadow-tint: 0 0 0;
+  --scrollbar-thumb: #3a3b3f;
+  --scrollbar-track: transparent;
+  --selection-bg: oklch(0.673 0.182 276.935);
+  --selection-fg: oklch(0.145 0 0);
+}
+
+/* ==========================================================================
+   Theme gallery — 10 selectable palettes (src/lib/themes/*.ts holds the
+   metadata used to render these as cards; this is the single place the
+   actual CSS values live). Each block sets every token a theme owns, so
+   switching [data-theme] re-colors the whole app — components should never
+   need their own per-theme logic as long as they use these tokens.
+   ========================================================================== */
+
+[data-theme="midnight-gold"] {
+  --background: #0a0a0a;
+  --foreground: #f2ead9;
+  --card: #151310;
+  --card-foreground: #f2ead9;
+  --popover: #151310;
+  --popover-foreground: #f2ead9;
+  --primary: #d4af37;
+  --primary-foreground: #171203;
+  --secondary: #221d15;
+  --secondary-foreground: #e8dcc0;
+  --muted: #1c1812;
+  --muted-foreground: #a89a7c;
+  --accent: #3a2f18;
+  --accent-foreground: #f6e6b8;
+  --destructive: #e5484d;
+  --border: #2e2818;
+  --input: #33291a;
+  --ring: #d4af37;
+  --surface: #110f0c;
+  --success: #7fae52;
+  --warning: #e0a72e;
+  --hover: #241f14;
+  --shadow-tint: 0 0 0;
+  --scrollbar-thumb: #3a331f;
+  --scrollbar-track: transparent;
+  --selection-bg: #d4af37;
+  --selection-fg: #171203;
+}
+
+[data-theme="arctic-light"] {
+  --background: #ffffff;
+  --foreground: #1d1d1f;
+  --card: #ffffff;
+  --card-foreground: #1d1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1d1d1f;
+  --primary: #0071e3;
+  --primary-foreground: #ffffff;
+  --secondary: #f0f1f3;
+  --secondary-foreground: #1d1d1f;
+  --muted: #f5f6f8;
+  --muted-foreground: #6e6e73;
+  --accent: #e8f2ff;
+  --accent-foreground: #0071e3;
+  --destructive: #ff3b30;
+  --border: #e4e6ea;
+  --input: #e4e6ea;
+  --ring: #0071e3;
+  --surface: #f7f8fa;
+  --success: #248a3d;
+  --warning: #b9740a;
+  --hover: #eef4ff;
+  --shadow-tint: 15 23 42;
+  --scrollbar-thumb: #d4d7dd;
+  --scrollbar-track: transparent;
+  --selection-bg: #0071e3;
+  --selection-fg: #ffffff;
+}
+
+[data-theme="ocean-breeze"] {
+  --background: #f2fbfd;
+  --foreground: #0a2933;
+  --card: #ffffff;
+  --card-foreground: #0a2933;
+  --popover: #ffffff;
+  --popover-foreground: #0a2933;
+  --primary: #0891b2;
+  --primary-foreground: #ffffff;
+  --secondary: #e0f7fa;
+  --secondary-foreground: #0a2933;
+  --muted: #e6f7fa;
+  --muted-foreground: #4b7a86;
+  --accent: #ccf3f9;
+  --accent-foreground: #0891b2;
+  --destructive: #e11d48;
+  --border: #bfeaf1;
+  --input: #bfeaf1;
+  --ring: #0891b2;
+  --surface: #e3f6fa;
+  --success: #0d9269;
+  --warning: #b45309;
+  --hover: #d7f4fb;
+  --shadow-tint: 8 60 70;
+  --scrollbar-thumb: #a9dee7;
+  --scrollbar-track: transparent;
+  --selection-bg: #0891b2;
+  --selection-fg: #ffffff;
+}
+
+[data-theme="forest-explorer"] {
+  --background: #131c16;
+  --foreground: #ece4cf;
+  --card: #1a251d;
+  --card-foreground: #ece4cf;
+  --popover: #1a251d;
+  --popover-foreground: #ece4cf;
+  --primary: #7a9c4a;
+  --primary-foreground: #12190d;
+  --secondary: #2c2519;
+  --secondary-foreground: #e9dfc6;
+  --muted: #1e2820;
+  --muted-foreground: #a3ab8f;
+  --accent: #4d3d24;
+  --accent-foreground: #eee2c4;
+  --destructive: #e5534b;
+  --border: #2b3628;
+  --input: #30392c;
+  --ring: #7a9c4a;
+  --surface: #101711;
+  --success: #6bbf59;
+  --warning: #d99a35;
+  --hover: #24301f;
+  --shadow-tint: 0 0 0;
+  --scrollbar-thumb: #344030;
+  --scrollbar-track: transparent;
+  --selection-bg: #7a9c4a;
+  --selection-fg: #12190d;
+}
+
+[data-theme="sakura"] {
+  --background: #fff6f8;
+  --foreground: #45222d;
+  --card: #ffffff;
+  --card-foreground: #45222d;
+  --popover: #ffffff;
+  --popover-foreground: #45222d;
+  --primary: #ec7ca5;
+  --primary-foreground: #3a1420;
+  --secondary: #fbe3ea;
+  --secondary-foreground: #45222d;
+  --muted: #fdeaf0;
+  --muted-foreground: #96727e;
+  --accent: #ecdcfb;
+  --accent-foreground: #6b3fa0;
+  --destructive: #e11d48;
+  --border: #f6d3e0;
+  --input: #f6d3e0;
+  --ring: #ec7ca5;
+  --surface: #ffeef3;
+  --success: #2f9e5b;
+  --warning: #b9700a;
+  --hover: #ffe1eb;
+  --shadow-tint: 100 30 55;
+  --scrollbar-thumb: #f3c2d4;
+  --scrollbar-track: transparent;
+  --selection-bg: #ec7ca5;
+  --selection-fg: #3a1420;
+}
+
+[data-theme="cyber-neon"] {
+  --background: #08000f;
+  --foreground: #e7e1ff;
+  --card: #130a24;
+  --card-foreground: #e7e1ff;
+  --popover: #130a24;
+  --popover-foreground: #e7e1ff;
+  --primary: #00e5ff;
+  --primary-foreground: #04121a;
+  --secondary: #241247;
+  --secondary-foreground: #e7deff;
+  --muted: #180d2c;
+  --muted-foreground: #9d8fc9;
+  --accent: #3a1a5c;
+  --accent-foreground: #ff9bf5;
+  --destructive: #ff2079;
+  --border: #2c1a52;
+  --input: #2c1a52;
+  --ring: #00e5ff;
+  --surface: #0f0620;
+  --success: #39ff14;
+  --warning: #ffea00;
+  --hover: #21123f;
+  --shadow-tint: 0 229 255;
+  --scrollbar-thumb: #3d1f70;
+  --scrollbar-track: transparent;
+  --selection-bg: #00e5ff;
+  --selection-fg: #04121a;
+}
+
+[data-theme="royal-purple"] {
+  --background: #130a22;
+  --foreground: #efe7fb;
+  --card: #1c1233;
+  --card-foreground: #efe7fb;
+  --popover: #1c1233;
+  --popover-foreground: #efe7fb;
+  --primary: #a855f7;
+  --primary-foreground: #ffffff;
+  --secondary: #2a1c48;
+  --secondary-foreground: #ecdfff;
+  --muted: #201636;
+  --muted-foreground: #b3a0d6;
+  --accent: #4a3a15;
+  --accent-foreground: #f3dfa0;
+  --destructive: #f43f5e;
+  --border: #362450;
+  --input: #362450;
+  --ring: #a855f7;
+  --surface: #170e28;
+  --success: #4ade80;
+  --warning: #eab308;
+  --hover: #291a44;
+  --shadow-tint: 40 10 70;
+  --scrollbar-thumb: #3f2a5c;
+  --scrollbar-track: transparent;
+  --selection-bg: #a855f7;
+  --selection-fg: #ffffff;
+}
+
+[data-theme="desert-sand"] {
+  --background: #fbf3e6;
+  --foreground: #4a3524;
+  --card: #fffdf9;
+  --card-foreground: #4a3524;
+  --popover: #fffdf9;
+  --popover-foreground: #4a3524;
+  --primary: #c1622f;
+  --primary-foreground: #fff7ec;
+  --secondary: #ecdcbc;
+  --secondary-foreground: #4a3524;
+  --muted: #f2e6cd;
+  --muted-foreground: #8a7458;
+  --accent: #eaddc3;
+  --accent-foreground: #8a5a34;
+  --destructive: #b91c1c;
+  --border: #e4cea5;
+  --input: #e4cea5;
+  --ring: #c1622f;
+  --surface: #f5e8d3;
+  --success: #4d7c0f;
+  --warning: #b45309;
+  --hover: #f0e0c1;
+  --shadow-tint: 90 55 20;
+  --scrollbar-thumb: #d9bd8d;
+  --scrollbar-track: transparent;
+  --selection-bg: #c1622f;
+  --selection-fg: #fff7ec;
+}
+
+[data-theme="emerald-night"] {
+  --background: #04120d;
+  --foreground: #e3f7ee;
+  --card: #0c221a;
+  --card-foreground: #e3f7ee;
+  --popover: #0c221a;
+  --popover-foreground: #e3f7ee;
+  --primary: #10b981;
+  --primary-foreground: #04150f;
+  --secondary: #163229;
+  --secondary-foreground: #dff5ec;
+  --muted: #0f231c;
+  --muted-foreground: #8fb3a4;
+  --accent: #2a3a36;
+  --accent-foreground: #d4dbd9;
+  --destructive: #f87171;
+  --border: #1c3a2f;
+  --input: #1c3a2f;
+  --ring: #10b981;
+  --surface: #081a14;
+  --success: #34d399;
+  --warning: #f59e0b;
+  --hover: #123527;
+  --shadow-tint: 0 0 0;
+  --scrollbar-thumb: #204638;
+  --scrollbar-track: transparent;
+  --selection-bg: #10b981;
+  --selection-fg: #04150f;
+}
+
+[data-theme="aurora"] {
+  --background: #070b1e;
+  --foreground: #eceeff;
+  --card: #101835;
+  --card-foreground: #eceeff;
+  --popover: #101835;
+  --popover-foreground: #eceeff;
+  --primary: #8098ff;
+  --primary-foreground: #090c22;
+  --secondary: #262a5c;
+  --secondary-foreground: #e6e8ff;
+  --muted: #131a3a;
+  --muted-foreground: #9aa3d6;
+  --accent: #3a2650;
+  --accent-foreground: #ff9bf5;
+  --destructive: #fb7185;
+  --border: #262c5c;
+  --input: #262c5c;
+  --ring: #8098ff;
+  --surface: #0c1230;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --hover: #1a2350;
+  --shadow-tint: 80 60 255;
+  --scrollbar-thumb: #2e356b;
+  --scrollbar-track: transparent;
+  --selection-bg: #8098ff;
+  --selection-fg: #090c22;
 }
 
 @layer base {
@@ -140,12 +475,45 @@
   }
 }
 
+/* Smooth theme switching — only active for ~400ms right after a theme
+   change (toggled by ThemeGalleryProvider), so ordinary hover/focus
+   transitions elsewhere keep their own timing instead of being slowed
+   down permanently. */
+html.theme-transitioning,
+html.theme-transitioning * {
+  transition-property: background-color, border-color, color, box-shadow, fill, stroke, text-decoration-color !important;
+  transition-duration: 320ms !important;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+/* Themed scrollbar + text selection — safe additive globals, no existing
+   behavior changes, just re-skinned per theme. */
+* {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 9999px;
+}
+::selection {
+  background-color: var(--selection-bg);
+  color: var(--selection-fg);
+}
+
 @utility glass-card {
-  @apply rounded-2xl border border-white/20 bg-white/60 shadow-xl shadow-black/5 backdrop-blur-xl dark:border-white/10 dark:bg-white/5 dark:shadow-black/20;
+  @apply rounded-2xl border border-border/30 bg-card/60 shadow-xl shadow-black/5 backdrop-blur-xl dark:border-white/10 dark:bg-card/40 dark:shadow-black/20;
 }
 
 @utility glass-panel {
-  @apply rounded-3xl border border-white/20 bg-white/70 shadow-2xl shadow-black/10 backdrop-blur-2xl dark:border-white/10 dark:bg-neutral-900/60 dark:shadow-black/30;
+  @apply rounded-3xl border border-border/30 bg-card/70 shadow-2xl shadow-black/10 backdrop-blur-2xl dark:border-white/10 dark:bg-card/60 dark:shadow-black/30;
 }
 
 /* Solid "modern card" used across the country page redesign: rounded,

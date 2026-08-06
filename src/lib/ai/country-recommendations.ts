@@ -2,16 +2,13 @@
 
 import { useQuery } from "@tanstack/react-query";
 
-export interface CountryAiRecommendation {
-  summary: string;
-  highlights: string[];
-  food: string[];
-  bestTimeToVisit: string;
-  tips: string[];
-}
+import {
+  normalizeCountryAiRecommendation,
+  type CountryAiRecommendation,
+} from "@/lib/ai/country-knowledge";
 
 interface CountryAiRecommendationResponse {
-  content: CountryAiRecommendation;
+  content: unknown;
   cached: boolean;
   cacheWriteFailed?: boolean;
 }
@@ -32,12 +29,17 @@ async function fetchCountryAiRecommendation(
   }
 
   const data = (await res.json()) as CountryAiRecommendationResponse;
-  return data.content;
+  return normalizeCountryAiRecommendation(data.content, countryName);
 }
 
-export function useCountryAiRecommendation(isoA2: string | undefined, countryName: string | undefined) {
+export type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
+
+export function useCountryAiRecommendation(
+  isoA2: string | undefined,
+  countryName: string | undefined
+) {
   return useQuery({
-    queryKey: ["ai-country-recommendation", isoA2?.toUpperCase() ?? ""],
+    queryKey: ["ai-country-recommendation-v2", isoA2?.toUpperCase() ?? ""],
     enabled: !!isoA2 && !!countryName,
     queryFn: () => fetchCountryAiRecommendation(isoA2!, countryName!),
     staleTime: Infinity,

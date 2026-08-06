@@ -3,12 +3,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  applyAiPlanToWorkspace,
   createDefaultWorkspace,
   createEmptyDay,
   createEmptyItineraryItem,
   createId,
   createJournalEntry,
-  ensureJournalEntriesForDays,
   normalizeWorkspace,
   recommendationToItineraryItem,
   type AiItineraryResponse,
@@ -314,46 +314,7 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
         });
       },
       replaceWithAiPlan(plan: AiItineraryResponse) {
-        updateWorkspace((current) => {
-          const nextDays = plan.days.map((day) => ({
-            id: current.itineraryDays[day.dayNumber - 1]?.id ?? createId("day"),
-            dayNumber: day.dayNumber,
-            title: day.title,
-            date: day.date,
-            notes: [day.notes, day.warnings.join(" "), day.nearbyRestaurantSuggestion ? `מסעדה קרובה: ${day.nearbyRestaurantSuggestion}` : ""]
-              .filter(Boolean)
-              .join("\n"),
-            transportation: day.transportation,
-            items: day.items.map((item) => ({
-              ...createEmptyItineraryItem(item.slot),
-              recommendationId: item.recommendationId,
-              name: item.name,
-              category: item.category,
-              location: item.location,
-              shortDescription: item.shortDescription,
-              slot: item.slot,
-              plannedStartTime: item.plannedStartTime,
-              estimatedDurationMinutes: item.estimatedDurationMinutes,
-              approximatePrice: item.approximatePrice,
-              travelMinutes: item.travelMinutes,
-              transportation: item.transportation,
-              openingHours: item.openingHours,
-              reservationRequired: item.reservationRequired,
-              mapLink: item.mapLink,
-              lat: item.lat,
-              lon: item.lon,
-              alternativeSuggestion: item.alternativeSuggestion,
-              bookingWarning: item.bookingWarning,
-            })),
-          }));
-
-          return {
-            ...current,
-            itineraryDays: nextDays,
-            journalEntries: ensureJournalEntriesForDays(current.journalEntries, nextDays),
-            lastAiPlanSummary: plan.summary,
-          };
-        });
+        updateWorkspace((current) => applyAiPlanToWorkspace(current, plan));
       },
       upsertBooking(booking: TripBooking) {
         updateWorkspace((current) => {
@@ -446,6 +407,9 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
       resetWorkspace() {
         const fresh = createDefaultWorkspace(countryName);
         setWorkspace(fresh);
+      },
+      loadWorkspace(nextWorkspace: CountryTripWorkspaceState) {
+        setWorkspace(normalizeWorkspace(nextWorkspace, countryName));
       },
       createBooking(): TripBooking {
         return {

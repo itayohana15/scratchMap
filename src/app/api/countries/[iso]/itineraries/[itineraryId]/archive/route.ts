@@ -1,0 +1,32 @@
+import { NextResponse } from "next/server";
+
+import { archiveCountryItinerary } from "@/lib/server/country-itineraries";
+import { createClient } from "@/lib/supabase/server";
+
+export async function POST(
+  _request: Request,
+  { params }: { params: Promise<{ iso: string; itineraryId: string }> }
+) {
+  const { iso, itineraryId } = await params;
+  const supabase = await createClient();
+
+  const { data: country } = await supabase
+    .from("countries")
+    .select("name")
+    .eq("iso_a2", iso.toUpperCase())
+    .maybeSingle();
+
+  try {
+    const itinerary = await archiveCountryItinerary(
+      supabase,
+      itineraryId,
+      country?.name ?? iso.toUpperCase()
+    );
+    return NextResponse.json({ itinerary });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Failed to archive itinerary" },
+      { status: 500 }
+    );
+  }
+}

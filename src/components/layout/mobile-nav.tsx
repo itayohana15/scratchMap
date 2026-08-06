@@ -17,7 +17,7 @@ import {
 import { cn } from "@/lib/utils";
 
 export function MobileNav() {
-  const pathname = usePathname();
+  const pathname = usePathname() ?? "";
   const [open, setOpen] = useState(false);
 
   return (

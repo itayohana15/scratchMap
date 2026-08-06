@@ -86,6 +86,133 @@ export interface Database {
           },
         ];
       };
+      country_itineraries: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          country_id: string;
+          iso_a2: string;
+          title: string;
+          start_date: string | null;
+          end_date: string | null;
+          days_count: number;
+          travelers: number;
+          budget: number | null;
+          generation_mode: string;
+          source: string;
+          model: string | null;
+          summary: string | null;
+          preferences_snapshot: unknown;
+          workspace_snapshot: unknown;
+          itinerary_days: unknown;
+          cost_summary: unknown;
+          status: string;
+          version: number;
+          parent_itinerary_id: string | null;
+          manually_edited: boolean;
+          archived: boolean;
+          generated_at: string;
+          deleted_at: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["country_itineraries"]["Row"],
+            | "id"
+            | "user_id"
+            | "start_date"
+            | "end_date"
+            | "days_count"
+            | "travelers"
+            | "budget"
+            | "generation_mode"
+            | "source"
+            | "model"
+            | "summary"
+            | "preferences_snapshot"
+            | "workspace_snapshot"
+            | "itinerary_days"
+            | "cost_summary"
+            | "status"
+            | "version"
+            | "parent_itinerary_id"
+            | "manually_edited"
+            | "archived"
+            | "generated_at"
+            | "deleted_at"
+            | "created_at"
+            | "updated_at"
+          >
+        > &
+          Pick<
+            Database["public"]["Tables"]["country_itineraries"]["Row"],
+            "country_id" | "iso_a2" | "title"
+          >;
+        Update: Partial<Database["public"]["Tables"]["country_itineraries"]["Insert"]>;
+        Relationships: [
+          {
+            foreignKeyName: "country_itineraries_country_id_fkey";
+            columns: ["country_id"];
+            isOneToOne: false;
+            referencedRelation: "countries";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "country_itineraries_parent_itinerary_id_fkey";
+            columns: ["parent_itinerary_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itineraries";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+      country_itinerary_versions: {
+        Row: {
+          id: string;
+          itinerary_id: string;
+          version: number;
+          change_reason: string | null;
+          source: string;
+          model: string | null;
+          snapshot: unknown;
+          restored_from_version_id: string | null;
+          created_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["country_itinerary_versions"]["Row"],
+            | "id"
+            | "change_reason"
+            | "source"
+            | "model"
+            | "snapshot"
+            | "restored_from_version_id"
+            | "created_at"
+          >
+        > &
+          Pick<
+            Database["public"]["Tables"]["country_itinerary_versions"]["Row"],
+            "itinerary_id" | "version"
+          >;
+        Update: Partial<Database["public"]["Tables"]["country_itinerary_versions"]["Insert"]>;
+        Relationships: [
+          {
+            foreignKeyName: "country_itinerary_versions_itinerary_id_fkey";
+            columns: ["itinerary_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itineraries";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "country_itinerary_versions_restored_from_version_id_fkey";
+            columns: ["restored_from_version_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itinerary_versions";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
       trips: {
         Row: {
           id: string;

@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export function Navbar() {
-  const pathname = usePathname();
+  const pathname = usePathname() ?? "";
   const hideNavbar = /^\/countries\/[^/]+$/.test(pathname);
 
   if (hideNavbar) {

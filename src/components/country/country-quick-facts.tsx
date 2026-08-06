@@ -16,16 +16,25 @@ interface FactTileProps {
   icon: ComponentType<{ className?: string }>;
   label: string;
   value: string | null;
+  accentColor?: string;
 }
 
-function FactTile({ icon: Icon, label, value }: FactTileProps) {
+function FactTile({ icon: Icon, label, value, accentColor }: FactTileProps) {
   return (
-    <div className="section-card flex flex-col items-center gap-2 p-5 text-center">
-      <div className="flex size-11 items-center justify-center rounded-full bg-primary/10 text-primary">
+    <div className="section-card flex h-full flex-col items-start gap-4 p-5 text-right">
+      <div
+        className="flex size-11 items-center justify-center rounded-2xl shadow-sm"
+        style={{
+          backgroundColor: accentColor ? `${accentColor}1A` : undefined,
+          color: accentColor,
+        }}
+      >
         <Icon className="size-5" />
       </div>
-      <p className="text-sm font-semibold">{value ?? "—"}</p>
-      <p className="text-xs text-muted-foreground">{label}</p>
+      <div className="space-y-1">
+        <p className="text-base font-semibold text-foreground">{value}</p>
+        <p className="text-xs font-medium text-muted-foreground">{label}</p>
+      </div>
     </div>
   );
 }
@@ -33,9 +42,10 @@ function FactTile({ icon: Icon, label, value }: FactTileProps) {
 interface CountryQuickFactsProps {
   isoA2: string;
   className?: string;
+  accentColor?: string;
 }
 
-export function CountryQuickFacts({ isoA2, className }: CountryQuickFactsProps) {
+export function CountryQuickFacts({ isoA2, className, accentColor }: CountryQuickFactsProps) {
   const { data: facts, isLoading, isError } = useCountryFacts(isoA2);
 
   if (isError) return null;
@@ -59,12 +69,12 @@ export function CountryQuickFacts({ isoA2, className }: CountryQuickFactsProps) 
     { icon: Languages, label: "שפה", value: facts.languages.length > 0 ? facts.languages.join(", ") : null },
     { icon: Ruler, label: "שטח", value: facts.area != null ? `${formatNumber(facts.area)} קמ״ר` : null },
     { icon: Globe2, label: "יבשת", value: facts.continent },
-  ];
+  ].filter((tile) => Boolean(tile.value));
 
   return (
     <div className={cn("grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6", className)}>
       {tiles.map((tile) => (
-        <FactTile key={tile.label} {...tile} />
+        <FactTile key={tile.label} {...tile} accentColor={accentColor} />
       ))}
     </div>
   );

@@ -16,6 +16,7 @@ interface CountryBannerProps {
   showFlagOverlay?: boolean;
   flagOverlayClassName?: string;
   scrimClassName?: string;
+  imageAlt?: string;
 }
 
 export function CountryBanner({
@@ -27,6 +28,7 @@ export function CountryBanner({
   showFlagOverlay = true,
   flagOverlayClassName,
   scrimClassName,
+  imageAlt,
 }: CountryBannerProps) {
   const { data, isLoading, isError } = useCountryPhoto(isoA2);
   const [photoLoaded, setPhotoLoaded] = useState(false);
@@ -38,7 +40,7 @@ export function CountryBanner({
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={data.photoUrl}
-          alt=""
+          alt={imageAlt ?? `תמונת רקע של ${countryName}`}
           className={cn(
             "absolute inset-0 size-full object-cover transition-opacity duration-500",
             photoLoaded ? "opacity-100" : "opacity-0"

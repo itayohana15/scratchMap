@@ -5,12 +5,10 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import type { Feature, MultiPolygon, Polygon } from "geojson";
 import {
   BedDouble,
-  Bot,
   CalendarDays,
-  CircleCheck,
-  DollarSign,
   Filter,
   ImagePlus,
+  LoaderCircle,
   MapPin,
   NotebookPen,
   Plus,
@@ -25,13 +23,13 @@ import { useTheme } from "next-themes";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { generateCountryAiItinerary } from "@/lib/ai/country-itinerary";
 import { AttractionModal } from "@/components/country/attraction-modal";
+import { CountryAboutSection } from "@/components/country/country-about-section";
+import { CountryItineraryHistorySection } from "@/components/country/country-itinerary-history-section";
 import { CountryCitiesSection } from "@/components/country/country-cities-section";
 import { CountryCurrencyConverter } from "@/components/country/country-currency-converter";
 import { CountryNotesSection } from "@/components/country/country-notes-section";
 import { CountryOverviewSection } from "@/components/country/country-overview-section";
-import { CountryQuickFacts } from "@/components/country/country-quick-facts";
 import { CountrySafetyInfo } from "@/components/country/country-safety-info";
 import { CountryRatingsSection } from "@/components/country/country-ratings-section";
 import { CountryStatsSection } from "@/components/country/country-stats-section";
@@ -41,6 +39,7 @@ import type { useCountryTripWorkspace } from "@/components/country/use-country-t
 import { PhotoGallery } from "@/components/gallery/photo-gallery";
 import { CountryAiRecommendations } from "@/components/shared/country-ai-recommendations";
 import { PlacesSection } from "@/components/shared/places-section";
+import { STATUS_COLORS } from "@/components/map/status-colors";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -64,6 +63,8 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { TabsContent } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { createWorkspaceFromItineraryRecord } from "@/lib/itineraries";
+import { useGenerateCountryItinerary } from "@/lib/queries/country-itineraries";
 import { usePlacesForCountry } from "@/lib/queries/places";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureProperties } from "@/lib/map/geo";
@@ -73,13 +74,13 @@ import {
   BOOKING_TYPE_LABELS,
   DAY_PART_LABELS,
   EXPENSE_CATEGORY_LABELS,
+  ITINERARY_GENERATION_MODE_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
   TRIP_STATUS_LABELS,
   buildMapLink,
   buildTripComparison,
   buildTripStatistics,
   createId,
-  getTabOrderForStatus,
   type CountryTripWorkspaceState,
   type DayPart,
   type RecommendationCategory,
@@ -90,7 +91,7 @@ import {
   type TripRecommendation,
   type TripWorkspaceTab,
 } from "@/lib/trip-workspace";
-import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
+import { formatCurrency, formatDate } from "@/lib/format";
 import { fetchCategoryRecommendations, useCategoryRecommendations } from "@/lib/places/country-places";
 import { cn } from "@/lib/utils";
 
@@ -109,6 +110,13 @@ interface CountryTripWorkspaceContentProps {
 const ALL_CATEGORIES = Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[];
 const API_RECOMMENDATION_COUNT = 10;
 const SLOT_OPTIONS: DayPart[] = ["morning", "lunch", "afternoon", "dinner", "evening", "night"];
+const AI_GENERATION_STAGES = [
+  "מנתחים העדפות ותאריכים",
+  "בוחרים ערים ואזורים מתאימים",
+  "מסדרים ימי נסיעה ומנוחה",
+  "מחשבים מסלול ועלויות משוערות",
+  "שומרים את המסלול למסד הנתונים",
+];
 
 function createEmptyRecommendationDraft(): TripRecommendation {
   return {
@@ -155,6 +163,23 @@ function getRecommendationPriceLabel(category: RecommendationCategory) {
     default:
       return "עלות משוערת";
   }
+}
+
+function hexToRgba(hex: string, alpha: number) {
+  const normalized = hex.replace("#", "");
+  const full = normalized.length === 3
+    ? normalized
+        .split("")
+        .map((char) => `${char}${char}`)
+        .join("")
+    : normalized;
+
+  const value = Number.parseInt(full, 16);
+  const red = (value >> 16) & 255;
+  const green = (value >> 8) & 255;
+  const blue = value & 255;
+
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
 }
 
 export function RecommendationImage({
@@ -292,20 +317,6 @@ function buildLiveRecommendations(
     }
   }
   return [...seen.values()];
-}
-
-function findTodayDay(workspace: CountryTripWorkspaceState) {
-  const today = new Date().toISOString().slice(0, 10);
-  return (
-    workspace.itineraryDays.find((day) => day.date === today) ??
-    workspace.itineraryDays.find((day) => day.items.some((item) => !item.completed && !item.skipped)) ??
-    workspace.itineraryDays[0] ??
-    null
-  );
-}
-
-function nextActivity(day: TripItineraryDay | null) {
-  return day?.items.find((item) => !item.completed && !item.skipped) ?? null;
 }
 
 function journalForDay(workspace: CountryTripWorkspaceState, dayId: string) {
@@ -470,8 +481,8 @@ function TripPlannerMap({
         popupNode.className = "w-52 space-y-2 p-1 text-sm";
         popupNode.innerHTML = `
           <p class="font-medium">${recommendation.name}</p>
-          <p class="text-xs text-slate-500">${RECOMMENDATION_CATEGORY_LABELS[recommendation.category]}</p>
-          <p class="text-xs text-slate-500">${recommendation.location || ""}</p>
+          <p class="text-xs text-muted-foreground">${RECOMMENDATION_CATEGORY_LABELS[recommendation.category]}</p>
+          <p class="text-xs text-muted-foreground">${recommendation.location || ""}</p>
         `;
         const addButton = document.createElement("button");
         addButton.type = "button";
@@ -502,13 +513,13 @@ function TripPlannerMap({
         popupNode.className = "w-48 space-y-2 p-1 text-sm";
         popupNode.innerHTML = `
           <p class="font-medium">${item.name}</p>
-          <p class="text-xs text-slate-500">${DAY_PART_LABELS[item.slot]}${item.plannedStartTime ? ` · ${item.plannedStartTime}` : ""}</p>
-          <p class="text-xs text-slate-500">${item.location || ""}</p>
+          <p class="text-xs text-muted-foreground">${DAY_PART_LABELS[item.slot]}${item.plannedStartTime ? ` · ${item.plannedStartTime}` : ""}</p>
+          <p class="text-xs text-muted-foreground">${item.location || ""}</p>
         `;
         const removeButton = document.createElement("button");
         removeButton.type = "button";
         removeButton.className =
-          "w-full rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-700";
+          "w-full rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground";
         removeButton.textContent = "הסרה מהיום";
         removeButton.addEventListener("click", () => onRemoveFromItinerary(selectedDayId, item.id));
         popupNode.appendChild(removeButton);
@@ -691,9 +702,11 @@ function SectionShell({
     <section className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-500 sm:space-y-8">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="font-heading text-2xl font-bold tracking-tight sm:text-3xl">{title}</h2>
+          <h2 className="font-heading text-[1.6rem] font-bold tracking-tight text-foreground sm:text-[1.9rem]">
+            {title}
+          </h2>
           {description && (
-            <p className="mt-2 max-w-2xl text-base leading-[1.8] text-muted-foreground sm:text-lg">
+            <p className="mt-2 max-w-3xl text-sm leading-7 text-muted-foreground sm:text-base">
               {description}
             </p>
           )}
@@ -713,8 +726,8 @@ function PreferenceField({
   children: React.ReactNode;
 }) {
   return (
-    <div className="space-y-1.5">
-      <Label className="text-xs text-muted-foreground">{label}</Label>
+    <div className="space-y-2">
+      <Label className="text-xs font-medium tracking-[0.02em] text-muted-foreground">{label}</Label>
       {children}
     </div>
   );
@@ -846,10 +859,14 @@ export function CountryTripWorkspaceContent({
   workspaceController,
 }: CountryTripWorkspaceContentProps) {
   const { workspace, actions, hydrated } = workspaceController;
+  const accentColor = STATUS_COLORS[country.status].light;
   const { data: attractionPlaces } = usePlacesForCountry(country.id, "attraction");
   const { data: restaurantPlaces } = usePlacesForCountry(country.id, "restaurant");
   const { data: hotelPlaces } = usePlacesForCountry(country.id, "hotel");
+  const generateSavedItinerary = useGenerateCountryItinerary(iso);
   const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
+  const [aiGenerationStageIndex, setAiGenerationStageIndex] = useState(0);
+  const [autoOpenItineraryId, setAutoOpenItineraryId] = useState<string | null>(null);
   const [activeRecommendationCategory, setActiveRecommendationCategory] =
     useState<RecommendationCategory>("attraction");
   const [apiRecommendationsByCategory, setApiRecommendationsByCategory] = useState<
@@ -890,6 +907,21 @@ export function CountryTripWorkspaceContent({
   const [recommendationDialogOpen, setRecommendationDialogOpen] = useState(false);
   const [recommendationDraft, setRecommendationDraft] =
     useState<TripRecommendation>(createEmptyRecommendationDraft);
+
+  useEffect(() => {
+    if (!generateSavedItinerary.isPending) {
+      setAiGenerationStageIndex(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setAiGenerationStageIndex((current) =>
+        current < AI_GENERATION_STAGES.length - 1 ? current + 1 : current
+      );
+    }, 1200);
+
+    return () => window.clearInterval(intervalId);
+  }, [generateSavedItinerary.isPending]);
 
   useEffect(() => {
     if (!workspace.itineraryDays.some((day) => day.id === selectedDayId)) {
@@ -969,10 +1001,6 @@ export function CountryTripWorkspaceContent({
     workspace.preferences.startDate,
   ]);
 
-  const todayDay = findTodayDay(workspace);
-  const nextPlannedActivity = nextActivity(todayDay);
-  const selectedDay =
-    workspace.itineraryDays.find((day) => day.id === selectedDayId) ?? workspace.itineraryDays[0];
   const filteredRecommendations = liveRecommendations.filter(
     (recommendation) => recommendation.category === activeRecommendationCategory
   );
@@ -989,21 +1017,33 @@ export function CountryTripWorkspaceContent({
   }, [liveRecommendations, selectedRecommendation]);
   const budgetComparison = buildTripComparison(workspace);
   const tripStatistics = buildTripStatistics(workspace);
-  const activeTabOrder = getTabOrderForStatus(workspace.tripStatus);
+  const aiGenerationStage = generateSavedItinerary.isPending
+    ? AI_GENERATION_STAGES[aiGenerationStageIndex] ?? AI_GENERATION_STAGES[0]
+    : null;
 
   async function handleAiPlan() {
+    if (!workspace.preferences.startDate || !workspace.preferences.endDate) {
+      toast.error("צריך לבחור תאריכי התחלה וסיום כדי ליצור מסלול מלא.");
+      return;
+    }
+
     try {
-      const response = await generateCountryAiItinerary({
+      setAiGenerationStageIndex(0);
+      const itinerary = await generateSavedItinerary.mutateAsync({
+        countryId: country.id,
         countryName: country.name,
         isoA2: iso.toUpperCase(),
         tripStatus: workspace.tripStatus,
         preferences: workspace.preferences,
         selectedPlaces: workspace.recommendations,
         recommendations: liveRecommendations,
+        bookings: workspace.bookings,
         existingDays: workspace.itineraryDays,
       });
-      actions.replaceWithAiPlan(response);
-      toast.success("נבנה מסלול יום-אחר-יום");
+      actions.loadWorkspace(createWorkspaceFromItineraryRecord(itinerary, country.name));
+      setAutoOpenItineraryId(itinerary.id);
+      setSelectedDayId(itinerary.itineraryDays[0]?.id ?? "");
+      toast.success("המסלול נוצר, נשמר ונפתח בהיסטוריה");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "בניית המסלול נכשלה");
     }
@@ -1047,369 +1087,29 @@ export function CountryTripWorkspaceContent({
   }
 
   return (
-    <>
+    <div
+      className={cn(
+        "space-y-8",
+        "[&_.section-card]:!rounded-[24px] [&_.section-card]:!border-border [&_.section-card]:!bg-card [&_.section-card]:!shadow-sm [&_.section-card]:transition-shadow [&_.section-card]:hover:!shadow-md",
+        "[&_[data-slot=input]]:!h-11 [&_[data-slot=input]]:!rounded-[16px] [&_[data-slot=input]]:!border-input [&_[data-slot=input]]:!bg-background [&_[data-slot=input]]:!px-3.5 [&_[data-slot=input]]:!text-foreground [&_[data-slot=input]]:placeholder:!text-muted-foreground",
+        "[&_[data-slot=textarea]]:!min-h-[110px] [&_[data-slot=textarea]]:!rounded-[18px] [&_[data-slot=textarea]]:!border-input [&_[data-slot=textarea]]:!bg-background [&_[data-slot=textarea]]:!px-3.5 [&_[data-slot=textarea]]:!py-3 [&_[data-slot=textarea]]:!text-foreground [&_[data-slot=textarea]]:placeholder:!text-muted-foreground",
+        "[&_[data-slot=select-trigger]]:!h-11 [&_[data-slot=select-trigger]]:!w-full [&_[data-slot=select-trigger]]:!rounded-[16px] [&_[data-slot=select-trigger]]:!border-input [&_[data-slot=select-trigger]]:!bg-background [&_[data-slot=select-trigger]]:!px-3.5 [&_[data-slot=select-trigger]]:!text-foreground",
+        "[&_[data-slot=select-content]]:!rounded-[18px] [&_[data-slot=select-content]]:!border [&_[data-slot=select-content]]:!border-border [&_[data-slot=select-content]]:!bg-popover [&_[data-slot=select-content]]:!text-popover-foreground"
+      )}
+    >
       <TabsContent value="overview" className={cn("pt-0", activeTab !== "overview" && "hidden")}>
-        <div className="animate-in fade-in slide-in-from-bottom-2 mb-8 duration-500">
-          <CountryQuickFacts isoA2={iso} />
-        </div>
-
         <SectionShell
-          title="Trip overview"
-          description="העמוד משנה דגש לפי מצב הטיול, אבל כל התכנון, היומן והסיכום נשמרים יחד באותו חלל עבודה."
-          action={
-            <Select
-              value={workspace.tripStatus}
-              onValueChange={(value) => actions.setTripStatus(value as TripPhase)}
-            >
-              <SelectTrigger size="sm" className="w-44">
-                <span>{TRIP_STATUS_LABELS[workspace.tripStatus]}</span>
-              </SelectTrigger>
-              <SelectContent>
-                {Object.entries(TRIP_STATUS_LABELS).map(([value, label]) => (
-                  <SelectItem key={value} value={value}>
-                    {label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          }
+          title="סקירת המדינה"
+          description="מדריך עומק למדינה: היסטוריה, תרבות, טבע, מסלולים, עונות, תקציב ומידע פרקטי."
         >
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_360px]">
-            <div className="space-y-4">
-              <div className="section-card grid gap-4 p-4 md:grid-cols-2 xl:grid-cols-3">
-                <PreferenceField label="תאריכי נסיעה">
-                  <div className="grid grid-cols-2 gap-2">
-                    <Input
-                      type="date"
-                      value={workspace.preferences.startDate}
-                      onChange={(event) =>
-                        actions.updatePreferences({ startDate: event.target.value })
-                      }
-                    />
-                    <Input
-                      type="date"
-                      value={workspace.preferences.endDate}
-                      onChange={(event) =>
-                        actions.updatePreferences({ endDate: event.target.value })
-                      }
-                    />
-                  </div>
-                </PreferenceField>
-                <PreferenceField label="מספר נוסעים">
-                  <Input
-                    type="number"
-                    value={workspace.preferences.travelers}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        travelers: Number(event.target.value) || 1,
-                      })
-                    }
-                  />
-                </PreferenceField>
-                <PreferenceField label="תקציב משוער">
-                  <Input
-                    type="number"
-                    value={workspace.preferences.budget ?? ""}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        budget: event.target.value ? Number(event.target.value) : null,
-                      })
-                    }
-                    placeholder="למשל 8500"
-                  />
-                </PreferenceField>
-                <PreferenceField label="Trip style">
-                  <Input
-                    value={workspace.preferences.tripStyle}
-                    onChange={(event) =>
-                      actions.updatePreferences({ tripStyle: event.target.value })
-                    }
-                    placeholder="רומנטי, עירוני, קולינרי..."
-                  />
-                </PreferenceField>
-                <PreferenceField label="קצב">
-                  <Select
-                    value={workspace.preferences.tripPace}
-                    onValueChange={(value) =>
-                      actions.updatePreferences({
-                        tripPace: value as CountryTripWorkspaceState["preferences"]["tripPace"],
-                      })
-                    }
-                  >
-                    <SelectTrigger size="sm">
-                      <span>
-                        {workspace.preferences.tripPace === "relaxed"
-                          ? "רגוע"
-                          : workspace.preferences.tripPace === "balanced"
-                            ? "מאוזן"
-                            : "אינטנסיבי"}
-                      </span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="relaxed">רגוע</SelectItem>
-                      <SelectItem value="balanced">מאוזן</SelectItem>
-                      <SelectItem value="fast">אינטנסיבי</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </PreferenceField>
-                <PreferenceField label="תחבורה מועדפת">
-                  <Input
-                    value={workspace.preferences.transportationPreferences}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        transportationPreferences: event.target.value,
-                      })
-                    }
-                    placeholder="רכב, רכבת, הליכה..."
-                  />
-                </PreferenceField>
-                <PreferenceField label="תחומי עניין">
-                  <Input
-                    value={workspace.preferences.interests}
-                    onChange={(event) =>
-                      actions.updatePreferences({ interests: event.target.value })
-                    }
-                    placeholder="היסטוריה, שווקים, חופים..."
-                  />
-                </PreferenceField>
-                <PreferenceField label="אזור לינה">
-                  <Input
-                    value={workspace.preferences.accommodationArea}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        accommodationArea: event.target.value,
-                      })
-                    }
-                  />
-                </PreferenceField>
-                <PreferenceField label="העדפות תזונתיות ונגישות">
-                  <div className="grid gap-2">
-                    <Input
-                      value={workspace.preferences.dietaryPreferences}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          dietaryPreferences: event.target.value,
-                        })
-                      }
-                      placeholder="צמחוני, ללא גלוטן..."
-                    />
-                    <Input
-                      value={workspace.preferences.accessibilityNeeds}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          accessibilityNeeds: event.target.value,
-                        })
-                      }
-                      placeholder="מעליות, הליכה קצרה..."
-                    />
-                  </div>
-                </PreferenceField>
-              </div>
-
-              <div className="grid gap-3 lg:grid-cols-3">
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">חלון נסיעה</p>
-                  <p className="mt-2 text-lg font-semibold">
-                    {formatDateRange(
-                      workspace.preferences.startDate || null,
-                      workspace.preferences.endDate || null
-                    ) ?? "עוד לא הוגדר"}
-                  </p>
-                </div>
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">ימים במסלול</p>
-                  <p className="mt-2 text-lg font-semibold">{workspace.itineraryDays.length}</p>
-                </div>
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">המלצות פעילות</p>
-                  <p className="mt-2 text-lg font-semibold">{liveRecommendations.length}</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              {workspace.tripStatus === "currently_traveling" ? (
-                <div className="section-card space-y-4 p-4">
-                  <div className="flex items-center gap-2">
-                    <Route className="size-4 text-primary" />
-                    <h3 className="font-medium">המסלול של היום</h3>
-                  </div>
-                  {todayDay ? (
-                    <>
-                      <div className="rounded-2xl border border-border/70 p-3">
-                        <p className="text-sm font-medium">
-                          {todayDay.title}
-                          {todayDay.date ? ` · ${formatDate(todayDay.date)}` : ""}
-                        </p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          {todayDay.items.length} עצירות מתוכננות
-                        </p>
-                      </div>
-                      {nextPlannedActivity ? (
-                        <div className="rounded-2xl border border-primary/25 bg-primary/5 p-3">
-                          <p className="text-sm font-medium">הפעילות הבאה</p>
-                          <p className="mt-1 text-lg font-semibold">{nextPlannedActivity.name}</p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {DAY_PART_LABELS[nextPlannedActivity.slot]}
-                            {nextPlannedActivity.plannedStartTime
-                              ? ` · ${nextPlannedActivity.plannedStartTime}`
-                              : ""}
-                            {nextPlannedActivity.travelMinutes != null
-                              ? ` · ${nextPlannedActivity.travelMinutes} דק' נסיעה`
-                              : ""}
-                          </p>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <Button
-                              size="sm"
-                              className="gap-1.5"
-                              onClick={() =>
-                                actions.updateItem(todayDay.id, nextPlannedActivity.id, {
-                                  completed: true,
-                                  skipped: false,
-                                })
-                              }
-                            >
-                              <CircleCheck className="size-4" />
-                              סמן כהושלם
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() =>
-                                actions.updateItem(todayDay.id, nextPlannedActivity.id, {
-                                  skipped: true,
-                                  completed: false,
-                                })
-                              }
-                            >
-                              דלג
-                            </Button>
-                            {nextPlannedActivity.mapLink && (
-                              <Button
-                                size="sm"
-                                variant="secondary"
-                                nativeButton={false}
-                                render={
-                                  <a
-                                    href={nextPlannedActivity.mapLink}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  />
-                                }
-                              >
-                                ניווט במפה
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-                      ) : (
-                        <p className="text-sm text-muted-foreground">
-                          כל פעילויות היום כבר טופלו. אפשר לעדכן יומן, הוצאות או להוסיף עצירה ספונטנית.
-                        </p>
-                      )}
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <Button
-                          variant="secondary"
-                          className="gap-1.5"
-                          onClick={() => actions.addItem(todayDay.id, "afternoon")}
-                        >
-                          <Plus className="size-4" />
-                          מקום ספונטני
-                        </Button>
-                        <Button
-                          variant="outline"
-                          className="gap-1.5"
-                          onClick={() =>
-                            actions.addExpense("actualExpenses", {
-                              dayId: todayDay.id,
-                              date: todayDay.date,
-                            })
-                          }
-                        >
-                          <DollarSign className="size-4" />
-                          הוצאה יומית
-                        </Button>
-                      </div>
-                    </>
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      אין עדיין ימים במסלול. אפשר ליצור יום חדש או לבנות מסלול עם AI.
-                    </p>
-                  )}
-                </div>
-              ) : workspace.tripStatus === "completed" ? (
-                <div className="section-card space-y-4 p-4">
-                  <div className="flex items-center gap-2">
-                    <Star className="size-4 text-amber-500" />
-                    <h3 className="font-medium">סיכום מהיר</h3>
-                  </div>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl border border-border/70 p-3">
-                      <p className="text-xs text-muted-foreground">זיכרון אהוב</p>
-                      <p className="mt-1 text-sm">{workspace.summary.favoriteMemory || country.favorite_memory || "—"}</p>
-                    </div>
-                    <div className="rounded-2xl border border-border/70 p-3">
-                      <p className="text-xs text-muted-foreground">המקום האהוב</p>
-                      <p className="mt-1 text-sm">{workspace.summary.favoritePlace || "—"}</p>
-                    </div>
-                    <div className="rounded-2xl border border-border/70 p-3">
-                      <p className="text-xs text-muted-foreground">יחס תכנון מול ביצוע</p>
-                      <p className="mt-1 text-sm">
-                        {tripStatistics.completedActivities}/{tripStatistics.plannedActivities} פעילויות הושלמו
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-border/70 p-3">
-                      <p className="text-xs text-muted-foreground">הוצאה בפועל</p>
-                      <p className="mt-1 text-sm">{formatCurrency(tripStatistics.totalActualExpenses)}</p>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="section-card space-y-4 p-4">
-                  <div className="flex items-center gap-2">
-                    <Bot className="size-4 text-primary" />
-                    <h3 className="font-medium">Planning first</h3>
-                  </div>
-                  <p className="text-sm text-muted-foreground">
-                    במצב {TRIP_STATUS_LABELS[workspace.tripStatus]} אנחנו מדגישים קודם את כלי התכנון: העדפות, AI, מסלול, מפה והמלצות.
-                  </p>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <Button className="gap-1.5" onClick={handleAiPlan}>
-                      <Sparkles className="size-4" />
-                      Create itinerary with AI
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      className="gap-1.5"
-                      onClick={() =>
-                        actions.addDay(
-                          selectedDay?.date || workspace.preferences.startDate || ""
-                        )
-                      }
-                    >
-                      <Plus className="size-4" />
-                      הוספת יום
-                    </Button>
-                  </div>
-                  {workspace.lastAiPlanSummary && (
-                    <div className="rounded-2xl border border-primary/20 bg-primary/5 p-3 text-sm">
-                      {workspace.lastAiPlanSummary}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              <div className="section-card p-4">
-                <p className="text-sm font-medium">מיקוד הטאבים לפי מצב הטיול</p>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {activeTabOrder.map((tab) => (
-                    <Badge key={tab} variant={tab === activeTab ? "default" : "outline"}>
-                      {tab}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            </div>
+          <div
+            className="section-card p-6"
+            style={{
+              backgroundColor: hexToRgba(accentColor, 0.05),
+              borderColor: hexToRgba(accentColor, 0.18),
+            }}
+          >
+            <CountryAboutSection isoA2={iso} countryName={country.name} />
           </div>
         </SectionShell>
       </TabsContent>
@@ -1419,9 +1119,13 @@ export function CountryTripWorkspaceContent({
           title="תכנון חכם"
           description="העדפות הטיול, AI itinerary, הזמנות ותובנות route נבנים כאן יחד."
           action={
-            <Button className="gap-1.5" onClick={handleAiPlan}>
-              <Sparkles className="size-4" />
-              Create itinerary with AI
+            <Button className="gap-1.5" onClick={handleAiPlan} disabled={generateSavedItinerary.isPending}>
+              {generateSavedItinerary.isPending ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Sparkles className="size-4" />
+              )}
+              {generateSavedItinerary.isPending ? "Generating itinerary..." : "Create itinerary with AI"}
             </Button>
           }
         >
@@ -1541,19 +1245,245 @@ export function CountryTripWorkspaceContent({
             <div className="section-card space-y-4 p-4">
               <div className="flex items-center gap-2">
                 <Save className="size-4 text-primary" />
-                <h3 className="font-medium">מיקוד תכנוני</h3>
+                <h3 className="font-medium">העדפות טיול</h3>
               </div>
-              <div className="space-y-3 text-sm text-muted-foreground">
-                <p>סטטוס: {TRIP_STATUS_LABELS[workspace.tripStatus]}</p>
-                <p>יעד לינה: {workspace.preferences.accommodationArea || "לא הוגדר"}</p>
-                <p>תקציב: {formatCurrency(workspace.preferences.budget)}</p>
-                <p>תחבורה: {workspace.preferences.transportationPreferences || "לא הוגדר"}</p>
-                <p>תחומי עניין: {workspace.preferences.interests || "לא הוגדר"}</p>
-                <p>העדפות תזונה: {workspace.preferences.dietaryPreferences || "אין"}</p>
-                <p>נגישות: {workspace.preferences.accessibilityNeeds || "אין"}</p>
+              <div className="space-y-4">
+                <PreferenceField label="סטטוס טיול">
+                  <Select
+                    value={workspace.tripStatus}
+                    onValueChange={(value) => actions.setTripStatus(value as TripPhase)}
+                  >
+                    <SelectTrigger>
+                      <span>{TRIP_STATUS_LABELS[workspace.tripStatus]}</span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Object.entries(TRIP_STATUS_LABELS).map(([value, label]) => (
+                        <SelectItem key={value} value={value}>
+                          {label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </PreferenceField>
+
+                <div className="space-y-2">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <p className="text-xs font-medium text-muted-foreground">תאריך התחלה</p>
+                      <Input
+                        type="date"
+                        value={workspace.preferences.startDate}
+                        onChange={(event) =>
+                          actions.updatePreferences({ startDate: event.target.value })
+                        }
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-xs font-medium text-muted-foreground">תאריך סיום</p>
+                      <Input
+                        type="date"
+                        value={workspace.preferences.endDate}
+                        onChange={(event) =>
+                          actions.updatePreferences({ endDate: event.target.value })
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <PreferenceField label="מספר נוסעים">
+                  <Input
+                    type="number"
+                    value={workspace.preferences.travelers}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        travelers: Number(event.target.value) || 1,
+                      })
+                    }
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="תקציב משוער">
+                  <Input
+                    type="number"
+                    value={workspace.preferences.budget ?? ""}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        budget: event.target.value ? Number(event.target.value) : null,
+                      })
+                    }
+                    placeholder="למשל 8500"
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="סגנון טיול">
+                  <Input
+                    value={workspace.preferences.tripStyle}
+                    onChange={(event) =>
+                      actions.updatePreferences({ tripStyle: event.target.value })
+                    }
+                    placeholder="רומנטי, עירוני, קולינרי..."
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="קצב">
+                  <Select
+                    value={workspace.preferences.tripPace}
+                    onValueChange={(value) =>
+                      actions.updatePreferences({
+                        tripPace: value as CountryTripWorkspaceState["preferences"]["tripPace"],
+                      })
+                    }
+                  >
+                    <SelectTrigger>
+                      <span>
+                        {workspace.preferences.tripPace === "relaxed"
+                          ? "רגוע"
+                          : workspace.preferences.tripPace === "balanced"
+                            ? "מאוזן"
+                            : "אינטנסיבי"}
+                      </span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="relaxed">רגוע</SelectItem>
+                      <SelectItem value="balanced">מאוזן</SelectItem>
+                      <SelectItem value="fast">אינטנסיבי</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </PreferenceField>
+
+                <PreferenceField label="Mode ליצירת מסלול">
+                  <Select
+                    value={workspace.preferences.generationMode}
+                    onValueChange={(value) =>
+                      actions.updatePreferences({
+                        generationMode:
+                          value as CountryTripWorkspaceState["preferences"]["generationMode"],
+                      })
+                    }
+                  >
+                    <SelectTrigger>
+                      <span>{ITINERARY_GENERATION_MODE_LABELS[workspace.preferences.generationMode]}</span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Object.entries(ITINERARY_GENERATION_MODE_LABELS).map(([value, label]) => (
+                        <SelectItem key={value} value={value}>
+                          {label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </PreferenceField>
+
+                <PreferenceField label="תחבורה מועדפת">
+                  <Input
+                    value={workspace.preferences.transportationPreferences}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        transportationPreferences: event.target.value,
+                      })
+                    }
+                    placeholder="רכב, רכבת, הליכה..."
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="תחומי עניין">
+                  <Input
+                    value={workspace.preferences.interests}
+                    onChange={(event) =>
+                      actions.updatePreferences({ interests: event.target.value })
+                    }
+                    placeholder="היסטוריה, שווקים, חופים..."
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="אזור לינה">
+                  <Input
+                    value={workspace.preferences.accommodationArea}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        accommodationArea: event.target.value,
+                      })
+                    }
+                    placeholder="מרכז, ליד חוף, ליד תחנה..."
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="אזורים / ערים מועדפים">
+                  <Input
+                    value={workspace.preferences.preferredRegions}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        preferredRegions: event.target.value,
+                      })
+                    }
+                    placeholder="טוקיו וקיוטו, צפון המדינה, חופים..."
+                  />
+                </PreferenceField>
+
+                <PreferenceField label="Must-visit ו-avoid">
+                  <div className="grid gap-3">
+                    <Input
+                      value={workspace.preferences.mustVisitPlaces}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          mustVisitPlaces: event.target.value,
+                        })
+                      }
+                      placeholder="מקומות שחייבים להיכנס למסלול"
+                    />
+                    <Input
+                      value={workspace.preferences.placesToAvoid}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          placesToAvoid: event.target.value,
+                        })
+                      }
+                      placeholder="אזורים או סוגי מקומות שכדאי להימנע מהם"
+                    />
+                  </div>
+                </PreferenceField>
+
+                <PreferenceField label="העדפות תזונה ונגישות">
+                  <div className="grid gap-3">
+                    <Input
+                      value={workspace.preferences.dietaryPreferences}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          dietaryPreferences: event.target.value,
+                        })
+                      }
+                      placeholder="צמחוני, ללא גלוטן..."
+                    />
+                    <Input
+                      value={workspace.preferences.accessibilityNeeds}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          accessibilityNeeds: event.target.value,
+                        })
+                      }
+                      placeholder="מעליות, הליכה קצרה..."
+                    />
+                  </div>
+                </PreferenceField>
+
+                <PreferenceField label="מגבלות בטיחות / הערות חשובות">
+                  <Textarea
+                    value={workspace.preferences.safetyConstraints}
+                    onChange={(event) =>
+                      actions.updatePreferences({
+                        safetyConstraints: event.target.value,
+                      })
+                    }
+                    rows={3}
+                    placeholder="למשל הימנעות מהעברות לילה, הליכה קצרה בלבד, אזורים בטוחים יותר..."
+                  />
+                </PreferenceField>
               </div>
               <div className="rounded-2xl border border-border/70 p-3 text-sm">
-                {workspace.lastAiPlanSummary || "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
+                {generateSavedItinerary.isPending
+                  ? `כרגע: ${aiGenerationStage}`
+                  : workspace.lastAiPlanSummary || "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
               </div>
             </div>
           </div>
@@ -1563,7 +1493,7 @@ export function CountryTripWorkspaceContent({
       <TabsContent value="itinerary" className={cn("pt-0", activeTab !== "itinerary" && "hidden")}>
         <SectionShell
           title="Itinerary builder"
-          description="יום אחר יום, בוקר עד לילה, עם move up/down, duplication, optional, bookings ו-planned מול actual."
+          description="היסטוריית מסלולים שמורים לצד ה-workspace המקומי: פתיחה, עריכה, גרסאות ו-planned מול actual."
           action={
             <Button
               variant="secondary"
@@ -1577,6 +1507,18 @@ export function CountryTripWorkspaceContent({
           }
         >
           <div className="space-y-4">
+            <CountryItineraryHistorySection
+              iso={iso}
+              country={country}
+              workspace={workspace}
+              isGenerating={generateSavedItinerary.isPending}
+              generationStage={aiGenerationStage}
+              autoOpenItineraryId={autoOpenItineraryId}
+              onAutoOpenHandled={() => setAutoOpenItineraryId(null)}
+              onGenerate={handleAiPlan}
+              onLoadWorkspace={actions.loadWorkspace}
+            />
+
             {workspace.itineraryDays.map((day) => (
               <div key={day.id} className="section-card space-y-4 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1951,20 +1893,26 @@ export function CountryTripWorkspaceContent({
               </div>
               <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
                 <div className="grid gap-2 sm:grid-cols-2">
-                  <Input
-                    type="date"
-                    value={workspace.preferences.startDate}
-                    onChange={(event) =>
-                      actions.updatePreferences({ startDate: event.target.value })
-                    }
-                  />
-                  <Input
-                    type="date"
-                    value={workspace.preferences.endDate}
-                    onChange={(event) =>
-                      actions.updatePreferences({ endDate: event.target.value })
-                    }
-                  />
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-medium text-muted-foreground">תאריך התחלה</p>
+                    <Input
+                      type="date"
+                      value={workspace.preferences.startDate}
+                      onChange={(event) =>
+                        actions.updatePreferences({ startDate: event.target.value })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-medium text-muted-foreground">תאריך סיום</p>
+                    <Input
+                      type="date"
+                      value={workspace.preferences.endDate}
+                      onChange={(event) =>
+                        actions.updatePreferences({ endDate: event.target.value })
+                      }
+                    />
+                  </div>
                 </div>
                 <Button
                   className="gap-1.5 lg:min-w-40"
@@ -2929,6 +2877,6 @@ export function CountryTripWorkspaceContent({
           <CountryCurrencyConverter isoA2={iso} countryName={country.name} />
         </SectionShell>
       </TabsContent>
-    </>
+    </div>
   );
 }

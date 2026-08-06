@@ -1,6 +1,15 @@
 import { differenceInCalendarDays, parseISO } from "date-fns";
 
 export type TripPhase = "planning" | "booked" | "currently_traveling" | "completed";
+export type ItineraryGenerationMode =
+  | "balanced"
+  | "cheapest"
+  | "fastest"
+  | "relaxed"
+  | "intensive"
+  | "family_friendly"
+  | "walking_friendly"
+  | "safer_route";
 
 export type TripWorkspaceTab =
   | "overview"
@@ -51,11 +60,16 @@ export interface TripPreferences {
   budget: number | null;
   tripStyle: string;
   tripPace: "relaxed" | "balanced" | "fast";
+  generationMode: ItineraryGenerationMode;
   interests: string;
   transportationPreferences: string;
   accommodationArea: string;
   dietaryPreferences: string;
   accessibilityNeeds: string;
+  preferredRegions: string;
+  mustVisitPlaces: string;
+  placesToAvoid: string;
+  safetyConstraints: string;
 }
 
 export interface TripRecommendation {
@@ -93,15 +107,18 @@ export interface TripItineraryItem {
   slot: DayPart;
   plannedStartTime: string;
   actualStartTime: string;
+  actualEndTime: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
   actualCost: number | null;
   travelMinutes: number | null;
   transportation: string;
+  actualTransportation: string;
   openingHours: string;
   reservationRequired: boolean;
   bookingCompleted: boolean;
   optional: boolean;
+  locked: boolean;
   completed: boolean;
   skipped: boolean;
   plannedNotes: string;
@@ -123,8 +140,18 @@ export interface TripItineraryDay {
   dayNumber: number;
   title: string;
   date: string;
+  cityRegion: string;
+  accommodation: string;
   notes: string;
   transportation: string;
+  estimatedCost: number | null;
+  totalTravelMinutes: number | null;
+  warnings: string[];
+  alternatives: string[];
+  bookingRequirements: string[];
+  safetyNotes: string[];
+  restWindow: string;
+  transportSegments: string[];
   items: TripItineraryItem[];
 }
 
@@ -188,7 +215,7 @@ export interface TripSummary {
 }
 
 export interface CountryTripWorkspaceState {
-  version: 1;
+  version: 2;
   tripStatus: TripPhase;
   preferences: TripPreferences;
   recommendations: TripRecommendation[];
@@ -232,13 +259,18 @@ export interface TripComparison {
 }
 
 export interface AiItineraryRequest {
+  countryId: string;
   countryName: string;
   isoA2: string;
   tripStatus: TripPhase;
   preferences: TripPreferences;
   selectedPlaces: TripRecommendation[];
   recommendations: TripRecommendation[];
+  bookings: TripBooking[];
   existingDays: TripItineraryDay[];
+  regenerationScope?: "full" | "day" | "activity" | "optimize_route" | "recalculate_costs";
+  targetDayId?: string | null;
+  targetItemId?: string | null;
 }
 
 export interface AiGeneratedItem {
@@ -266,19 +298,46 @@ export interface AiGeneratedDay {
   dayNumber: number;
   date: string;
   title: string;
+  cityRegion: string;
+  accommodation: string;
   notes: string;
   transportation: string;
   estimatedCost: number | null;
+  activityCost: number | null;
+  foodCost: number | null;
+  transportCost: number | null;
+  accommodationCost: number | null;
   totalTravelMinutes: number | null;
   warnings: string[];
-  nearbyRestaurantSuggestion: string;
+  alternatives: string[];
+  bookingRequirements: string[];
+  safetyNotes: string[];
+  restWindow: string;
+  transportSegments: string[];
   items: AiGeneratedItem[];
 }
 
 export interface AiItineraryResponse {
   summary: string;
+  title: string;
+  totalEstimatedCost: number | null;
+  estimatedTransportCost: number | null;
+  averageDailyCost: number | null;
+  costPerTraveler: number | null;
+  categoryBreakdown: Record<string, number>;
   days: AiGeneratedDay[];
 }
+
+export const ITINERARY_GENERATION_MODE_LABELS: Record<ItineraryGenerationMode, string> = {
+  balanced: "מאוזן",
+  cheapest: "הכי חסכוני",
+  fastest: "הכי מהיר",
+  relaxed: "רגוע",
+  intensive: "אינטנסיבי",
+  family_friendly: "ידידותי למשפחה",
+  walking_friendly: "ידידותי להליכה",
+  safer_route: "מסלול בטוח יותר",
+};
 
 export const TRIP_STATUS_LABELS: Record<TripPhase, string> = {
   planning: "בתכנון",
@@ -448,15 +507,18 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     slot,
     plannedStartTime: "",
     actualStartTime: "",
+    actualEndTime: "",
     estimatedDurationMinutes: null,
     approximatePrice: null,
     actualCost: null,
     travelMinutes: null,
     transportation: "",
+    actualTransportation: "",
     openingHours: "",
     reservationRequired: false,
     bookingCompleted: false,
     optional: false,
+    locked: false,
     completed: false,
     skipped: false,
     plannedNotes: "",
@@ -497,8 +559,18 @@ export function createEmptyDay(dayNumber: number, date = ""): TripItineraryDay {
     dayNumber,
     title: `Day ${dayNumber}`,
     date,
+    cityRegion: "",
+    accommodation: "",
     notes: "",
     transportation: "",
+    estimatedCost: null,
+    totalTravelMinutes: null,
+    warnings: [],
+    alternatives: [],
+    bookingRequirements: [],
+    safetyNotes: [],
+    restWindow: "",
+    transportSegments: [],
     items: [],
   };
 }
@@ -520,7 +592,7 @@ export function createJournalEntry(dayId: string, date = ""): TripJournalEntry {
 
 export function createDefaultWorkspace(countryName: string): CountryTripWorkspaceState {
   return {
-    version: 1,
+    version: 2,
     tripStatus: "planning",
     preferences: {
       startDate: "",
@@ -529,11 +601,16 @@ export function createDefaultWorkspace(countryName: string): CountryTripWorkspac
       budget: null,
       tripStyle: "חוויות מגוונות",
       tripPace: "balanced",
+      generationMode: "balanced",
       interests: "",
       transportationPreferences: "",
       accommodationArea: "",
       dietaryPreferences: "",
       accessibilityNeeds: "",
+      preferredRegions: "",
+      mustVisitPlaces: "",
+      placesToAvoid: "",
+      safetyConstraints: "",
     },
     recommendations: [],
     itineraryDays: [createEmptyDay(1), createEmptyDay(2), createEmptyDay(3)],
@@ -578,10 +655,14 @@ export function normalizeWorkspace(
   const days =
     workspace.itineraryDays && workspace.itineraryDays.length > 0
       ? workspace.itineraryDays.map((day, index) => ({
+          ...createEmptyDay(index + 1, day.date ?? ""),
           ...day,
           dayNumber: index + 1,
           title: day.title || `Day ${index + 1}`,
-          items: day.items ?? [],
+          items: (day.items ?? []).map((item) => ({
+            ...createEmptyItineraryItem(item.slot ?? "morning"),
+            ...item,
+          })),
         }))
       : base.itineraryDays;
 
@@ -932,15 +1013,42 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       date:
         input.existingDays[dayNumber - 1]?.date || dateForDayNumber(input.preferences.startDate, dayNumber),
       title: `Day ${dayNumber}`,
+      cityRegion: items[0]?.location || input.countryName,
+      accommodation: input.preferences.accommodationArea || "",
       notes:
         input.preferences.tripPace === "relaxed"
           ? "השאירו חלון לגמישות ולקצב נעים בין העצירות."
           : "התחילו בזמן כדי להרוויח את כל העצירות בלי לחץ מיותר.",
       transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
       estimatedCost: estimatedCost > 0 ? estimatedCost : null,
+      activityCost:
+        items
+          .filter((item) => item.category !== "restaurant" && item.category !== "cafe")
+          .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null,
+      foodCost:
+        items
+          .filter((item) => item.category === "restaurant" || item.category === "cafe")
+          .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null,
+      transportCost: null,
+      accommodationCost: null,
       totalTravelMinutes: totalTravelMinutes > 0 ? totalTravelMinutes : null,
       warnings,
-      nearbyRestaurantSuggestion,
+      alternatives: nearbyRestaurantSuggestion ? [nearbyRestaurantSuggestion] : [],
+      bookingRequirements: items
+        .filter((item) => item.reservationRequired)
+        .map((item) => `${item.name}: מומלץ להזמין מראש.`),
+      safetyNotes: [],
+      restWindow:
+        input.preferences.tripPace === "relaxed"
+          ? "המסלול כולל חלונות גמישות למנוחה ולהתאוששות."
+          : "",
+      transportSegments: items
+        .map((item) =>
+          item.travelMinutes != null && item.travelMinutes > 0
+            ? `${item.transportation || input.preferences.transportationPreferences || "תחבורה מקומית"} · ${item.travelMinutes} דק'`
+            : ""
+        )
+        .filter(Boolean),
       items,
     });
   }
@@ -950,6 +1058,79 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       input.tripStatus === "currently_traveling"
         ? "נבנה מסלול פרקטי להמשך הימים הקרובים עם דגש על קצב, מרחקים ואפשרויות גיבוי."
         : "נבנה מסלול יום-אחר-יום שמאזן בין אתרים, אוכל ולוגיסטיקה בלי להפוך למאמר כללי.",
+    title: `${input.countryName} · ${input.preferences.startDate || "ללא תאריך"}${input.preferences.endDate ? ` עד ${input.preferences.endDate}` : ""}`,
+    totalEstimatedCost: days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) || null,
+    estimatedTransportCost: null,
+    averageDailyCost:
+      days.length > 0
+        ? Math.round(days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) / days.length)
+        : null,
+    costPerTraveler:
+      input.preferences.travelers > 0
+        ? Math.round(
+            days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) / input.preferences.travelers
+          ) || null
+        : null,
+    categoryBreakdown: {
+      attractions: days.reduce(
+        (sum, day) => sum + (day.activityCost ?? 0),
+        0
+      ),
+      food: days.reduce((sum, day) => sum + (day.foodCost ?? 0), 0),
+    },
     days,
+  };
+}
+
+export function applyAiPlanToWorkspace(
+  current: CountryTripWorkspaceState,
+  plan: AiItineraryResponse
+): CountryTripWorkspaceState {
+  const nextDays = plan.days.map((day) => ({
+    ...createEmptyDay(day.dayNumber, day.date),
+    id: current.itineraryDays[day.dayNumber - 1]?.id ?? createId("day"),
+    dayNumber: day.dayNumber,
+    title: day.title,
+    date: day.date,
+    cityRegion: day.cityRegion,
+    accommodation: day.accommodation,
+    notes: day.notes,
+    transportation: day.transportation,
+    estimatedCost: day.estimatedCost,
+    totalTravelMinutes: day.totalTravelMinutes,
+    warnings: day.warnings,
+    alternatives: day.alternatives,
+    bookingRequirements: day.bookingRequirements,
+    safetyNotes: day.safetyNotes,
+    restWindow: day.restWindow,
+    transportSegments: day.transportSegments,
+    items: day.items.map((item) => ({
+      ...createEmptyItineraryItem(item.slot),
+      recommendationId: item.recommendationId,
+      name: item.name,
+      category: item.category,
+      location: item.location,
+      shortDescription: item.shortDescription,
+      slot: item.slot,
+      plannedStartTime: item.plannedStartTime,
+      estimatedDurationMinutes: item.estimatedDurationMinutes,
+      approximatePrice: item.approximatePrice,
+      travelMinutes: item.travelMinutes,
+      transportation: item.transportation,
+      openingHours: item.openingHours,
+      reservationRequired: item.reservationRequired,
+      mapLink: item.mapLink,
+      lat: item.lat,
+      lon: item.lon,
+      alternativeSuggestion: item.alternativeSuggestion,
+      bookingWarning: item.bookingWarning,
+    })),
+  }));
+
+  return {
+    ...current,
+    itineraryDays: nextDays,
+    journalEntries: ensureJournalEntriesForDays(current.journalEntries, nextDays),
+    lastAiPlanSummary: plan.summary,
   };
 }
