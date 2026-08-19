@@ -1043,6 +1043,51 @@ export function CountryTripWorkspaceContent({
     ? AI_GENERATION_STAGES[aiGenerationStageIndex] ?? AI_GENERATION_STAGES[0]
     : null;
 
+  async function buildRecommendationsForAiGeneration() {
+    if (!iso) return liveRecommendations;
+
+    const categoriesToFetch = ALL_CATEGORIES.filter(
+      (category) => !apiRecommendationsByCategory[category]
+    );
+
+    if (categoriesToFetch.length === 0) {
+      return liveRecommendations;
+    }
+
+    const results = await Promise.allSettled(
+      categoriesToFetch.map(async (category) => {
+        const result = await fetchCategoryRecommendations(
+          iso,
+          category,
+          API_RECOMMENDATION_COUNT,
+          workspace.preferences.startDate || undefined,
+          workspace.preferences.endDate || undefined
+        );
+        return [category, result.places] as const;
+      })
+    );
+
+    const nextRecommendationsByCategory = {
+      ...apiRecommendationsByCategory,
+    } as Partial<Record<RecommendationCategory, TripRecommendation[]>>;
+
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const [category, recommendations] = result.value;
+      nextRecommendationsByCategory[category] = recommendations;
+    }
+
+    setApiRecommendationsByCategory(nextRecommendationsByCategory);
+
+    return buildLiveRecommendations(
+      workspace,
+      Object.values(nextRecommendationsByCategory).flat(),
+      attractionPlaces,
+      restaurantPlaces,
+      hotelPlaces
+    );
+  }
+
   async function handleAiPlan() {
     if (!workspace.preferences.startDate || !workspace.preferences.endDate) {
       toast.error("צריך לבחור תאריכי התחלה וסיום כדי ליצור מסלול מלא.");
@@ -1052,6 +1097,7 @@ export function CountryTripWorkspaceContent({
     try {
       setAiGenerationStageIndex(0);
       setSuccessDialogPayload(null);
+      const recommendationsForGeneration = await buildRecommendationsForAiGeneration();
       const result = await generateSavedItinerary.mutateAsync({
         countryId: country.id,
         countryName: country.name,
@@ -1059,7 +1105,7 @@ export function CountryTripWorkspaceContent({
         tripStatus: workspace.tripStatus,
         preferences: workspace.preferences,
         selectedPlaces: workspace.recommendations,
-        recommendations: liveRecommendations,
+        recommendations: recommendationsForGeneration,
         bookings: workspace.bookings,
         existingDays: workspace.itineraryDays,
       });
@@ -1538,367 +1584,17 @@ export function CountryTripWorkspaceContent({
       </TabsContent>
 
       <TabsContent value="itinerary" className={cn("pt-0", activeTab !== "itinerary" && "hidden")}>
-        <SectionShell
-          title="Itinerary builder"
-          description="היסטוריית מסלולים שמורים לצד ה-workspace המקומי: פתיחה, עריכה, גרסאות ו-planned מול actual."
-          action={
-            <Button
-              variant="secondary"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => actions.addDay(workspace.preferences.startDate)}
-            >
-              <Plus className="size-4" />
-              Day חדש
-            </Button>
-          }
-        >
-          <div className="space-y-4">
-            <CountryItineraryHistorySection
-              iso={iso}
-              country={country}
-              workspace={workspace}
-              isGenerating={generateSavedItinerary.isPending}
-              generationStage={aiGenerationStage}
-              autoOpenItineraryId={autoOpenItineraryId}
-              onAutoOpenHandled={() => setAutoOpenItineraryId(null)}
-              onGenerate={handleAiPlan}
-              onLoadWorkspace={actions.loadWorkspace}
-            />
-
-            {workspace.itineraryDays.map((day) => (
-              <div key={day.id} className="section-card space-y-4 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="grid gap-2 sm:grid-cols-3">
-                    <Input
-                      value={day.title}
-                      onChange={(event) =>
-                        actions.updateDay(day.id, { title: event.target.value })
-                      }
-                    />
-                    <Input
-                      type="date"
-                      value={day.date}
-                      onChange={(event) =>
-                        actions.updateDay(day.id, { date: event.target.value })
-                      }
-                    />
-                    <Input
-                      value={day.transportation}
-                      onChange={(event) =>
-                        actions.updateDay(day.id, { transportation: event.target.value })
-                      }
-                      placeholder="תחבורה עיקרית"
-                    />
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setSelectedDayId(day.id)}
-                    >
-                      הצג במפה
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => actions.duplicateDay(day.id)}
-                    >
-                      שכפול יום
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => actions.removeDay(day.id)}
-                    >
-                      מחיקה
-                    </Button>
-                  </div>
-                </div>
-
-                <Textarea
-                  value={day.notes}
-                  onChange={(event) =>
-                    actions.updateDay(day.id, { notes: event.target.value })
-                  }
-                  rows={2}
-                  placeholder="תכנון יומי, חלונות זמן, תחבורה, מה חשוב לא לפספס..."
-                />
-
-                <div className="space-y-3">
-                  {day.items.length > 0 ? (
-                    day.items.map((item) => (
-                      <div
-                        key={item.id}
-                        className="rounded-[1.5rem] border border-border/70 bg-background/70 p-4"
-                      >
-                        <div className="grid gap-3 xl:grid-cols-[minmax(0,1.1fr)_repeat(4,minmax(0,160px))]">
-                          <div className="space-y-3">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Input
-                                value={item.name}
-                                onChange={(event) =>
-                                  actions.updateItem(day.id, item.id, {
-                                    name: event.target.value,
-                                  })
-                                }
-                                placeholder="שם פעילות"
-                              />
-                              {plannedVsActualBadge(item)}
-                            </div>
-                            <Input
-                              value={item.location}
-                              onChange={(event) =>
-                                actions.updateItem(day.id, item.id, {
-                                  location: event.target.value,
-                                })
-                              }
-                              placeholder="מיקום"
-                            />
-                            <Textarea
-                              value={item.plannedNotes}
-                              onChange={(event) =>
-                                actions.updateItem(day.id, item.id, {
-                                  plannedNotes: event.target.value,
-                                })
-                              }
-                              rows={2}
-                              placeholder="הערות תכנון"
-                            />
-                          </div>
-
-                          <Select
-                            value={item.slot}
-                            onValueChange={(value) =>
-                              actions.updateItem(day.id, item.id, {
-                                slot: value as DayPart,
-                              })
-                            }
-                          >
-                            <SelectTrigger size="sm">
-                              <span>{DAY_PART_LABELS[item.slot]}</span>
-                            </SelectTrigger>
-                            <SelectContent>
-                              {SLOT_OPTIONS.map((slot) => (
-                                <SelectItem key={slot} value={slot}>
-                                  {DAY_PART_LABELS[slot]}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-
-                          <Input
-                            type="time"
-                            value={item.plannedStartTime}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                plannedStartTime: event.target.value,
-                              })
-                            }
-                          />
-                          <Input
-                            type="number"
-                            value={item.estimatedDurationMinutes ?? ""}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                estimatedDurationMinutes: event.target.value
-                                  ? Number(event.target.value)
-                                  : null,
-                              })
-                            }
-                            placeholder="דקות"
-                          />
-                          <Input
-                            type="number"
-                            value={item.approximatePrice ?? ""}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                approximatePrice: event.target.value
-                                  ? Number(event.target.value)
-                                  : null,
-                              })
-                            }
-                            placeholder="מחיר"
-                          />
-                          <Input
-                            value={item.transportation}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                transportation: event.target.value,
-                              })
-                            }
-                            placeholder="תחבורה"
-                          />
-                        </div>
-
-                        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-[repeat(5,minmax(0,1fr))_160px]">
-                          <Input
-                            value={item.openingHours}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                openingHours: event.target.value,
-                              })
-                            }
-                            placeholder="שעות פתיחה"
-                          />
-                          <Input
-                            value={item.mapLink}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                mapLink: event.target.value,
-                              })
-                            }
-                            placeholder="קישור מפה"
-                          />
-                          <Input
-                            type="number"
-                            value={item.travelMinutes ?? ""}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                travelMinutes: event.target.value
-                                  ? Number(event.target.value)
-                                  : null,
-                              })
-                            }
-                            placeholder="דקות נסיעה"
-                          />
-                          <Input
-                            value={item.alternativeSuggestion}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                alternativeSuggestion: event.target.value,
-                              })
-                            }
-                            placeholder="אלטרנטיבה"
-                          />
-                          <Input
-                            value={item.bookingWarning}
-                            onChange={(event) =>
-                              actions.updateItem(day.id, item.id, {
-                                bookingWarning: event.target.value,
-                              })
-                            }
-                            placeholder="אזהרת הזמנה"
-                          />
-                          <Select
-                            value={day.id}
-                            onValueChange={(value) => {
-                              if (value) {
-                                actions.moveItemToDay(day.id, value, item.id);
-                              }
-                            }}
-                          >
-                            <SelectTrigger size="sm">
-                              <span>העבר יום</span>
-                            </SelectTrigger>
-                            <SelectContent>
-                              {workspace.itineraryDays.map((targetDay) => (
-                                <SelectItem key={targetDay.id} value={targetDay.id}>
-                                  {targetDay.title}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
-
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <Button
-                            variant={item.optional ? "default" : "outline"}
-                            size="sm"
-                            onClick={() =>
-                              actions.updateItem(day.id, item.id, {
-                                optional: !item.optional,
-                              })
-                            }
-                          >
-                            אופציונלי
-                          </Button>
-                          <Button
-                            variant={item.bookingCompleted ? "default" : "outline"}
-                            size="sm"
-                            onClick={() =>
-                              actions.updateItem(day.id, item.id, {
-                                bookingCompleted: !item.bookingCompleted,
-                              })
-                            }
-                          >
-                            booking הושלם
-                          </Button>
-                          <Button
-                            variant={item.completed ? "default" : "outline"}
-                            size="sm"
-                            onClick={() =>
-                              actions.updateItem(day.id, item.id, {
-                                completed: !item.completed,
-                                skipped: item.completed ? item.skipped : false,
-                              })
-                            }
-                          >
-                            הושלם בפועל
-                          </Button>
-                          <Button
-                            variant={item.skipped ? "default" : "outline"}
-                            size="sm"
-                            onClick={() =>
-                              actions.updateItem(day.id, item.id, {
-                                skipped: !item.skipped,
-                                completed: item.skipped ? item.completed : false,
-                              })
-                            }
-                          >
-                            דולג
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => actions.moveItem(day.id, item.id, "up")}
-                          >
-                            למעלה
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => actions.moveItem(day.id, item.id, "down")}
-                          >
-                            למטה
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => actions.duplicateItem(day.id, item.id)}
-                          >
-                            שכפול
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => actions.removeItem(day.id, item.id)}
-                          >
-                            מחיקה
-                          </Button>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="rounded-2xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      עדיין אין עצירות ליום הזה. אפשר להוסיף ידנית או למשוך המלצות לטאב Recommendation.
-                    </div>
-                  )}
-                </div>
-
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="gap-1.5"
-                  onClick={() => actions.addItem(day.id, "morning")}
-                >
-                  <Plus className="size-4" />
-                  הוספת פעילות
-                </Button>
-              </div>
-            ))}
-          </div>
-        </SectionShell>
+        <CountryItineraryHistorySection
+          iso={iso}
+          country={country}
+          workspace={workspace}
+          isGenerating={generateSavedItinerary.isPending}
+          generationStage={aiGenerationStage}
+          autoOpenItineraryId={autoOpenItineraryId}
+          onAutoOpenHandled={() => setAutoOpenItineraryId(null)}
+          onGenerate={handleAiPlan}
+          onLoadWorkspace={actions.loadWorkspace}
+        />
       </TabsContent>
 
       <TabsContent value="map" className={cn("pt-0", activeTab !== "map" && "hidden")}>

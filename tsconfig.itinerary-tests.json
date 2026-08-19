@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "rootDir": ".",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2020",
+    "lib": ["es2020"],
+    "incremental": false,
+    "isolatedModules": false
+  },
+  "include": [
+    "src/lib/trip-workspace.ts",
+    "src/lib/server/itinerary-generation-constraints.ts",
+    "src/lib/server/itinerary-planning-principles.ts",
+    "tests/itinerary-generation-constraints.test.ts",
+    "tests/itinerary-planning-principles.test.ts"
+  ],
+  "exclude": ["node_modules", ".next"]
+}

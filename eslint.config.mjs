@@ -17,6 +17,7 @@ const eslintConfig = [
       ".next/**",
       "out/**",
       "build/**",
+      ".test-dist/**",
       "next-env.d.ts",
       // Vendored maplibre-gl runtime bundles (see scripts/copy-maplibre-assets.mjs)
       "public/maplibre/**",

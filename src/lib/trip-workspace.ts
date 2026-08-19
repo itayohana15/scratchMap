@@ -83,6 +83,11 @@ export interface TripRecommendation {
   openingHours: string;
   recommendedTimeOfDay: DayPart | "any";
   reservationRequired: boolean;
+  priceOriginalAmount?: number | null;
+  priceOriginalCurrency?: string | null;
+  priceConvertedAmount?: number | null;
+  priceExchangeRate?: number | null;
+  priceRateTimestamp?: string | null;
   mapLink: string;
   imageUrl: string;
   imageQuery: string;
@@ -110,6 +115,11 @@ export interface TripItineraryItem {
   actualEndTime: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
+  priceOriginalAmount: number | null;
+  priceOriginalCurrency: string | null;
+  priceConvertedAmount: number | null;
+  priceExchangeRate: number | null;
+  priceRateTimestamp: string | null;
   actualCost: number | null;
   travelMinutes: number | null;
   transportation: string;
@@ -142,9 +152,16 @@ export interface TripItineraryDay {
   date: string;
   cityRegion: string;
   accommodation: string;
+  accommodationMapLink: string;
+  accommodationLat: number | null;
+  accommodationLon: number | null;
   notes: string;
   transportation: string;
   estimatedCost: number | null;
+  activityCost: number | null;
+  foodCost: number | null;
+  transportCost: number | null;
+  accommodationCost: number | null;
   totalTravelMinutes: number | null;
   warnings: string[];
   alternatives: string[];
@@ -282,6 +299,11 @@ export interface AiGeneratedItem {
   plannedStartTime: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
+  priceOriginalAmount: number | null;
+  priceOriginalCurrency: string | null;
+  priceConvertedAmount: number | null;
+  priceExchangeRate: number | null;
+  priceRateTimestamp: string | null;
   travelMinutes: number | null;
   openingHours: string;
   reservationRequired: boolean;
@@ -429,8 +451,6 @@ const PACE_ACTIVITY_LIMITS: Record<TripPreferences["tripPace"], number> = {
   fast: 5,
 };
 
-const AI_SLOT_ORDER: DayPart[] = ["morning", "lunch", "afternoon", "dinner", "evening"];
-
 function pad(number: number) {
   return String(number).padStart(2, "0");
 }
@@ -510,6 +530,11 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     actualEndTime: "",
     estimatedDurationMinutes: null,
     approximatePrice: null,
+    priceOriginalAmount: null,
+    priceOriginalCurrency: null,
+    priceConvertedAmount: null,
+    priceExchangeRate: null,
+    priceRateTimestamp: null,
     actualCost: null,
     travelMinutes: null,
     transportation: "",
@@ -545,6 +570,11 @@ export function recommendationToItineraryItem(recommendation: TripRecommendation
     shortDescription: recommendation.shortDescription,
     estimatedDurationMinutes: recommendation.estimatedDurationMinutes,
     approximatePrice: recommendation.approximatePrice,
+    priceOriginalAmount: recommendation.priceOriginalAmount ?? recommendation.approximatePrice,
+    priceOriginalCurrency: recommendation.priceOriginalCurrency ?? null,
+    priceConvertedAmount: recommendation.priceConvertedAmount ?? recommendation.approximatePrice,
+    priceExchangeRate: recommendation.priceExchangeRate ?? null,
+    priceRateTimestamp: recommendation.priceRateTimestamp ?? null,
     openingHours: recommendation.openingHours,
     reservationRequired: recommendation.reservationRequired,
     mapLink: recommendation.mapLink,
@@ -561,9 +591,16 @@ export function createEmptyDay(dayNumber: number, date = ""): TripItineraryDay {
     date,
     cityRegion: "",
     accommodation: "",
+    accommodationMapLink: "",
+    accommodationLat: null,
+    accommodationLon: null,
     notes: "",
     transportation: "",
     estimatedCost: null,
+    activityCost: null,
+    foodCost: null,
+    transportCost: null,
+    accommodationCost: null,
     totalTravelMinutes: null,
     warnings: [],
     alternatives: [],
@@ -843,12 +880,6 @@ function sanitizeCandidates(candidates: TripRecommendation[]) {
     .sort((left, right) => categoryPriority(right.category) - categoryPriority(left.category));
 }
 
-function firstAvailable<T>(items: T[], predicate: (item: T) => boolean) {
-  const index = items.findIndex(predicate);
-  if (index === -1) return null;
-  return items.splice(index, 1)[0] ?? null;
-}
-
 function slotTime(slot: DayPart) {
   switch (slot) {
     case "morning":
@@ -866,17 +897,14 @@ function slotTime(slot: DayPart) {
   }
 }
 
-function buildWarnings(items: AiGeneratedItem[], pace: TripPreferences["tripPace"]) {
+export function buildWarnings(items: AiGeneratedItem[], pace: TripPreferences["tripPace"]) {
   const warnings: string[] = [];
   const activeItems = items.filter((item) => item.name);
   const totalMinutes = activeItems.reduce(
     (sum, item) => sum + (item.estimatedDurationMinutes ?? 90) + (item.travelMinutes ?? 0),
     0
   );
-  const crowdedThreshold = pace === "relaxed" ? 360 : pace === "balanced" ? 480 : 600;
-  if (totalMinutes > crowdedThreshold) {
-    warnings.push("היום צפוף יחסית. כדאי לשקול להזיז פעילות אחת ליום אחר.");
-  }
+  const crowdedThreshold = pace === "relaxed" ? 480 : pace === "balanced" ? 600 : 720;
   if (
     activeItems.some(
       (item) =>
@@ -887,16 +915,558 @@ function buildWarnings(items: AiGeneratedItem[], pace: TripPreferences["tripPace
   ) {
     warnings.push("יש פעילויות עם סיכון לקונפליקט בשעות הפתיחה. בדקו מול המקום לפני היציאה.");
   }
+  if (activeItems.some((item) => (item.travelMinutes ?? 0) >= 90)) {
+    warnings.push("יש מקטע מעבר ארוך במיוחד. כדאי לבדוק כרטיסים, עומסי דרך או חלופה קרובה יותר.");
+  }
+  if (totalMinutes > crowdedThreshold + 120) {
+    warnings.push("היום עדיין כבד גם אחרי תיקוני המסלול, ולכן כדאי להשאיר גמישות בשעות הערב.");
+  }
   return warnings;
 }
 
-function buildAlternative(
-  usedIds: Set<string>,
+type FallbackDayKind =
+  | "exploration"
+  | "culture"
+  | "nature"
+  | "food"
+  | "shopping"
+  | "nightlife"
+  | "day_trip"
+  | "transfer"
+  | "rest"
+  | "practical";
+
+interface FallbackDayTemplate {
+  kind: FallbackDayKind;
+  titleHint: string;
+  slots: DayPart[];
+  maxStops: number;
+  notes: string;
+  restWindow: string;
+}
+
+const FALLBACK_FOOD_CATEGORIES = new Set<RecommendationCategory>(["restaurant", "cafe"]);
+
+function fallbackAreaLabel(location: string) {
+  return location
+    .split(/[,|·/]/)
+    .map((part) => part.trim())
+    .find(Boolean) ?? location.trim();
+}
+
+function parsePreferenceKeywords(value: string) {
+  return value
+    .toLowerCase()
+    .split(/[,;\n/|]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 2);
+}
+
+function buildFallbackAreaRankings(pool: TripRecommendation[]) {
+  const stats = new Map<string, { count: number; categories: Set<RecommendationCategory> }>();
+
+  for (const recommendation of pool) {
+    const area = fallbackAreaLabel(recommendation.location);
+    if (!area) continue;
+
+    const current = stats.get(area) ?? { count: 0, categories: new Set<RecommendationCategory>() };
+    current.count += 1;
+    current.categories.add(recommendation.category);
+    stats.set(area, current);
+  }
+
+  return [...stats.entries()]
+    .sort((left, right) => {
+      const rightScore = right[1].count * 4 + right[1].categories.size * 3;
+      const leftScore = left[1].count * 4 + left[1].categories.size * 3;
+      return rightScore - leftScore;
+    })
+    .map(([area]) => area);
+}
+
+function hasAnyInterest(value: string, needles: string[]) {
+  const lower = value.toLowerCase();
+  return needles.some((needle) => lower.includes(needle));
+}
+
+function hasRecommendationCategory(pool: TripRecommendation[], categories: RecommendationCategory[]) {
+  return pool.some((candidate) => categories.includes(candidate.category));
+}
+
+function buildFallbackDayTemplate(
+  input: AiItineraryRequest,
   pool: TripRecommendation[],
-  category: RecommendationCategory
+  dayNumber: number,
+  dayCount: number
+): FallbackDayTemplate {
+  const baseMaxStops = PACE_ACTIVITY_LIMITS[input.preferences.tripPace];
+  const longTrip = dayCount > 7;
+  const veryLongTrip = dayCount > 13;
+  const interests = `${input.preferences.tripStyle} ${input.preferences.interests}`;
+  const likesFood = hasAnyInterest(interests, ["אוכל", "food", "culinary", "market", "שוק", "גסטרו"]);
+  const likesNature = hasAnyInterest(interests, ["טבע", "nature", "park", "hike", "hiking", "garden", "גנים"]);
+  const likesNightlife = hasAnyInterest(interests, ["nightlife", "חיי לילה", "bars", "bar", "club", "karaoke", "concert"]);
+  const hasFood = hasRecommendationCategory(pool, ["restaurant", "cafe"]);
+  const hasMuseum = hasRecommendationCategory(pool, ["museum"]);
+  const hasNature = hasRecommendationCategory(pool, ["nature"]);
+  const hasShopping = hasRecommendationCategory(pool, ["shopping"]);
+  const hasNightlife = hasRecommendationCategory(pool, ["nightlife"]);
+  const hasDayTrip = hasRecommendationCategory(pool, ["day_trip"]);
+
+  if (longTrip && dayNumber > 1 && dayNumber % 7 === 0) {
+    return {
+      kind: "rest",
+      titleHint: "יום קל וגמיש",
+      slots: ["morning", "lunch", "afternoon", "dinner"],
+      maxStops: Math.max(3, baseMaxStops - 1),
+      notes: "יום קל יותר עם בוקר רגוע, אוכל קרוב ושוליים לספונטניות או מנוחה.",
+      restWindow: "השאירו חלון גמיש למנוחה, כביסה, תכנון או התאוששות לקראת הימים הבאים.",
+    };
+  }
+
+  if (longTrip && dayNumber > 1 && (dayNumber - 1) % (veryLongTrip ? 6 : 5) === 0) {
+    return {
+      kind: "transfer",
+      titleHint: "יום מעבר",
+      slots: ["lunch", "afternoon", "dinner"],
+      maxStops: Math.max(3, baseMaxStops),
+      notes: "יום שמפנה מקום לצ'ק-אאוט, מעבר לבסיס הבא, צ'ק-אין ופעילות קלה בלבד.",
+      restWindow: "שמרו מרווח לצ'ק-אין, הפקדת מזוודות והתאוששות אחרי המעבר.",
+    };
+  }
+
+  if (hasDayTrip && (dayNumber % 5 === 0 || (dayCount <= 6 && dayNumber === dayCount))) {
+    return {
+      kind: "day_trip",
+      titleHint: "טיול יום",
+      slots: ["morning", "lunch", "afternoon", "dinner"],
+      maxStops: Math.max(4, baseMaxStops),
+      notes: "יום שיוצא מעט מהשגרה העירונית עם מוקד ברור, נסיעות סבירות וחזרה נוחה בערב.",
+      restWindow: "",
+    };
+  }
+
+  if (hasNature && (likesNature || dayNumber % 4 === 0)) {
+    return {
+      kind: "nature",
+      titleHint: "טבע ונוף",
+      slots: ["morning", "lunch", "afternoon", "dinner"],
+      maxStops: Math.max(4, baseMaxStops),
+      notes: "יום שמעדיף קצב פתוח יותר, שטחים ירוקים או נופים, עם עצירות אוכל באותו אזור.",
+      restWindow: "",
+    };
+  }
+
+  if (hasFood && (likesFood || dayNumber % 6 === 0)) {
+    return {
+      kind: "food",
+      titleHint: "שכונות ואוכל",
+      slots: ["morning", "lunch", "afternoon", "dinner", "evening"],
+      maxStops: Math.max(4, baseMaxStops),
+      notes: "יום שמחבר שוק, רחובות מעניינים, עצירות אוכל טובות וסיום ערב נעים בלי לקפוץ רחוק.",
+      restWindow: "",
+    };
+  }
+
+  if (hasNightlife && (likesNightlife || dayNumber % 3 === 0)) {
+    return {
+      kind: "nightlife",
+      titleHint: "ערב וחיי לילה",
+      slots: ["morning", "lunch", "afternoon", "dinner", "evening", "night"],
+      maxStops: input.preferences.tripPace === "relaxed" ? baseMaxStops : baseMaxStops + 1,
+      notes: "יום עם בוקר רגוע יותר, מרכז יום ברור וסיום ערב באזור שקל להישאר בו גם אחרי החושך.",
+      restWindow: input.preferences.tripPace === "relaxed" ? "אפשר להתחיל את היום מאוחר יותר כדי להשאיר אנרגיה לערב." : "",
+    };
+  }
+
+  if (hasShopping && dayNumber % 3 === 0) {
+    return {
+      kind: "shopping",
+      titleHint: "קניות ושיטוט",
+      slots: ["morning", "lunch", "afternoon", "dinner", "evening"],
+      maxStops: Math.max(4, baseMaxStops),
+      notes: "יום שממוקד ברחובות חיים, חנויות, שווקים ועצירות קלות באותו אזור.",
+      restWindow: "",
+    };
+  }
+
+  if (hasMuseum && dayNumber % 2 === 0) {
+    return {
+      kind: "culture",
+      titleHint: "תרבות ושכונות",
+      slots: ["morning", "lunch", "afternoon", "dinner"],
+      maxStops: Math.max(4, baseMaxStops),
+      notes: "יום שמחבר בין מוסדות תרבות, הליכה בין שכונות וארוחות קרובות בלי נסיעות מיותרות.",
+      restWindow: "",
+    };
+  }
+
+  if (longTrip && dayNumber % 5 === 0) {
+    return {
+      kind: "practical",
+      titleHint: "סידורים וגמישות",
+      slots: ["lunch", "afternoon", "dinner"],
+      maxStops: Math.max(3, baseMaxStops - 1),
+      notes: "יום שמשאיר מקום לקניית כרטיסים, כביסה, תכנון המשך ופעילות קלה באותו אזור.",
+      restWindow: "זה יום טוב לטפל בסידורים, לתכנן את ההמשך ולהשאיר זמן ספונטני.",
+    };
+  }
+
+  return {
+    kind: "exploration",
+    titleHint: "שכונות ואתרים",
+    slots: ["morning", "lunch", "afternoon", "dinner", "evening"],
+    maxStops: Math.max(4, baseMaxStops),
+    notes: "יום שמחבר עוגן מרכזי, עצירה משנית, אוכל קרוב ואפשרות לערב קל אם נשארת אנרגיה.",
+    restWindow: "",
+  };
+}
+
+function getFallbackPreferredCategories(kind: FallbackDayKind, slot: DayPart): RecommendationCategory[] {
+  if (slot === "lunch") return ["cafe", "restaurant", "shopping", "hidden_gem"];
+  if (slot === "dinner") return ["restaurant", "cafe", "nightlife", "shopping"];
+
+  switch (kind) {
+    case "culture":
+      return slot === "morning" ? ["museum", "attraction", "hidden_gem"] : ["attraction", "museum", "hidden_gem", "shopping"];
+    case "nature":
+      return ["nature", "day_trip", "attraction", "hidden_gem"];
+    case "food":
+      return slot === "morning"
+        ? ["hidden_gem", "shopping", "attraction", "cafe"]
+        : slot === "evening"
+          ? ["nightlife", "shopping", "hidden_gem"]
+          : ["shopping", "hidden_gem", "attraction", "museum"];
+    case "shopping":
+      return ["shopping", "hidden_gem", "attraction", "cafe"];
+    case "nightlife":
+      return slot === "morning"
+        ? ["cafe", "hidden_gem", "nature"]
+        : slot === "evening" || slot === "night"
+          ? ["nightlife", "shopping", "hidden_gem"]
+          : ["attraction", "shopping", "museum", "hidden_gem"];
+    case "day_trip":
+      return ["day_trip", "nature", "attraction", "museum"];
+    case "transfer":
+      return ["attraction", "cafe", "shopping", "hidden_gem"];
+    case "rest":
+      return slot === "morning"
+        ? ["cafe", "nature", "hidden_gem"]
+        : ["hidden_gem", "shopping", "museum", "nature"];
+    case "practical":
+      return ["shopping", "hidden_gem", "museum", "attraction"];
+    case "exploration":
+    default:
+      return ["attraction", "hidden_gem", "museum", "nature", "shopping"];
+  }
+}
+
+function resolveFallbackTransportation(
+  previousItem: AiGeneratedItem | null,
+  candidate: TripRecommendation,
+  input: AiItineraryRequest
 ) {
-  const alternative = pool.find((candidate) => candidate.category === category && !usedIds.has(candidate.id));
-  return alternative?.name ?? "";
+  const preferred = input.preferences.transportationPreferences || "תחבורה מקומית";
+  const km = haversineKm(previousItem?.lat ?? null, previousItem?.lon ?? null, candidate.lat, candidate.lon);
+
+  if (km > 0 && km <= 1.5) return "הליכה";
+  return preferred;
+}
+
+function estimateFallbackTravelMinutes(
+  previousItem: AiGeneratedItem | null,
+  candidate: TripRecommendation,
+  input: AiItineraryRequest,
+  template: FallbackDayTemplate,
+  transportation: string
+) {
+  if (!previousItem) return 0;
+
+  if (previousItem.category === "transportation" && (previousItem.lat == null || candidate.lat == null)) {
+    return template.kind === "transfer" ? 60 : 20;
+  }
+
+  const estimated = estimateTravelMinutes(
+    previousItem.lat,
+    previousItem.lon,
+    candidate.lat,
+    candidate.lon,
+    input.preferences.tripPace,
+    transportation
+  );
+  if (estimated > 0) return estimated;
+
+  const sameArea =
+    fallbackAreaLabel(previousItem.location).toLowerCase() === fallbackAreaLabel(candidate.location).toLowerCase();
+  if (sameArea) return 12;
+  if (template.kind === "day_trip") return 45;
+  if (template.kind === "transfer") return 35;
+  return 20;
+}
+
+function buildFallbackItemDescription(
+  candidate: TripRecommendation,
+  slot: DayPart,
+  template: FallbackDayTemplate,
+  dayArea: string
+) {
+  if (candidate.shortDescription.trim()) return candidate.shortDescription;
+
+  if (slot === "lunch" || slot === "dinner") {
+    return `עצירת אוכל באזור ${dayArea || fallbackAreaLabel(candidate.location)} כדי לשמור על יום נוח גאוגרפית.`;
+  }
+
+  if (template.kind === "transfer") {
+    return `עצירה קלה באזור ${dayArea || fallbackAreaLabel(candidate.location)} שמתאימה ליום מעבר בלי להעמיס יותר מדי.`;
+  }
+
+  if (template.kind === "rest") {
+    return `נקודה רגועה באזור ${dayArea || fallbackAreaLabel(candidate.location)} שמתאימה ליום קל יותר.`;
+  }
+
+  if (template.kind === "day_trip") {
+    return `מוקד מתאים ליום טיול שמחובר היטב לשאר המסלול.`;
+  }
+
+  return `עצירה טובה באזור ${dayArea || fallbackAreaLabel(candidate.location)} שמשתלבת בטבעיות עם שאר היום.`;
+}
+
+function scoreFallbackCandidate(
+  candidate: TripRecommendation,
+  slot: DayPart,
+  template: FallbackDayTemplate,
+  preferredArea: string,
+  previousItem: AiGeneratedItem | null,
+  usageCounts: Map<string, number>,
+  selectedIds: Set<string>,
+  preferredKeywords: string[],
+  avoidKeywords: string[]
+) {
+  const preferredCategories = getFallbackPreferredCategories(template.kind, slot);
+  const candidateArea = fallbackAreaLabel(candidate.location).toLowerCase();
+  const lowerPreferredArea = preferredArea.toLowerCase();
+  const haystack = `${candidate.name} ${candidate.location}`.toLowerCase();
+  const usageCount = usageCounts.get(candidate.id) ?? 0;
+  const categoryIndex = preferredCategories.indexOf(candidate.category);
+  let score = 0;
+
+  if (avoidKeywords.some((keyword) => haystack.includes(keyword))) {
+    return -1000;
+  }
+
+  if (categoryIndex >= 0) {
+    score += 95 - categoryIndex * 8;
+  } else if (slot === "lunch" || slot === "dinner") {
+    score -= 30;
+  } else if (FALLBACK_FOOD_CATEGORIES.has(candidate.category)) {
+    score -= 10;
+  }
+
+  if (candidate.recommendedTimeOfDay === slot) score += 14;
+  if (candidate.recommendedTimeOfDay === "any") score += 5;
+
+  if (lowerPreferredArea && candidateArea) {
+    if (candidateArea === lowerPreferredArea) score += 24;
+    else if (candidateArea.includes(lowerPreferredArea) || lowerPreferredArea.includes(candidateArea)) score += 14;
+  }
+
+  if (preferredKeywords.some((keyword) => haystack.includes(keyword))) score += 12;
+  if (selectedIds.has(candidate.id) || candidate.source === "saved" || candidate.source === "manual") score += 12;
+
+  score -= usageCount * 18;
+
+  if (previousItem) {
+    const km = haversineKm(previousItem.lat, previousItem.lon, candidate.lat, candidate.lon);
+    if (km > 0 && km <= 1.5) score += 24;
+    else if (km > 0 && km <= 4) score += 14;
+    else if (km > 0 && km <= 10) score += 5;
+    else if (km > 18) score -= 10;
+
+    if (previousItem.category === candidate.category && !FALLBACK_FOOD_CATEGORIES.has(candidate.category)) {
+      score -= 5;
+    }
+  }
+
+  if (template.kind === "rest" && (candidate.estimatedDurationMinutes ?? 90) > 180) score -= 12;
+  if (template.kind === "nature" && candidate.category === "nature") score += 18;
+  if (template.kind === "shopping" && candidate.category === "shopping") score += 18;
+  if (template.kind === "culture" && (candidate.category === "museum" || candidate.category === "attraction")) {
+    score += 16;
+  }
+  if (template.kind === "food" && (slot === "lunch" || slot === "dinner")) {
+    score += candidate.category === "restaurant" || candidate.category === "cafe" ? 20 : -10;
+  }
+  if (template.kind === "nightlife" && (slot === "evening" || slot === "night") && candidate.category === "nightlife") {
+    score += 24;
+  }
+  if ((template.kind === "transfer" || template.kind === "practical") && candidate.category === "transportation") {
+    score += 12;
+  }
+  if (candidate.category === "hotel" && template.kind !== "transfer") score -= 12;
+
+  return score;
+}
+
+function selectFallbackCandidate(args: {
+  pool: TripRecommendation[];
+  slot: DayPart;
+  template: FallbackDayTemplate;
+  preferredArea: string;
+  previousItem: AiGeneratedItem | null;
+  usedToday: Set<string>;
+  usageCounts: Map<string, number>;
+  selectedIds: Set<string>;
+  preferredKeywords: string[];
+  avoidKeywords: string[];
+}) {
+  const ranked = args.pool
+    .filter((candidate) => !args.usedToday.has(candidate.id))
+    .map((candidate) => ({
+      candidate,
+      score: scoreFallbackCandidate(
+        candidate,
+        args.slot,
+        args.template,
+        args.preferredArea,
+        args.previousItem,
+        args.usageCounts,
+        args.selectedIds,
+        args.preferredKeywords,
+        args.avoidKeywords
+      ),
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.candidate ?? null;
+}
+
+function createFallbackMealPlaceholder(
+  slot: DayPart,
+  dayArea: string,
+  input: AiItineraryRequest
+): AiGeneratedItem {
+  const name =
+    slot === "lunch"
+      ? dayArea
+        ? `אזור אוכל מקומי ב${dayArea}`
+        : "שוק או אזור אוכל מקומי"
+      : dayArea
+        ? `ארוחת ערב באזור ${dayArea}`
+        : "אזור אוכל מומלץ לערב";
+
+  return {
+    name,
+    category: slot === "lunch" ? "cafe" : "restaurant",
+    location: dayArea || input.countryName,
+    shortDescription:
+      "אם אין מקום ספציפי זמין, חפשו מסעדות, דוכנים או קפה טובים ממש באזור הפעילויות של אותו יום.",
+    slot,
+    plannedStartTime: slotTime(slot),
+    estimatedDurationMinutes: slot === "lunch" ? 60 : 75,
+    approximatePrice: null,
+    priceOriginalAmount: null,
+    priceOriginalCurrency: null,
+    priceConvertedAmount: null,
+    priceExchangeRate: null,
+    priceRateTimestamp: null,
+    travelMinutes: 10,
+    openingHours: "לא זמין",
+    reservationRequired: false,
+    transportation: "הליכה",
+    mapLink: buildMapLink(dayArea || input.countryName, null, null),
+    lat: null,
+    lon: null,
+    bookingWarning: "",
+    alternativeSuggestion: "",
+    recommendationId: null,
+  };
+}
+
+function createFallbackPracticalItem(
+  template: FallbackDayTemplate,
+  dayArea: string,
+  input: AiItineraryRequest
+): AiGeneratedItem | null {
+  if (template.kind === "transfer") {
+    return {
+      name: "צ'ק-אאוט, שמירת מזוודות ומעבר לבסיס הבא",
+      category: "transportation",
+      location: dayArea || input.countryName,
+      shortDescription: "בלוק פרקטי ליציאה מהלינה, נסיעה מסודרת וצ'ק-אין לפני שמעמיסים עוד פעילויות.",
+      slot: "morning",
+      plannedStartTime: "08:30",
+      estimatedDurationMinutes: 90,
+      approximatePrice: null,
+      priceOriginalAmount: null,
+      priceOriginalCurrency: null,
+      priceConvertedAmount: null,
+      priceExchangeRate: null,
+      priceRateTimestamp: null,
+      travelMinutes: 0,
+      openingHours: "לא זמין",
+      reservationRequired: false,
+      transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
+      mapLink: buildMapLink(dayArea || input.countryName, null, null),
+      lat: null,
+      lon: null,
+      bookingWarning: "בדקו שעות צ'ק-אאוט, אחסון מזוודות והגעה ללינה החדשה.",
+      alternativeSuggestion: "",
+      recommendationId: null,
+    };
+  }
+
+  if (template.kind === "practical") {
+    return {
+      name: "חלון סידורים, כביסה ותכנון המשך",
+      category: "transportation",
+      location: dayArea || input.countryName,
+      shortDescription: "זמן ייעודי לקניית כרטיסים, כביסה, סידורים קטנים ותכנון רגוע של הימים הבאים.",
+      slot: "morning",
+      plannedStartTime: "09:30",
+      estimatedDurationMinutes: 75,
+      approximatePrice: null,
+      priceOriginalAmount: null,
+      priceOriginalCurrency: null,
+      priceConvertedAmount: null,
+      priceExchangeRate: null,
+      priceRateTimestamp: null,
+      travelMinutes: 0,
+      openingHours: "לא זמין",
+      reservationRequired: false,
+      transportation: "הליכה",
+      mapLink: buildMapLink(dayArea || input.countryName, null, null),
+      lat: null,
+      lon: null,
+      bookingWarning: "",
+      alternativeSuggestion: "",
+      recommendationId: null,
+    };
+  }
+
+  return null;
+}
+
+function buildFallbackAlternative(
+  pool: TripRecommendation[],
+  currentItems: AiGeneratedItem[],
+  category: RecommendationCategory,
+  preferredArea: string,
+  usageCounts: Map<string, number>
+) {
+  const excludedIds = new Set(currentItems.map((item) => item.recommendationId).filter(Boolean) as string[]);
+  const allowMealSwap = category === "restaurant" || category === "cafe";
+
+  return pool
+    .filter((candidate) => !excludedIds.has(candidate.id))
+    .filter((candidate) =>
+      allowMealSwap ? FALLBACK_FOOD_CATEGORIES.has(candidate.category) : candidate.category === category
+    )
+    .sort((left, right) => {
+      const rightArea = fallbackAreaLabel(right.location).toLowerCase() === preferredArea.toLowerCase() ? 1 : 0;
+      const leftArea = fallbackAreaLabel(left.location).toLowerCase() === preferredArea.toLowerCase() ? 1 : 0;
+      if (rightArea !== leftArea) return rightArea - leftArea;
+      return (usageCounts.get(left.id) ?? 0) - (usageCounts.get(right.id) ?? 0);
+    })[0]?.name ?? "";
 }
 
 export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItineraryResponse {
@@ -904,77 +1474,99 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
     input.existingDays.length || 0,
     getTripDayCount(input.preferences.startDate, input.preferences.endDate, 3)
   );
-  const recommendationPool = sanitizeCandidates([
-    ...input.selectedPlaces,
-    ...input.recommendations,
-  ]);
-  const available = [...recommendationPool];
-  const usedIds = new Set<string>();
+  const recommendationPool = sanitizeCandidates([...input.selectedPlaces, ...input.recommendations]);
   const days: AiGeneratedDay[] = [];
-  const activityLimit = PACE_ACTIVITY_LIMITS[input.preferences.tripPace];
+  const areaRankings = buildFallbackAreaRankings(recommendationPool);
+  const usageCounts = new Map<string, number>();
+  const selectedIds = new Set(input.selectedPlaces.map((place) => place.id));
+  const preferredKeywords = parsePreferenceKeywords(
+    [input.preferences.preferredRegions, input.preferences.mustVisitPlaces, input.preferences.interests].join(",")
+  );
+  const avoidKeywords = parsePreferenceKeywords(input.preferences.placesToAvoid);
+  const baseStayLength = dayCount >= 14 ? 3 : dayCount > 7 ? 2 : 1;
 
   for (let dayNumber = 1; dayNumber <= dayCount; dayNumber += 1) {
     const items: AiGeneratedItem[] = [];
-    let previousLat: number | null = null;
-    let previousLon: number | null = null;
+    const template = buildFallbackDayTemplate(input, recommendationPool, dayNumber, dayCount);
+    const baseAreaIndex = Math.floor((dayNumber - 1) / baseStayLength) % Math.max(areaRankings.length, 1);
+    const preferredArea =
+      areaRankings[template.kind === "transfer" && areaRankings.length > 1 ? (baseAreaIndex + 1) % areaRankings.length : baseAreaIndex] ??
+      fallbackAreaLabel(input.preferences.accommodationArea) ??
+      "";
+    const usedToday = new Set<string>();
 
-    for (const slot of AI_SLOT_ORDER) {
-      if (items.length >= activityLimit) break;
+    const practicalItem = createFallbackPracticalItem(template, preferredArea, input);
+    if (practicalItem) {
+      items.push(practicalItem);
+    }
 
-      let next: TripRecommendation | null = null;
-      if (slot === "lunch") {
-        next =
-          firstAvailable(available, (candidate) => candidate.category === "cafe") ??
-          firstAvailable(available, (candidate) => candidate.category === "restaurant");
-      } else if (slot === "dinner") {
-        next = firstAvailable(available, (candidate) => candidate.category === "restaurant");
-      } else if (slot === "evening") {
-        next =
-          firstAvailable(available, (candidate) =>
-            candidate.category === "nightlife" || candidate.category === "shopping"
-          ) ??
-          firstAvailable(available, (candidate) => candidate.category === "hidden_gem");
-      } else {
-        next =
-          firstAvailable(available, (candidate) => candidate.category !== "restaurant" && candidate.category !== "hotel") ??
-          firstAvailable(available, () => true);
+    for (const slot of template.slots) {
+      if (items.length >= template.maxStops) break;
+
+      const previousItem = items.at(-1) ?? null;
+      const next = selectFallbackCandidate({
+        pool: recommendationPool,
+        slot,
+        template,
+        preferredArea,
+        previousItem,
+        usedToday,
+        usageCounts,
+        selectedIds,
+        preferredKeywords,
+        avoidKeywords,
+      });
+
+      if (!next) {
+        if (slot === "lunch" || slot === "dinner") {
+          items.push(createFallbackMealPlaceholder(slot, preferredArea, input));
+        }
+        continue;
       }
 
-      if (!next) continue;
-      usedIds.add(next.id);
+      usedToday.add(next.id);
+      usageCounts.set(next.id, (usageCounts.get(next.id) ?? 0) + 1);
 
-      const travelMinutes = estimateTravelMinutes(
-        previousLat,
-        previousLon,
-        next.lat,
-        next.lon,
-        input.preferences.tripPace,
-        input.preferences.transportationPreferences
-      );
+      const transportation = resolveFallbackTransportation(previousItem, next, input);
+      const travelMinutes = estimateFallbackTravelMinutes(previousItem, next, input, template, transportation);
 
       items.push({
         name: next.name,
         category: next.category,
         location: next.location,
-        shortDescription: next.shortDescription || `עצירה מומלצת ב${next.location}`,
+        shortDescription: buildFallbackItemDescription(next, slot, template, preferredArea),
         slot: slot === "lunch" && next.category === "restaurant" ? "lunch" : slot,
         plannedStartTime: slotTime(slot),
-        estimatedDurationMinutes: next.estimatedDurationMinutes ?? (slot === "lunch" || slot === "dinner" ? 75 : 120),
+        estimatedDurationMinutes:
+          next.estimatedDurationMinutes ?? (slot === "lunch" || slot === "dinner" ? 75 : slot === "evening" ? 90 : 120),
         approximatePrice: next.approximatePrice,
+        priceOriginalAmount: next.priceOriginalAmount ?? next.approximatePrice,
+        priceOriginalCurrency: next.priceOriginalCurrency ?? null,
+        priceConvertedAmount: next.priceConvertedAmount ?? next.approximatePrice,
+        priceExchangeRate: next.priceExchangeRate ?? null,
+        priceRateTimestamp: next.priceRateTimestamp ?? null,
         travelMinutes,
-        openingHours: next.openingHours,
+        openingHours: next.openingHours || "לא זמין",
         reservationRequired: next.reservationRequired,
-        transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
+        transportation,
         mapLink: next.mapLink || buildMapLink(next.name, next.lat, next.lon),
         lat: next.lat,
         lon: next.lon,
-        bookingWarning: next.reservationRequired ? "מומלץ לשריין מקום מראש." : "",
-        alternativeSuggestion: buildAlternative(usedIds, recommendationPool, next.category),
+        bookingWarning:
+          next.reservationRequired
+            ? "מומלץ לשריין מקום מראש."
+            : template.kind === "transfer" && slot === "afternoon"
+              ? "עדיף להשאיר מרווח אחרי המעבר לפני שמתחייבים לפעילות נוספת."
+              : "",
+        alternativeSuggestion: buildFallbackAlternative(
+          recommendationPool,
+          [...items],
+          next.category,
+          preferredArea,
+          usageCounts
+        ),
         recommendationId: next.id,
       });
-
-      previousLat = next.lat;
-      previousLon = next.lon;
     }
 
     if (items.length === 0) {
@@ -987,6 +1579,11 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         plannedStartTime: "10:00",
         estimatedDurationMinutes: 180,
         approximatePrice: null,
+        priceOriginalAmount: null,
+        priceOriginalCurrency: null,
+        priceConvertedAmount: null,
+        priceExchangeRate: null,
+        priceRateTimestamp: null,
         travelMinutes: 0,
         openingHours: "",
         reservationRequired: false,
@@ -1000,83 +1597,118 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       });
     }
 
+    const cityRegion =
+      preferredArea ||
+      fallbackAreaLabel(
+        items.find((item) => item.category !== "restaurant" && item.category !== "cafe")?.location || items[0]?.location || input.countryName
+      );
     const estimatedCost = items.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
     const totalTravelMinutes = items.reduce((sum, item) => sum + (item.travelMinutes ?? 0), 0);
+    const transportCost =
+      items
+        .filter((item) => item.category === "transportation")
+        .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null;
+    const activityCost =
+      items
+        .filter((item) => !FALLBACK_FOOD_CATEGORIES.has(item.category) && item.category !== "transportation")
+        .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null;
+    const foodCost =
+      items
+        .filter((item) => FALLBACK_FOOD_CATEGORIES.has(item.category))
+        .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null;
     const warnings = buildWarnings(items, input.preferences.tripPace);
+    if (template.kind === "transfer") {
+      warnings.push("זה יום מעבר, אז עדיף לא לדחוס יותר מדי פעילויות קשיחות בזמן.");
+    }
+    if (template.kind === "nightlife") {
+      warnings.push("אם חוזרים מאוחר, עדיף לסיים את הערב באזור שקל ממנו לחזור ללינה.");
+    }
     const nearbyRestaurantSuggestion =
-      items.find((item) => item.category === "restaurant" || item.category === "cafe")?.name ??
-      recommendationPool.find((candidate) => candidate.category === "restaurant" || candidate.category === "cafe")?.name ??
+      buildFallbackAlternative(recommendationPool, items, "restaurant", preferredArea, usageCounts) ||
       "";
+    const anchorCategory =
+      items.find((item) => !FALLBACK_FOOD_CATEGORIES.has(item.category) && item.category !== "transportation")?.category ??
+      "attraction";
+    const alternatives = [
+      nearbyRestaurantSuggestion,
+      buildFallbackAlternative(recommendationPool, items, anchorCategory, preferredArea, usageCounts),
+    ].filter(Boolean);
+    const transportSegments = items.reduce<string[]>((segments, item, index) => {
+      if (index === 0 || (item.travelMinutes ?? 0) <= 0) return segments;
+      const previous = items[index - 1];
+      segments.push(
+        `${previous.location || cityRegion} -> ${item.location || item.name} · ${item.transportation || "תחבורה מקומית"} · ${item.travelMinutes} דק'`
+      );
+      return segments;
+    }, []);
+    const bookingRequirements = items
+      .filter((item) => item.reservationRequired)
+      .map((item) => `${item.name}: מומלץ להזמין מראש.`);
+    if (template.kind === "transfer") {
+      bookingRequirements.unshift("בדקו צ'ק-אאוט, אחסון מזוודות ושעת הגעה ללינה הבאה.");
+    }
+    if (template.kind === "practical") {
+      bookingRequirements.unshift("זה יום טוב להשלים הזמנות, כרטיסים וארגון לוגיסטי להמשך.");
+    }
 
     days.push({
       dayNumber,
       date:
         input.existingDays[dayNumber - 1]?.date || dateForDayNumber(input.preferences.startDate, dayNumber),
-      title: `Day ${dayNumber}`,
-      cityRegion: items[0]?.location || input.countryName,
-      accommodation: input.preferences.accommodationArea || "",
-      notes:
-        input.preferences.tripPace === "relaxed"
-          ? "השאירו חלון לגמישות ולקצב נעים בין העצירות."
-          : "התחילו בזמן כדי להרוויח את כל העצירות בלי לחץ מיותר.",
+      title: `יום ${dayNumber} · ${template.titleHint}${cityRegion ? ` ב${cityRegion}` : ""}`,
+      cityRegion,
+      accommodation:
+        input.preferences.accommodationArea ||
+        (cityRegion ? `בסיס לינה באזור ${cityRegion}` : ""),
+      notes: `${template.notes}${cityRegion ? ` היום בנוי סביב ${cityRegion}` : ""} כדי לשמור על קצב טבעי, אוכל קרוב ומעברים הגיוניים.`,
       transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
       estimatedCost: estimatedCost > 0 ? estimatedCost : null,
-      activityCost:
-        items
-          .filter((item) => item.category !== "restaurant" && item.category !== "cafe")
-          .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null,
-      foodCost:
-        items
-          .filter((item) => item.category === "restaurant" || item.category === "cafe")
-          .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0) || null,
-      transportCost: null,
+      activityCost,
+      foodCost,
+      transportCost,
       accommodationCost: null,
       totalTravelMinutes: totalTravelMinutes > 0 ? totalTravelMinutes : null,
       warnings,
-      alternatives: nearbyRestaurantSuggestion ? [nearbyRestaurantSuggestion] : [],
-      bookingRequirements: items
-        .filter((item) => item.reservationRequired)
-        .map((item) => `${item.name}: מומלץ להזמין מראש.`),
-      safetyNotes: [],
+      alternatives,
+      bookingRequirements,
+      safetyNotes:
+        template.kind === "nightlife"
+          ? ["בדקו מסלול חזרה בטוח ללינה אם נשארים מאוחר."]
+          : [],
       restWindow:
-        input.preferences.tripPace === "relaxed"
-          ? "המסלול כולל חלונות גמישות למנוחה ולהתאוששות."
-          : "",
-      transportSegments: items
-        .map((item) =>
-          item.travelMinutes != null && item.travelMinutes > 0
-            ? `${item.transportation || input.preferences.transportationPreferences || "תחבורה מקומית"} · ${item.travelMinutes} דק'`
-            : ""
-        )
-        .filter(Boolean),
+        template.restWindow ||
+        (input.preferences.tripPace === "relaxed"
+          ? "המסלול כולל שוליים לגמישות, קפה טוב או מנוחה קצרה בין העצירות."
+          : ""),
+      transportSegments,
       items,
     });
   }
 
+  const totalEstimatedCost = days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) || null;
+  const estimatedTransportCost =
+    days.reduce((sum, day) => sum + (day.transportCost ?? 0), 0) || null;
+
   return {
     summary:
       input.tripStatus === "currently_traveling"
-        ? "נבנה מסלול פרקטי להמשך הימים הקרובים עם דגש על קצב, מרחקים ואפשרויות גיבוי."
-        : "נבנה מסלול יום-אחר-יום שמאזן בין אתרים, אוכל ולוגיסטיקה בלי להפוך למאמר כללי.",
+        ? "נבנה מסלול פרקטי להמשך הימים הקרובים עם דגש על קצב, אזורים, אוכל קרוב ואפשרויות גיבוי."
+        : "נבנה מסלול יום-אחר-יום שמרגיש כמו טיול עצמאי אמיתי: אזורים שונים, קצב משתנה, אוכל קרוב ולוגיסטיקה פרקטית.",
     title: `${input.countryName} · ${input.preferences.startDate || "ללא תאריך"}${input.preferences.endDate ? ` עד ${input.preferences.endDate}` : ""}`,
-    totalEstimatedCost: days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) || null,
-    estimatedTransportCost: null,
+    totalEstimatedCost,
+    estimatedTransportCost,
     averageDailyCost:
-      days.length > 0
-        ? Math.round(days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) / days.length)
-        : null,
+      totalEstimatedCost != null && days.length > 0 ? Math.round(totalEstimatedCost / days.length) : null,
     costPerTraveler:
-      input.preferences.travelers > 0
-        ? Math.round(
-            days.reduce((sum, day) => sum + (day.estimatedCost ?? 0), 0) / input.preferences.travelers
-          ) || null
+      totalEstimatedCost != null && input.preferences.travelers > 0
+        ? Math.round(totalEstimatedCost / input.preferences.travelers) || null
         : null,
     categoryBreakdown: {
-      attractions: days.reduce(
-        (sum, day) => sum + (day.activityCost ?? 0),
-        0
-      ),
+      attractions: days.reduce((sum, day) => sum + (day.activityCost ?? 0), 0),
       food: days.reduce((sum, day) => sum + (day.foodCost ?? 0), 0),
+      transportation: estimatedTransportCost ?? 0,
+      accommodation: days.reduce((sum, day) => sum + (day.accommodationCost ?? 0), 0),
+      other: 0,
     },
     days,
   };
@@ -1097,6 +1729,10 @@ export function applyAiPlanToWorkspace(
     notes: day.notes,
     transportation: day.transportation,
     estimatedCost: day.estimatedCost,
+    activityCost: day.activityCost,
+    foodCost: day.foodCost,
+    transportCost: day.transportCost,
+    accommodationCost: day.accommodationCost,
     totalTravelMinutes: day.totalTravelMinutes,
     warnings: day.warnings,
     alternatives: day.alternatives,
@@ -1115,6 +1751,11 @@ export function applyAiPlanToWorkspace(
       plannedStartTime: item.plannedStartTime,
       estimatedDurationMinutes: item.estimatedDurationMinutes,
       approximatePrice: item.approximatePrice,
+      priceOriginalAmount: item.priceOriginalAmount,
+      priceOriginalCurrency: item.priceOriginalCurrency,
+      priceConvertedAmount: item.priceConvertedAmount,
+      priceExchangeRate: item.priceExchangeRate,
+      priceRateTimestamp: item.priceRateTimestamp,
       travelMinutes: item.travelMinutes,
       transportation: item.transportation,
       openingHours: item.openingHours,

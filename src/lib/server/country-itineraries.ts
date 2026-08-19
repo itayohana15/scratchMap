@@ -106,6 +106,24 @@ function recomputeDayEstimates(
   });
 
   const estimatedCost = nextItems.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const activityCost = nextItems
+    .filter(
+      (item) =>
+        item.category !== "restaurant" &&
+        item.category !== "cafe" &&
+        item.category !== "transportation" &&
+        item.category !== "hotel"
+    )
+    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const foodCost = nextItems
+    .filter((item) => item.category === "restaurant" || item.category === "cafe")
+    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const transportCost = nextItems
+    .filter((item) => item.category === "transportation")
+    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const accommodationCost = nextItems
+    .filter((item) => item.category === "hotel")
+    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
   const totalTravelMinutes = nextItems.reduce((sum, item) => sum + (item.travelMinutes ?? 0), 0);
   const transportSegments = nextItems
     .map((item) =>
@@ -119,6 +137,10 @@ function recomputeDayEstimates(
     ...day,
     items: nextItems,
     estimatedCost: estimatedCost > 0 ? estimatedCost : null,
+    activityCost: activityCost > 0 ? activityCost : null,
+    foodCost: foodCost > 0 ? foodCost : null,
+    transportCost: transportCost > 0 ? transportCost : null,
+    accommodationCost: accommodationCost > 0 ? accommodationCost : null,
     totalTravelMinutes: totalTravelMinutes > 0 ? totalTravelMinutes : null,
     transportSegments,
   };

@@ -173,6 +173,11 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
             actualEndTime: toText(itemRecord.actualEndTime),
             estimatedDurationMinutes: toNumber(itemRecord.estimatedDurationMinutes),
             approximatePrice: toNumber(itemRecord.approximatePrice),
+            priceOriginalAmount: toNumber(itemRecord.priceOriginalAmount),
+            priceOriginalCurrency: toText(itemRecord.priceOriginalCurrency) || null,
+            priceConvertedAmount: toNumber(itemRecord.priceConvertedAmount),
+            priceExchangeRate: toNumber(itemRecord.priceExchangeRate),
+            priceRateTimestamp: toText(itemRecord.priceRateTimestamp) || null,
             actualCost: toNumber(itemRecord.actualCost),
             travelMinutes: toNumber(itemRecord.travelMinutes),
             transportation: toText(itemRecord.transportation),
@@ -210,9 +215,16 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
       date: toText(dayRecord.date),
       cityRegion: toText(dayRecord.cityRegion),
       accommodation: toText(dayRecord.accommodation),
+      accommodationMapLink: toText(dayRecord.accommodationMapLink),
+      accommodationLat: toNumber(dayRecord.accommodationLat),
+      accommodationLon: toNumber(dayRecord.accommodationLon),
       notes: toText(dayRecord.notes),
       transportation: toText(dayRecord.transportation),
       estimatedCost: toNumber(dayRecord.estimatedCost),
+      activityCost: toNumber(dayRecord.activityCost),
+      foodCost: toNumber(dayRecord.foodCost),
+      transportCost: toNumber(dayRecord.transportCost),
+      accommodationCost: toNumber(dayRecord.accommodationCost),
       totalTravelMinutes: toNumber(dayRecord.totalTravelMinutes),
       warnings: toStringArray(dayRecord.warnings),
       alternatives: toStringArray(dayRecord.alternatives),
@@ -305,11 +317,7 @@ export function computeItineraryCostSummary(
   const categoryBreakdown = new Map<string, number>();
 
   for (const day of workspace.itineraryDays) {
-    const dayBase =
-      day.estimatedCost ??
-      day.items.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
-
-    const itemGroups = {
+    const derivedGroups = {
       accommodation: 0,
       food: 0,
       attractions: 0,
@@ -319,18 +327,32 @@ export function computeItineraryCostSummary(
     for (const item of day.items) {
       const price = item.approximatePrice ?? 0;
       if (item.category === "restaurant" || item.category === "cafe") {
-        itemGroups.food += price;
+        derivedGroups.food += price;
       } else if (item.category === "hotel") {
-        itemGroups.accommodation += price;
+        derivedGroups.accommodation += price;
       } else if (item.category === "transportation") {
-        itemGroups.transportation += price;
+        derivedGroups.transportation += price;
       } else {
-        itemGroups.attractions += price;
+        derivedGroups.attractions += price;
       }
     }
 
-    if (dayBase > 0 && itemGroups.accommodation + itemGroups.food + itemGroups.attractions + itemGroups.transportation === 0) {
+    const itemGroups = {
+      accommodation: day.accommodationCost ?? (derivedGroups.accommodation > 0 ? derivedGroups.accommodation : 0),
+      food: day.foodCost ?? (derivedGroups.food > 0 ? derivedGroups.food : 0),
+      attractions:
+        day.activityCost ?? (derivedGroups.attractions > 0 ? derivedGroups.attractions : 0),
+      transportation:
+        day.transportCost ?? (derivedGroups.transportation > 0 ? derivedGroups.transportation : 0),
+    };
+
+    const explicitTotal = itemGroups.accommodation + itemGroups.food + itemGroups.attractions + itemGroups.transportation;
+    const dayBase = day.estimatedCost ?? explicitTotal;
+
+    if (dayBase > explicitTotal && explicitTotal === 0) {
       itemGroups.attractions += dayBase;
+    } else if (dayBase > explicitTotal) {
+      categoryBreakdown.set("other", (categoryBreakdown.get("other") ?? 0) + (dayBase - explicitTotal));
     }
 
     for (const [key, amount] of Object.entries(itemGroups)) {

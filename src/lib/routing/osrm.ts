@@ -13,6 +13,10 @@ export interface DrivingRoute {
   durationSeconds: number;
 }
 
+export interface DrivingRouteGeometry extends DrivingRoute {
+  geometry: RoutePoint[];
+}
+
 export interface RoutePoint {
   lat: number;
   lon: number;
@@ -20,7 +24,11 @@ export interface RoutePoint {
 
 interface OsrmResponse {
   code: string;
-  routes?: { distance: number; duration: number }[];
+  routes?: {
+    distance: number;
+    duration: number;
+    geometry?: { coordinates?: [number, number][] };
+  }[];
 }
 
 async function fetchDrivingRoute(from: RoutePoint, to: RoutePoint): Promise<DrivingRoute | null> {
@@ -32,6 +40,26 @@ async function fetchDrivingRoute(from: RoutePoint, to: RoutePoint): Promise<Driv
   if (data.code !== "Ok" || !route) return null;
 
   return { distanceMeters: route.distance, durationSeconds: route.duration };
+}
+
+export async function fetchDrivingRouteGeometry(
+  from: RoutePoint,
+  to: RoutePoint
+): Promise<DrivingRouteGeometry | null> {
+  const url = `${OSRM_ENDPOINT}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+
+  const data = (await res.json()) as OsrmResponse;
+  const route = data.routes?.[0];
+  const coordinates = route?.geometry?.coordinates ?? [];
+  if (data.code !== "Ok" || !route || coordinates.length < 2) return null;
+
+  return {
+    distanceMeters: route.distance,
+    durationSeconds: route.duration,
+    geometry: coordinates.map(([lon, lat]) => ({ lat, lon })),
+  };
 }
 
 export function useDrivingRoute(from: RoutePoint | null, to: RoutePoint | null) {
