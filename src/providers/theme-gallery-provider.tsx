@@ -4,9 +4,9 @@ import { useTheme as useNextTheme } from "next-themes";
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 
 import { DEFAULT_THEME_ID, THEME_IDS, getThemeById, type ThemeId } from "@/lib/themes";
+import { applyThemePresentationToDocument } from "@/lib/themes/runtime";
 
 const STORAGE_KEY = "scratchmap-theme";
-const TRANSITION_MS = 350;
 
 interface ThemeGalleryContextValue {
   themeId: ThemeId;
@@ -15,17 +15,6 @@ interface ThemeGalleryContextValue {
 }
 
 const ThemeGalleryContext = createContext<ThemeGalleryContextValue | null>(null);
-
-function applyThemeToDocument(id: ThemeId, animate: boolean) {
-  const root = document.documentElement;
-
-  if (animate) {
-    root.classList.add("theme-transitioning");
-    window.setTimeout(() => root.classList.remove("theme-transitioning"), TRANSITION_MS);
-  }
-
-  root.setAttribute("data-theme", id);
-}
 
 export function ThemeGalleryProvider({ children }: { children: React.ReactNode }) {
   const { setTheme: setNextTheme } = useNextTheme();
@@ -39,6 +28,7 @@ export function ThemeGalleryProvider({ children }: { children: React.ReactNode }
     const stored = window.localStorage.getItem(STORAGE_KEY);
     const initialId = stored && (THEME_IDS as string[]).includes(stored) ? (stored as ThemeId) : DEFAULT_THEME_ID;
     setThemeIdState(initialId);
+    applyThemePresentationToDocument(initialId, { animate: false });
     setNextTheme(getThemeById(initialId).isDark ? "dark" : "light");
     setMounted(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -46,7 +36,7 @@ export function ThemeGalleryProvider({ children }: { children: React.ReactNode }
 
   const setThemeId = useCallback(
     (id: ThemeId) => {
-      applyThemeToDocument(id, true);
+      applyThemePresentationToDocument(id, { animate: true });
       setNextTheme(getThemeById(id).isDark ? "dark" : "light");
       setThemeIdState(id);
       window.localStorage.setItem(STORAGE_KEY, id);

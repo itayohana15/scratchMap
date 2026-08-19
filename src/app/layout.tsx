@@ -4,6 +4,7 @@ import { Navbar } from "@/components/layout/navbar";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { THEME_IDS } from "@/lib/themes";
+import { THEME_RUNTIME_DEFINITIONS } from "@/lib/themes/runtime";
 import { QueryProvider } from "@/providers/query-provider";
 import { ThemeGalleryProvider } from "@/providers/theme-gallery-provider";
 import { ThemeProvider } from "@/providers/theme-provider";
@@ -13,7 +14,7 @@ import "./globals.css";
 // Runs before hydration so the saved theme paints on the very first frame
 // instead of flashing the default palette. The valid-id list is serialized
 // from src/lib/themes/index.ts at render time, so it can never drift.
-const THEME_INIT_SCRIPT = `(function(){try{var k="scratchmap-theme";var valid=${JSON.stringify(THEME_IDS)};var stored=localStorage.getItem(k);var id=valid.indexOf(stored)!==-1?stored:"arctic-light";document.documentElement.setAttribute("data-theme",id);}catch(e){}})();`;
+const THEME_INIT_SCRIPT = `(function(){try{var k="scratchmap-theme";var valid=${JSON.stringify(THEME_IDS)};var defs=${JSON.stringify(THEME_RUNTIME_DEFINITIONS)};var stored=localStorage.getItem(k);var id=valid.indexOf(stored)!==-1?stored:"arctic-light";var theme=defs[id]||defs["arctic-light"];var root=document.documentElement;root.setAttribute("data-theme",id);root.classList.toggle("dark",!!(theme&&theme.dark));if(theme&&theme.background){root.style.setProperty("--theme-background-image",'url("'+theme.background.image+'")');root.style.setProperty("--theme-background-position",theme.background.position);root.style.setProperty("--theme-background-mobile-position",theme.background.mobilePosition);root.style.setProperty("--theme-background-size",theme.background.size);root.style.setProperty("--theme-background-mobile-size",theme.background.mobileSize);root.style.setProperty("--theme-background-repeat",theme.background.repeat);root.style.setProperty("--theme-background-opacity",theme.background.opacity);root.style.setProperty("--theme-background-overlay",theme.background.overlay);root.style.setProperty("--theme-background-overlay-opacity",theme.background.overlayOpacity);root.style.setProperty("--theme-background-attachment",theme.background.attachment);var head=document.head;if(head&&theme.background.image){var link=document.getElementById("theme-background-preload");if(!link){link=document.createElement("link");link.id="theme-background-preload";link.rel="preload";link.as="image";head.appendChild(link);}link.href=theme.background.image;}}}catch(e){}})();`;
 
 export const metadata: Metadata = {
   title: {
@@ -34,7 +35,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="he" dir="rtl" suppressHydrationWarning>
-      <body className="min-h-screen bg-background font-sans antialiased">
+      <body className="min-h-screen font-sans antialiased">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <ThemeProvider
           attribute="class"

@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "generate:theme-backgrounds": "node scripts/generate-theme-backgrounds.mjs",
     "postinstall": "node scripts/copy-maplibre-assets.mjs && node scripts/copy-flags.mjs"
   },
   "dependencies": {

@@ -12,9 +12,11 @@
 
 # testing
 /coverage
+/.test-dist
 
 # next.js
 /.next/
+/.next-corrupt-*/
 /out/
 
 # production
