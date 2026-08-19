@@ -16,9 +16,10 @@ import type { DashboardStats } from "@/lib/queries/dashboard";
 interface StatGridProps {
   stats: DashboardStats | undefined;
   isLoading: boolean;
+  countriesTotal: number | undefined;
 }
 
-export function StatGrid({ stats, isLoading }: StatGridProps) {
+export function StatGrid({ stats, isLoading, countriesTotal }: StatGridProps) {
   if (isLoading || !stats) {
     return (
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
@@ -30,7 +31,11 @@ export function StatGrid({ stats, isLoading }: StatGridProps) {
   }
 
   const tiles = [
-    { label: "מדינות שביקרתם בהן", value: stats.countriesVisited, icon: Globe2 },
+    {
+      label: "מדינות שביקרתם בהן",
+      value: countriesTotal ? `${stats.countriesVisited} / ${countriesTotal}` : stats.countriesVisited,
+      icon: Globe2,
+    },
     { label: "מדינות מתוכננות", value: stats.countriesPlanned, icon: Globe2 },
     { label: "ערים שביקרתם בהן", value: stats.citiesVisited, icon: MapPinned },
     { label: "ערים מתוכננות", value: stats.citiesPlanned, icon: MapPinned },

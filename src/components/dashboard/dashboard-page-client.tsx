@@ -2,10 +2,12 @@
 
 import { StatGrid } from "@/components/dashboard/stat-grid";
 import { TripListCard } from "@/components/dashboard/trip-list-card";
+import { useWorldCountriesGeoJson } from "@/lib/map/geo";
 import { useDashboardStats } from "@/lib/queries/dashboard";
 
 export function DashboardPageClient() {
   const { data: stats, isLoading } = useDashboardStats();
+  const { data: worldCountries } = useWorldCountriesGeoJson();
 
   return (
     <div className="space-y-6">
@@ -14,7 +16,11 @@ export function DashboardPageClient() {
         <p className="text-sm text-muted-foreground">הטיולים שלכם במבט אחד.</p>
       </div>
 
-      <StatGrid stats={stats} isLoading={isLoading} />
+      <StatGrid
+        stats={stats}
+        isLoading={isLoading}
+        countriesTotal={worldCountries?.features.length}
+      />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <TripListCard
