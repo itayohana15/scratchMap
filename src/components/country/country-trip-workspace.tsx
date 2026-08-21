@@ -7,15 +7,12 @@ import {
   BedDouble,
   CalendarDays,
   Filter,
-  ImagePlus,
   LoaderCircle,
   MapPin,
-  NotebookPen,
   Plus,
   Route,
   Save,
   Sparkles,
-  Star,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
@@ -29,15 +26,11 @@ import { CountryItineraryHistorySection } from "@/components/country/country-iti
 import { CountryItinerarySuccessDialog } from "@/components/country/country-itinerary-success-dialog";
 import { CountryCitiesSection } from "@/components/country/country-cities-section";
 import { CountryCurrencyConverter } from "@/components/country/country-currency-converter";
-import { CountryNotesSection } from "@/components/country/country-notes-section";
-import { CountryOverviewSection } from "@/components/country/country-overview-section";
 import { CountrySafetyInfo } from "@/components/country/country-safety-info";
-import { CountryRatingsSection } from "@/components/country/country-ratings-section";
-import { CountryStatsSection } from "@/components/country/country-stats-section";
+import { CountryTripSummarySection } from "@/components/country/country-trip-summary-section";
 import { CountryWeatherSection } from "@/components/country/country-weather-section";
 import { useCountryMiniMap } from "@/components/country/use-country-mini-map";
 import type { useCountryTripWorkspace } from "@/components/country/use-country-trip-workspace";
-import { PhotoGallery } from "@/components/gallery/photo-gallery";
 import { CountryAiRecommendations } from "@/components/shared/country-ai-recommendations";
 import { PlacesSection } from "@/components/shared/places-section";
 import { STATUS_COLORS } from "@/components/map/status-colors";
@@ -113,6 +106,7 @@ interface CountryTripWorkspaceContentProps {
   centerLat: number | undefined;
   centerLon: number | undefined;
   workspaceController: WorkspaceController;
+  initialAutoOpenItineraryId?: string | null;
 }
 
 const ALL_CATEGORIES = Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[];
@@ -325,10 +319,6 @@ function buildLiveRecommendations(
     }
   }
   return [...seen.values()];
-}
-
-function journalForDay(workspace: CountryTripWorkspaceState, dayId: string) {
-  return workspace.journalEntries.find((entry) => entry.dayId === dayId) ?? null;
 }
 
 function canOpenSuccessDialog(result: GenerateCountryItineraryResult) {
@@ -875,6 +865,7 @@ export function CountryTripWorkspaceContent({
   centerLat,
   centerLon,
   workspaceController,
+  initialAutoOpenItineraryId = null,
 }: CountryTripWorkspaceContentProps) {
   const { workspace, actions, hydrated } = workspaceController;
   const accentColor = STATUS_COLORS[country.status].light;
@@ -950,6 +941,11 @@ export function CountryTripWorkspaceContent({
       setSelectedDayId(workspace.itineraryDays[0]?.id ?? "");
     }
   }, [selectedDayId, workspace.itineraryDays]);
+
+  useEffect(() => {
+    if (!initialAutoOpenItineraryId) return;
+    setAutoOpenItineraryId(initialAutoOpenItineraryId);
+  }, [initialAutoOpenItineraryId]);
 
   useEffect(() => {
     if (activeTab === "map" || activeTab === "recommendations") {
@@ -2181,430 +2177,15 @@ export function CountryTripWorkspaceContent({
         </SectionShell>
       </TabsContent>
 
-      <TabsContent value="journal" className={cn("pt-0", activeTab !== "journal" && "hidden")}>
+      <TabsContent
+        value="country_summary"
+        className={cn("pt-0", activeTab !== "country_summary" && "hidden")}
+      >
         <SectionShell
-          title="Daily journal"
-          description="Planned itinerary נשאר נפרד, וכאן מתעדים מה באמת קרה בכל יום."
+          title="סיכום המדינה"
+          description="צבירה של כל הטיולים שהושלמו במדינה הזו — דירוגים, סטטיסטיקות, מפה ומועדפים."
         >
-          <div className="space-y-4">
-            {workspace.itineraryDays.map((day) => {
-              const journalEntry = journalForDay(workspace, day.id);
-              return (
-                <div key={day.id} className="section-card space-y-4 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <h3 className="font-medium">{day.title}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        {day.date ? formatDate(day.date) : "תאריך לא הוגדר"}
-                      </p>
-                    </div>
-                    <Badge variant="outline">
-                      {day.items.filter((item) => item.completed).length}/{day.items.length} בוצעו
-                    </Badge>
-                  </div>
-
-                  <div className="grid gap-4 xl:grid-cols-2">
-                    <div className="space-y-3">
-                      <Textarea
-                        value={journalEntry?.dailySummary ?? ""}
-                        onChange={(event) =>
-                          actions.upsertJournalEntry(day.id, {
-                            dayId: day.id,
-                            date: day.date,
-                            dailySummary: event.target.value,
-                          })
-                        }
-                        rows={3}
-                        placeholder="Daily summary"
-                      />
-                      <Textarea
-                        value={journalEntry?.notes ?? ""}
-                        onChange={(event) =>
-                          actions.upsertJournalEntry(day.id, {
-                            dayId: day.id,
-                            date: day.date,
-                            notes: event.target.value,
-                          })
-                        }
-                        rows={3}
-                        placeholder="Notes, surprises, fixes on the fly..."
-                      />
-                      <Textarea
-                        value={journalEntry?.placesActuallyVisited ?? ""}
-                        onChange={(event) =>
-                          actions.upsertJournalEntry(day.id, {
-                            dayId: day.id,
-                            date: day.date,
-                            placesActuallyVisited: event.target.value,
-                          })
-                        }
-                        rows={2}
-                        placeholder="Places actually visited"
-                      />
-                    </div>
-
-                    <div className="space-y-3">
-                      <Textarea
-                        value={journalEntry?.activitiesSkipped ?? ""}
-                        onChange={(event) =>
-                          actions.upsertJournalEntry(day.id, {
-                            dayId: day.id,
-                            date: day.date,
-                            activitiesSkipped: event.target.value,
-                          })
-                        }
-                        rows={2}
-                        placeholder="Activities skipped"
-                      />
-                      <Input
-                        value={journalEntry?.favoriteMoment ?? ""}
-                        onChange={(event) =>
-                          actions.upsertJournalEntry(day.id, {
-                            dayId: day.id,
-                            date: day.date,
-                            favoriteMoment: event.target.value,
-                          })
-                        }
-                        placeholder="Favorite moment"
-                      />
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <Input
-                          type="number"
-                          value={journalEntry?.moodRating ?? ""}
-                          onChange={(event) =>
-                            actions.upsertJournalEntry(day.id, {
-                              dayId: day.id,
-                              date: day.date,
-                              moodRating: event.target.value
-                                ? Number(event.target.value)
-                                : null,
-                            })
-                          }
-                          placeholder="Mood / rating"
-                        />
-                        <Input
-                          value={journalEntry?.weatherNotes ?? ""}
-                          onChange={(event) =>
-                            actions.upsertJournalEntry(day.id, {
-                              dayId: day.id,
-                              date: day.date,
-                              weatherNotes: event.target.value,
-                            })
-                          }
-                          placeholder="Weather notes"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-border/70 p-3 text-sm">
-                    <p className="font-medium">Planned vs actual</p>
-                    <p className="mt-2 text-muted-foreground">
-                      מתוכננות {day.items.length} פעילויות, הושלמו {day.items.filter((item) => item.completed).length},
-                      דולגו {day.items.filter((item) => item.skipped).length}.
-                    </p>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </SectionShell>
-      </TabsContent>
-
-      <TabsContent value="photos" className={cn("pt-0", activeTab !== "photos" && "hidden")}>
-        <SectionShell
-          title="Photos and memories"
-          description="גלריית הזיכרונות המקומית יושבת מעל גלריית התמונות האמיתית שכבר קיימת בפרויקט."
-          action={
-            <Button
-              variant="secondary"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => actions.upsertMemory(actions.createMemory())}
-            >
-              <ImagePlus className="size-4" />
-              זיכרון חדש
-            </Button>
-          }
-        >
-          <div className="space-y-4">
-            {workspace.memories.length > 0 ? (
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {workspace.memories.map((memory) => (
-                  <div key={memory.id} className="section-card group space-y-3 p-4">
-                    {memory.imageUrl ? (
-                      <div className="h-40 w-full overflow-hidden rounded-xl shadow-sm">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={memory.imageUrl}
-                          alt=""
-                          className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-105"
-                        />
-                      </div>
-                    ) : (
-                      <div className="flex h-40 w-full items-center justify-center rounded-xl bg-muted text-sm text-muted-foreground">
-                        הדביקו URL של תמונה
-                      </div>
-                    )}
-                    <Input
-                      value={memory.imageUrl}
-                      onChange={(event) =>
-                        actions.upsertMemory({
-                          ...memory,
-                          imageUrl: event.target.value,
-                        })
-                      }
-                      placeholder="Image URL"
-                    />
-                    <Input
-                      value={memory.caption}
-                      onChange={(event) =>
-                        actions.upsertMemory({
-                          ...memory,
-                          caption: event.target.value,
-                        })
-                      }
-                      placeholder="Caption"
-                    />
-                    <div className="grid grid-cols-2 gap-2">
-                      <Input
-                        type="date"
-                        value={memory.date}
-                        onChange={(event) =>
-                          actions.upsertMemory({
-                            ...memory,
-                            date: event.target.value,
-                          })
-                        }
-                      />
-                      <Input
-                        value={memory.location}
-                        onChange={(event) =>
-                          actions.upsertMemory({
-                            ...memory,
-                            location: event.target.value,
-                          })
-                        }
-                        placeholder="Location"
-                      />
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        variant={memory.favorite ? "default" : "outline"}
-                        onClick={() =>
-                          actions.upsertMemory({
-                            ...memory,
-                            favorite: !memory.favorite,
-                          })
-                        }
-                      >
-                        <Star className="size-4" />
-                        Favorite
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant={memory.cover ? "default" : "outline"}
-                        onClick={() =>
-                          actions.upsertMemory({
-                            ...memory,
-                            cover: !memory.cover,
-                          })
-                        }
-                      >
-                        Cover
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => actions.removeMemory(memory.id)}
-                      >
-                        מחיקה
-                      </Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="section-card p-4 text-sm text-muted-foreground">
-                עדיין לא נוצרו cards של זיכרונות. אפשר להוסיף caption, תאריך, location, favorite photo ו-cover photo.
-              </div>
-            )}
-
-            <PhotoGallery countryId={country.id} title="גלריית תמונות" />
-          </div>
-        </SectionShell>
-      </TabsContent>
-
-      <TabsContent value="summary" className={cn("pt-0", activeTab !== "summary" && "hidden")}>
-        <SectionShell
-          title="Trip summary and journal wrap-up"
-          description="סיכום סופי, planned vs actual, lessons learned ושימור שדות הסיכום הקיימים."
-        >
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_360px]">
-            <div className="space-y-4">
-              <div className="section-card grid gap-3 p-4 md:grid-cols-2">
-                <Input
-                  value={workspace.summary.favoritePlace}
-                  onChange={(event) =>
-                    actions.updateSummary({ favoritePlace: event.target.value })
-                  }
-                  placeholder="Favorite place"
-                />
-                <Input
-                  value={workspace.summary.favoriteRestaurant}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      favoriteRestaurant: event.target.value,
-                    })
-                  }
-                  placeholder="Favorite restaurant"
-                />
-                <Input
-                  value={workspace.summary.bestDay}
-                  onChange={(event) => actions.updateSummary({ bestDay: event.target.value })}
-                  placeholder="Best day"
-                />
-                <Input
-                  value={workspace.summary.biggestSurprise}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      biggestSurprise: event.target.value,
-                    })
-                  }
-                  placeholder="Biggest surprise"
-                />
-                <Input
-                  value={workspace.summary.favoriteMemory}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      favoriteMemory: event.target.value,
-                    })
-                  }
-                  placeholder="Favorite memory"
-                />
-                <Input
-                  type="number"
-                  value={workspace.summary.personalRating ?? ""}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      personalRating: event.target.value ? Number(event.target.value) : null,
-                    })
-                  }
-                  placeholder="Personal rating"
-                />
-                <Textarea
-                  value={workspace.summary.overallTripSummary}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      overallTripSummary: event.target.value,
-                    })
-                  }
-                  rows={3}
-                  placeholder="Overall trip summary"
-                />
-                <Textarea
-                  value={workspace.summary.tripHighlights}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      tripHighlights: event.target.value,
-                    })
-                  }
-                  rows={3}
-                  placeholder="Trip highlights"
-                />
-                <Textarea
-                  value={workspace.summary.lessonsLearned}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      lessonsLearned: event.target.value,
-                    })
-                  }
-                  rows={3}
-                  placeholder="Lessons learned"
-                />
-                <Textarea
-                  value={workspace.summary.differentlyNextTime}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      differentlyNextTime: event.target.value,
-                    })
-                  }
-                  rows={3}
-                  placeholder="What to do differently next time"
-                />
-                <Textarea
-                  value={workspace.summary.recommendationsForOthers}
-                  onChange={(event) =>
-                    actions.updateSummary({
-                      recommendationsForOthers: event.target.value,
-                    })
-                  }
-                  rows={3}
-                  placeholder="Recommendations for others"
-                />
-              </div>
-
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">Planned cost</p>
-                  <p className="mt-2 text-xl font-semibold">
-                    {formatCurrency(budgetComparison.plannedCost)}
-                  </p>
-                </div>
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">Actual cost</p>
-                  <p className="mt-2 text-xl font-semibold">
-                    {formatCurrency(budgetComparison.actualCost)}
-                  </p>
-                </div>
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">Completed activities</p>
-                  <p className="mt-2 text-xl font-semibold">
-                    {budgetComparison.completedActivities}/{budgetComparison.plannedActivities}
-                  </p>
-                </div>
-                <div className="section-card p-4">
-                  <p className="text-sm text-muted-foreground">Spontaneous additions</p>
-                  <p className="mt-2 text-xl font-semibold">
-                    {budgetComparison.spontaneousAdditions}
-                  </p>
-                </div>
-              </div>
-
-              <CountryOverviewSection country={country} showStatus={false} />
-              <CountryNotesSection country={country} />
-              <CountryRatingsSection countryId={country.id} />
-            </div>
-
-            <div className="space-y-4">
-              <div className="section-card space-y-3 p-4">
-                <div className="flex items-center gap-2">
-                  <NotebookPen className="size-4 text-primary" />
-                  <h3 className="font-medium">Trip statistics</h3>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-2xl border border-border/70 p-3">
-                    <p className="text-xs text-muted-foreground">ימי טיול</p>
-                    <p className="mt-1 text-lg font-semibold">{tripStatistics.totalTripDays}</p>
-                  </div>
-                  <div className="rounded-2xl border border-border/70 p-3">
-                    <p className="text-xs text-muted-foreground">מקומות שבוצעו</p>
-                    <p className="mt-1 text-lg font-semibold">{tripStatistics.placesVisited}</p>
-                  </div>
-                  <div className="rounded-2xl border border-border/70 p-3">
-                    <p className="text-xs text-muted-foreground">מרחק בין עצירות</p>
-                    <p className="mt-1 text-lg font-semibold">{tripStatistics.distanceStops} ק&quot;מ</p>
-                  </div>
-                  <div className="rounded-2xl border border-border/70 p-3">
-                    <p className="text-xs text-muted-foreground">קטגוריה מובילה</p>
-                    <p className="mt-1 text-lg font-semibold">{tripStatistics.topCategoryVisited}</p>
-                  </div>
-                </div>
-              </div>
-              <CountryStatsSection countryId={country.id} />
-            </div>
-          </div>
+          <CountryTripSummarySection iso={iso} country={country} />
         </SectionShell>
       </TabsContent>
 

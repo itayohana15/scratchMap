@@ -34,9 +34,7 @@ const TAB_EMOJIS: Record<TripWorkspaceTab, string> = {
   map: "🗺️",
   recommendations: "⭐",
   budget: "💰",
-  journal: "📔",
-  photos: "📸",
-  summary: "✅",
+  country_summary: "🧾",
   practical: "ℹ️",
   currency: "💱",
 };
@@ -125,18 +123,22 @@ function CountryWorkspaceView({
   feature,
   centerLat,
   centerLon,
+  initialItineraryId,
 }: {
   country: Tables<"countries">;
   iso: string;
   feature: Feature<Polygon | MultiPolygon, CountryFeatureProperties> | undefined;
   centerLat: number | undefined;
   centerLon: number | undefined;
+  initialItineraryId?: string | null;
 }) {
   const accentColor = STATUS_COLORS[country.status].light;
   const workspaceController = useCountryTripWorkspace(country.id, country.name);
   const { workspace, hydrated } = workspaceController;
   const tabOrder = getTabOrderForStatus(workspace.tripStatus);
-  const [activeTab, setActiveTab] = useState<TripWorkspaceTab>(tabOrder[0] ?? "overview");
+  const [activeTab, setActiveTab] = useState<TripWorkspaceTab>(
+    initialItineraryId ? "itinerary" : (tabOrder[0] ?? "overview")
+  );
 
   useEffect(() => {
     if (!tabOrder.includes(activeTab)) {
@@ -148,6 +150,11 @@ function CountryWorkspaceView({
     if (!hydrated) return;
     setActiveTab((current) => (tabOrder.includes(current) ? current : tabOrder[0] ?? "overview"));
   }, [hydrated, tabOrder]);
+
+  useEffect(() => {
+    if (!initialItineraryId) return;
+    setActiveTab("itinerary");
+  }, [initialItineraryId]);
 
   const sidebarNav = (
     <TabsList
@@ -202,6 +209,7 @@ function CountryWorkspaceView({
               centerLat={centerLat}
               centerLon={centerLon}
               workspaceController={workspaceController}
+              initialAutoOpenItineraryId={initialItineraryId}
             />
           </div>
         </div>
@@ -210,7 +218,13 @@ function CountryWorkspaceView({
   );
 }
 
-export function CountryPageClient({ iso }: { iso: string }) {
+export function CountryPageClient({
+  iso,
+  initialItineraryId = null,
+}: {
+  iso: string;
+  initialItineraryId?: string | null;
+}) {
   const { data: country, isLoading } = useCountryByIso(iso);
   const upsertCountry = useUpsertCountry();
   const { data: geojson } = useWorldCountriesGeoJson();
@@ -293,6 +307,7 @@ export function CountryPageClient({ iso }: { iso: string }) {
       feature={feature}
       centerLat={centerLat}
       centerLon={centerLon}
+      initialItineraryId={initialItineraryId}
     />
   );
 }

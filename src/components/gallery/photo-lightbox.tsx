@@ -1,13 +1,14 @@
 "use client";
 
-import { ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Star, Trash2 } from "lucide-react";
 import Image from "next/image";
 import { useCallback, useEffect } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { formatDate } from "@/lib/format";
-import { photoPublicUrl } from "@/lib/queries/photos";
+import { photoPublicUrl, useUpdatePhotoFavorite } from "@/lib/queries/photos";
 import type { Tables } from "@/lib/supabase/types";
 
 interface PhotoLightboxProps {
@@ -28,6 +29,7 @@ export function PhotoLightbox({
   onDelete,
 }: PhotoLightboxProps) {
   const photo = photos[index];
+  const updateFavorite = useUpdatePhotoFavorite();
 
   const goPrev = useCallback(() => {
     onIndexChange((index - 1 + photos.length) % photos.length);
@@ -98,15 +100,31 @@ export function PhotoLightbox({
               <p className="text-xs text-white/60">{formatDate(photo.taken_at)}</p>
             )}
           </div>
-          <Button
-            variant="secondary"
-            size="sm"
-            className="gap-1.5 bg-white/10 text-white hover:bg-white/20"
-            onClick={() => onDelete(photo)}
-          >
-            <Trash2 className="size-3.5" />
-            מחיקה
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              className={cn(
+                "gap-1.5 bg-white/10 text-white hover:bg-white/20",
+                photo.favorite && "text-warning"
+              )}
+              onClick={() =>
+                updateFavorite.mutate({ id: photo.id, favorite: !photo.favorite })
+              }
+            >
+              <Star className={cn("size-3.5", photo.favorite && "fill-current")} />
+              מועדף
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="gap-1.5 bg-white/10 text-white hover:bg-white/20"
+              onClick={() => onDelete(photo)}
+            >
+              <Trash2 className="size-3.5" />
+              מחיקה
+            </Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

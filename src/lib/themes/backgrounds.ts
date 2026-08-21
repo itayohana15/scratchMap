@@ -17,7 +17,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.18,
+    opacity: 0.24,
     overlay:
       "linear-gradient(180deg, rgba(10,10,10,0.12) 0%, rgba(10,10,10,0.02) 32%, rgba(10,10,10,0.22) 100%)",
     overlayOpacity: 1,
@@ -32,7 +32,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.04) 38%, rgba(245,249,255,0.12) 100%)",
     overlayOpacity: 1,
@@ -47,7 +47,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.2,
+    opacity: 0.26,
     overlay:
       "linear-gradient(180deg, rgba(242,251,253,0.14) 0%, rgba(242,251,253,0.02) 38%, rgba(235,249,251,0.16) 100%)",
     overlayOpacity: 1,
@@ -62,7 +62,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.24,
+    opacity: 0.26,
     overlay:
       "linear-gradient(180deg, rgba(19,28,22,0.22) 0%, rgba(19,28,22,0.06) 36%, rgba(19,28,22,0.28) 100%)",
     overlayOpacity: 1,
@@ -92,7 +92,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.24,
+    opacity: 0.26,
     overlay:
       "linear-gradient(180deg, rgba(8,0,15,0.18) 0%, rgba(8,0,15,0.04) 42%, rgba(8,0,15,0.22) 100%)",
     overlayOpacity: 1,
@@ -107,7 +107,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(19,10,34,0.18) 0%, rgba(19,10,34,0.05) 34%, rgba(19,10,34,0.2) 100%)",
     overlayOpacity: 1,
@@ -122,7 +122,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.25,
     overlay:
       "linear-gradient(180deg, rgba(251,243,230,0.08) 0%, rgba(251,243,230,0.02) 38%, rgba(248,239,224,0.16) 100%)",
     overlayOpacity: 1,
@@ -137,7 +137,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.25,
     overlay:
       "linear-gradient(180deg, rgba(4,18,13,0.2) 0%, rgba(4,18,13,0.04) 36%, rgba(4,18,13,0.24) 100%)",
     overlayOpacity: 1,
@@ -152,7 +152,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.24,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(7,11,30,0.22) 0%, rgba(7,11,30,0.04) 38%, rgba(7,11,30,0.28) 100%)",
     overlayOpacity: 1,
@@ -167,7 +167,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.2,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(247,249,251,0.12) 0%, rgba(247,249,251,0.02) 40%, rgba(244,247,250,0.16) 100%)",
     overlayOpacity: 1,
@@ -197,7 +197,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.24,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(246,243,231,0.08) 0%, rgba(246,243,231,0.02) 42%, rgba(241,239,227,0.18) 100%)",
     overlayOpacity: 1,
@@ -212,7 +212,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(251,248,241,0.08) 0%, rgba(251,248,241,0.02) 40%, rgba(247,243,235,0.14) 100%)",
     overlayOpacity: 1,
@@ -227,7 +227,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(245,242,232,0.06) 0%, rgba(245,242,232,0.02) 38%, rgba(241,237,227,0.18) 100%)",
     overlayOpacity: 1,
@@ -242,7 +242,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(251,241,231,0.08) 0%, rgba(251,241,231,0.02) 40%, rgba(247,237,227,0.14) 100%)",
     overlayOpacity: 1,
@@ -257,7 +257,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.2,
+    opacity: 0.24,
     overlay:
       "linear-gradient(180deg, rgba(246,237,225,0.08) 0%, rgba(246,237,225,0.02) 38%, rgba(241,231,219,0.16) 100%)",
     overlayOpacity: 1,
@@ -272,7 +272,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.23,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(244,236,216,0.1) 0%, rgba(244,236,216,0.02) 38%, rgba(239,231,209,0.16) 100%)",
     overlayOpacity: 1,
@@ -287,7 +287,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(244,247,248,0.1) 0%, rgba(244,247,248,0.02) 38%, rgba(239,243,244,0.14) 100%)",
     overlayOpacity: 1,
@@ -302,7 +302,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.24,
+    opacity: 0.27,
     overlay:
       "linear-gradient(180deg, rgba(246,237,224,0.08) 0%, rgba(246,237,224,0.02) 38%, rgba(242,231,215,0.16) 100%)",
     overlayOpacity: 1,
@@ -317,7 +317,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.26,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(18,16,29,0.2) 0%, rgba(18,16,29,0.04) 42%, rgba(18,16,29,0.28) 100%)",
     overlayOpacity: 1,
@@ -332,7 +332,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.26,
+    opacity: 0.3,
     overlay:
       "linear-gradient(180deg, rgba(5,10,18,0.22) 0%, rgba(5,10,18,0.04) 40%, rgba(5,10,18,0.28) 100%)",
     overlayOpacity: 1,
@@ -347,7 +347,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.2,
+    opacity: 0.28,
     overlay:
       "linear-gradient(180deg, rgba(247,241,227,0.1) 0%, rgba(247,241,227,0.02) 38%, rgba(242,237,224,0.14) 100%)",
     overlayOpacity: 1,
@@ -362,7 +362,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.22,
+    opacity: 0.25,
     overlay:
       "linear-gradient(180deg, rgba(237,225,211,0.1) 0%, rgba(237,225,211,0.02) 40%, rgba(232,219,203,0.16) 100%)",
     overlayOpacity: 1,
@@ -377,7 +377,7 @@ export const THEME_BACKGROUNDS = {
     size: "cover",
     mobileSize: "cover",
     repeat: "no-repeat",
-    opacity: 0.18,
+    opacity: 0.22,
     overlay:
       "linear-gradient(180deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.02) 40%, rgba(246,247,248,0.12) 100%)",
     overlayOpacity: 1,

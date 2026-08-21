@@ -10,6 +10,8 @@ const BUCKET = "photos";
 export const photoKeys = {
   byCountry: (countryId: string) => ["photos", "country", countryId] as const,
   byCity: (cityId: string) => ["photos", "city", cityId] as const,
+  byItinerary: (itineraryId: string) => ["photos", "itinerary", itineraryId] as const,
+  byItineraries: (itineraryIds: string[]) => ["photos", "itineraries", [...itineraryIds].sort()] as const,
 };
 
 export function usePhotosForCountry(countryId: string | undefined) {
@@ -50,9 +52,52 @@ export function usePhotosForCity(cityId: string | undefined) {
   });
 }
 
+/**
+ * One batched lookup for all completed trips' photos, used by the
+ * country-level aggregate summary instead of N+1 per-trip queries.
+ */
+export function usePhotosForItineraries(itineraryIds: string[]) {
+  const supabase = createClient();
+  const sortedIds = [...itineraryIds].sort();
+
+  return useQuery({
+    queryKey: photoKeys.byItineraries(sortedIds),
+    enabled: sortedIds.length > 0,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("photos")
+        .select("*")
+        .in("itinerary_id", sortedIds)
+        .order("sort_order")
+        .order("created_at");
+      if (error) throw error;
+      return data;
+    },
+  });
+}
+
 export function photoPublicUrl(storagePath: string) {
   const supabase = createClient();
   return supabase.storage.from(BUCKET).getPublicUrl(storagePath).data.publicUrl;
+}
+
+export function usePhotosForItinerary(itineraryId: string | undefined) {
+  const supabase = createClient();
+
+  return useQuery({
+    queryKey: photoKeys.byItinerary(itineraryId ?? ""),
+    enabled: !!itineraryId,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("photos")
+        .select("*")
+        .eq("itinerary_id", itineraryId!)
+        .order("sort_order")
+        .order("created_at");
+      if (error) throw error;
+      return data;
+    },
+  });
 }
 
 interface UploadPhotoInput {
@@ -60,8 +105,26 @@ interface UploadPhotoInput {
   countryId?: string;
   cityId?: string;
   tripId?: string;
+  itineraryId?: string;
+  dayId?: string | null;
+  placeId?: string | null;
   caption?: string;
   takenAt?: string;
+}
+
+function invalidatePhotoQueries(
+  queryClient: ReturnType<typeof useQueryClient>,
+  photo: Tables<"photos">
+) {
+  if (photo.country_id) {
+    queryClient.invalidateQueries({ queryKey: photoKeys.byCountry(photo.country_id) });
+  }
+  if (photo.city_id) {
+    queryClient.invalidateQueries({ queryKey: photoKeys.byCity(photo.city_id) });
+  }
+  if (photo.itinerary_id) {
+    queryClient.invalidateQueries({ queryKey: photoKeys.byItinerary(photo.itinerary_id) });
+  }
 }
 
 export function useUploadPhoto() {
@@ -69,8 +132,18 @@ export function useUploadPhoto() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async ({ file, countryId, cityId, tripId, caption, takenAt }: UploadPhotoInput) => {
-      const scopeId = cityId ?? countryId;
+    mutationFn: async ({
+      file,
+      countryId,
+      cityId,
+      tripId,
+      itineraryId,
+      dayId,
+      placeId,
+      caption,
+      takenAt,
+    }: UploadPhotoInput) => {
+      const scopeId = cityId ?? itineraryId ?? countryId;
       const extension = file.name.split(".").pop() ?? "jpg";
       const storagePath = `${scopeId}/${crypto.randomUUID()}.${extension}`;
 
@@ -87,6 +160,9 @@ export function useUploadPhoto() {
           country_id: countryId ?? null,
           city_id: cityId ?? null,
           trip_id: tripId ?? null,
+          itinerary_id: itineraryId ?? null,
+          day_id: dayId ?? null,
+          place_id: placeId ?? null,
           storage_path: storagePath,
           caption: caption ?? null,
           taken_at: takenAt ?? null,
@@ -103,14 +179,7 @@ export function useUploadPhoto() {
 
       return data as Tables<"photos">;
     },
-    onSuccess: (photo) => {
-      if (photo.country_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCountry(photo.country_id) });
-      }
-      if (photo.city_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCity(photo.city_id) });
-      }
-    },
+    onSuccess: (photo) => invalidatePhotoQueries(queryClient, photo),
   });
 }
 
@@ -130,14 +199,7 @@ export function useDeletePhoto() {
 
       return photo;
     },
-    onSuccess: (photo) => {
-      if (photo.country_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCountry(photo.country_id) });
-      }
-      if (photo.city_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCity(photo.city_id) });
-      }
-    },
+    onSuccess: (photo) => invalidatePhotoQueries(queryClient, photo),
   });
 }
 
@@ -164,14 +226,26 @@ export function useUpdatePhotoCaption() {
       if (error) throw error;
       return data as Tables<"photos">;
     },
-    onSuccess: (photo) => {
-      if (photo.country_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCountry(photo.country_id) });
-      }
-      if (photo.city_id) {
-        queryClient.invalidateQueries({ queryKey: photoKeys.byCity(photo.city_id) });
-      }
+    onSuccess: (photo) => invalidatePhotoQueries(queryClient, photo),
+  });
+}
+
+export function useUpdatePhotoFavorite() {
+  const supabase = createClient();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ id, favorite }: { id: string; favorite: boolean }) => {
+      const { data, error } = await supabase
+        .from("photos")
+        .update({ favorite })
+        .eq("id", id)
+        .select()
+        .single();
+      if (error) throw error;
+      return data as Tables<"photos">;
     },
+    onSuccess: (photo) => invalidatePhotoQueries(queryClient, photo),
   });
 }
 

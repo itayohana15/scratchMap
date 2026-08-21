@@ -145,10 +145,10 @@ function routeWithCache(segment: Pick<MapSegment, "from" | "to" | "mode">) {
   return promise;
 }
 
-function readCssHsl(name: string, fallback: string) {
+function readCssColor(name: string, fallback: string) {
   if (typeof window === "undefined") return fallback;
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return value ? `hsl(${value})` : fallback;
+  return value || fallback;
 }
 
 function classifyStopKind(item: TripItineraryItem): MapStopKind {
@@ -883,10 +883,10 @@ function DayMapCanvas({
     loadMaplibreGl().then((maplibregl) => {
       if (cancelled || !mapRef.current) return;
 
-      const surface = readCssHsl("--background", "#ffffff");
-      const border = readCssHsl("--border", "#d4d4d8");
-      const foreground = readCssHsl("--foreground", "#111827");
-      const accent = readCssHsl("--primary", "#0f172a");
+      const surface = readCssColor("--background", "#ffffff");
+      const border = readCssColor("--border", "#d4d4d8");
+      const foreground = readCssColor("--foreground", "#111827");
+      const accent = readCssColor("--primary", "#0f172a");
 
       markersRef.current.forEach((marker) => marker.remove());
       markersRef.current = [];
@@ -968,8 +968,8 @@ function DayMapCanvas({
   useEffect(() => {
     if (!ready || !mapRef.current) return;
     const map = mapRef.current;
-    const accent = readCssHsl("--primary", "#0f172a");
-    const muted = readCssHsl("--muted-foreground", "#64748b");
+    const accent = readCssColor("--primary", "#0f172a");
+    const muted = readCssColor("--muted-foreground", "#64748b");
     const cleanupIds: Array<{ sourceId: string; layerId: string; click: () => void; enter: () => void; leave: () => void }> = [];
 
     listenersRef.current.forEach((dispose) => dispose());

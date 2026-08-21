@@ -288,7 +288,8 @@ export async function updateCountryItinerary(
   const status = deriveItineraryStatus(
     preferencesSnapshot.startDate || existing.startDate,
     preferencesSnapshot.endDate || existing.endDate,
-    archived
+    archived,
+    existing.status
   );
 
   const { data, error } = await supabase
@@ -358,7 +359,7 @@ export async function duplicateCountryItinerary(
       workspace_snapshot: workspace,
       itinerary_days: existing.itineraryDays,
       cost_summary: costSummary,
-      status: deriveItineraryStatus(existing.startDate, existing.endDate, false),
+      status: deriveItineraryStatus(existing.startDate, existing.endDate, false, existing.status),
       version: 1,
       parent_itinerary_id: existing.id,
       manually_edited: existing.manuallyEdited,

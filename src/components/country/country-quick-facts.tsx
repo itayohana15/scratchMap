@@ -21,19 +21,20 @@ interface FactTileProps {
 
 function FactTile({ icon: Icon, label, value, accentColor }: FactTileProps) {
   return (
-    <div className="section-card flex h-full flex-col items-start gap-4 p-5 text-right">
+    <div className="section-card flex h-full min-h-20 items-center gap-3 p-4 text-right transition-shadow hover:shadow-md">
       <div
-        className="flex size-11 items-center justify-center rounded-2xl shadow-sm"
-        style={{
-          backgroundColor: accentColor ? `${accentColor}1A` : undefined,
-          color: accentColor,
-        }}
+        className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"
+        style={
+          accentColor
+            ? { color: `color-mix(in srgb, ${accentColor} 40%, var(--primary))` }
+            : undefined
+        }
       >
-        <Icon className="size-5" />
+        <Icon className="size-4.5" />
       </div>
-      <div className="space-y-1">
-        <p className="text-base font-semibold text-foreground">{value}</p>
-        <p className="text-xs font-medium text-muted-foreground">{label}</p>
+      <div className="min-w-0 space-y-0.5">
+        <p className="truncate text-sm font-semibold text-foreground">{value}</p>
+        <p className="truncate text-xs text-muted-foreground">{label}</p>
       </div>
     </div>
   );
@@ -54,7 +55,7 @@ export function CountryQuickFacts({ isoA2, className, accentColor }: CountryQuic
     return (
       <div className={cn("grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6", className)}>
         {Array.from({ length: 6 }).map((_, i) => (
-          <Skeleton key={i} className="h-28 rounded-[20px]" />
+          <Skeleton key={i} className="h-20 rounded-[20px]" />
         ))}
       </div>
     );

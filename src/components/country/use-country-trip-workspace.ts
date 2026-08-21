@@ -8,7 +8,6 @@ import {
   createEmptyDay,
   createEmptyItineraryItem,
   createId,
-  createJournalEntry,
   normalizeWorkspace,
   recommendationToItineraryItem,
   type AiItineraryResponse,
@@ -18,7 +17,6 @@ import {
   type TripExpense,
   type TripItineraryDay,
   type TripItineraryItem,
-  type TripJournalEntry,
   type TripMemoryPhoto,
   type TripPhase,
   type TripPreferences,
@@ -144,10 +142,6 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
           return {
             ...current,
             itineraryDays: nextDays,
-            journalEntries: [
-              ...current.journalEntries,
-              createJournalEntry(duplicatedDay.id, duplicatedDay.date),
-            ],
           };
         });
       },
@@ -364,22 +358,6 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
           ...current,
           [bucket]: current[bucket].filter((expense) => expense.id !== expenseId),
         }));
-      },
-      upsertJournalEntry(dayId: string, patch: Partial<TripJournalEntry>) {
-        updateWorkspace((current) => {
-          const existing =
-            current.journalEntries.find((entry) => entry.dayId === dayId) ??
-            createJournalEntry(
-              dayId,
-              current.itineraryDays.find((day) => day.id === dayId)?.date ?? ""
-            );
-          const nextEntry = { ...existing, ...patch };
-          const others = current.journalEntries.filter((entry) => entry.dayId !== dayId);
-          return {
-            ...current,
-            journalEntries: [...others, nextEntry],
-          };
-        });
       },
       upsertMemory(memory: TripMemoryPhoto) {
         updateWorkspace((current) => {

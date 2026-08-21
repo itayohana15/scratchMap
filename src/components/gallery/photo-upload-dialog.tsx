@@ -20,9 +20,10 @@ import { useUploadPhoto } from "@/lib/queries/photos";
 interface PhotoUploadDialogProps {
   countryId?: string;
   cityId?: string;
+  itineraryId?: string;
 }
 
-export function PhotoUploadDialog({ countryId, cityId }: PhotoUploadDialogProps) {
+export function PhotoUploadDialog({ countryId, cityId, itineraryId }: PhotoUploadDialogProps) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<FileList | null>(null);
   const [caption, setCaption] = useState("");
@@ -42,6 +43,7 @@ export function PhotoUploadDialog({ countryId, cityId }: PhotoUploadDialogProps)
           file,
           countryId,
           cityId,
+          itineraryId,
           caption: caption || undefined,
           takenAt: takenAt || undefined,
         });

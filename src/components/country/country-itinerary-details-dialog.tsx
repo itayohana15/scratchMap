@@ -3,6 +3,7 @@
 import {
   Archive,
   BedDouble,
+  CalendarRange,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -11,6 +12,7 @@ import {
   Download,
   Ellipsis,
   History,
+  ImagePlus,
   LoaderCircle,
   MapPin,
   NotebookPen,
@@ -18,17 +20,22 @@ import {
   RefreshCcw,
   Route,
   Save,
+  Sparkles,
+  Star,
   Trash2,
   TriangleAlert,
   Wallet,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 
 import {
   ItineraryDayRouteSection,
   ItineraryTripSummarySection,
 } from "@/components/country/itinerary-route-map";
+import { TripJournalSection } from "@/components/country/trip-journal-section";
+import { TripSummarySection } from "@/components/country/trip-summary-section";
+import { PhotoGallery } from "@/components/gallery/photo-gallery";
 import {
   buildSuggestedItineraryTitle,
   createWorkspaceFromItineraryRecord,
@@ -222,6 +229,16 @@ function activityPrice(value: number | null | undefined) {
 
 const SUMMARY_TAB_VALUE = "__trip-summary__";
 
+type TripSectionValue = "route" | "map" | "journal" | "photos" | "trip_summary";
+
+const TRIP_SECTIONS: Array<{ value: TripSectionValue; label: string; icon: ComponentType<{ className?: string }> }> = [
+  { value: "route", label: "מסלול", icon: Route },
+  { value: "map", label: "מפה", icon: MapPin },
+  { value: "journal", label: "יומן", icon: NotebookPen },
+  { value: "photos", label: "תמונות", icon: ImagePlus },
+  { value: "trip_summary", label: "סיכום הטיול", icon: Star },
+];
+
 function tabValueForDay(dayId: string) {
   return `day:${dayId}`;
 }
@@ -248,7 +265,7 @@ interface CountryItineraryDetailsDialogProps {
   open: boolean;
   draft: CountryItineraryRecord | null;
   activeItinerary: CountryItineraryRecord | null;
-  country: Tables<"countries">;
+  country: Pick<Tables<"countries">, "name">;
   versions: CountryItineraryVersionRecord[];
   isDirty: boolean;
   isSaving: boolean;
@@ -301,6 +318,7 @@ export function CountryItineraryDetailsDialog({
   onExport,
 }: CountryItineraryDetailsDialogProps) {
   const [isEditMode, setIsEditMode] = useState(false);
+  const [activeSection, setActiveSection] = useState<TripSectionValue>("route");
   const [selectedTab, setSelectedTab] = useState<string>("");
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [activeMapItemIdsByDay, setActiveMapItemIdsByDay] = useState<Record<string, string[]>>({});
@@ -424,6 +442,26 @@ export function CountryItineraryDetailsDialog({
       itineraryDays: [...current.itineraryDays, nextDay],
     }));
     setSelectedTab(tabValueForDay(nextDay.id));
+    setIsEditMode(true);
+  }
+
+  function handleCreateAllDays() {
+    if (!draft) {
+      return;
+    }
+
+    const targetCount = Math.max(draft.daysCount, draft.itineraryDays.length, 1);
+    const startDate = draft.startDate || draft.preferencesSnapshot.startDate;
+    const newDays = Array.from({ length: targetCount }, (_, index) =>
+      createEmptyDay(index + 1, startDate ? dateForDayNumber(startDate, index + 1) : "")
+    );
+    onPatchDraft((current) => ({
+      ...current,
+      daysCount: targetCount,
+      itineraryDays: newDays,
+    }));
+    setSelectedTab(tabValueForDay(newDays[0].id));
+    setIsEditMode(true);
   }
 
   function handleSelectDay(dayId: string) {
@@ -578,6 +616,36 @@ export function CountryItineraryDetailsDialog({
                 <Badge variant="outline">{draft.daysCount} ימים</Badge>
               </div>
 
+              <div
+                role="tablist"
+                aria-label="חלקי הטיול"
+                className="flex flex-wrap gap-1.5 rounded-2xl border border-border/60 bg-background/60 p-1.5"
+              >
+                {TRIP_SECTIONS.map((section) => {
+                  const selected = activeSection === section.value;
+                  return (
+                    <button
+                      key={section.value}
+                      type="button"
+                      role="tab"
+                      aria-selected={selected}
+                      onClick={() => setActiveSection(section.value)}
+                      className={cn(
+                        "flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-medium transition-colors",
+                        selected
+                          ? "bg-primary/10 text-primary shadow-sm"
+                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                      )}
+                    >
+                      <section.icon className="size-4" />
+                      {section.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {activeSection === "route" ? (
+              <>
               <div className="flex flex-wrap gap-2">
                 <Button
                   size="sm"
@@ -758,7 +826,7 @@ export function CountryItineraryDetailsDialog({
                             : "border-border/60 bg-background/70 text-foreground/80 hover:bg-muted/60"
                         )}
                       >
-                        <span className="block text-sm font-semibold">סיכום הטיול</span>
+                        <span className="block text-sm font-semibold">סיכום מסלול</span>
                         <span className="mt-1 block truncate text-[11px] text-muted-foreground">
                           מפה מלאה, תקציב ותובנות מסלול
                         </span>
@@ -775,12 +843,36 @@ export function CountryItineraryDetailsDialog({
                   </Button>
                 </div>
               </div>
+              </>
+              ) : null}
             </div>
           </header>
 
           <div ref={bodyViewportRef} className="min-h-0 flex-1 overflow-y-auto">
             <div className="space-y-6 px-4 py-4 pb-28 sm:px-6 sm:py-6 sm:pb-32">
-              {isSummarySelected ? (
+              {activeSection === "map" ? (
+                <ItineraryTripSummarySection
+                  days={draft.itineraryDays}
+                  countryName={country.name}
+                  isoA2={draft.isoA2}
+                  onPatchDay={onPatchDay}
+                  onPatchItem={onPatchItem}
+                  onOpenDay={(dayId) => {
+                    setActiveSection("route");
+                    handleSelectDay(dayId);
+                  }}
+                />
+              ) : activeSection === "journal" ? (
+                <TripJournalSection draft={draft} onPatchDraft={onPatchDraft} />
+              ) : activeSection === "photos" ? (
+                <PhotoGallery
+                  itineraryId={draft.id}
+                  countryId={draft.countryId}
+                  title="תמונות הטיול"
+                />
+              ) : activeSection === "trip_summary" ? (
+                <TripSummarySection draft={draft} country={country} onPatchDraft={onPatchDraft} />
+              ) : isSummarySelected ? (
                 <div
                   id={selectedPanelId}
                   role="tabpanel"
@@ -788,6 +880,55 @@ export function CountryItineraryDetailsDialog({
                   tabIndex={0}
                   className="space-y-6 outline-none"
                 >
+                  {draft.itineraryDays.length === 0 ? (
+                    <section className="rounded-[28px] border border-dashed border-border/70 bg-background/70 p-6 text-center sm:p-8">
+                      <div className="mx-auto flex max-w-xl flex-col items-center gap-3">
+                        <div className="flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                          <History className="size-5" />
+                        </div>
+                        <h4 className="font-heading text-lg font-semibold text-foreground">
+                          עדיין לא נוסף פירוט לטיול הזה
+                        </h4>
+                        <p className="text-sm leading-6 text-muted-foreground">
+                          זה טיול שכבר קרה, אבל עדיין לא שמור לו מסלול יום־יומי. אפשר להוסיף פרטים
+                          בהדרגה, יום אחרי יום, או ליצור בבת אחת את כל ימי הטיול ולמלא אותם לאט
+                          לאט.
+                        </p>
+                        <div className="mt-2 flex flex-wrap justify-center gap-2">
+                          <Button size="sm" onClick={() => setIsEditMode(true)}>
+                            <NotebookPen className="size-4" />
+                            הוסף פרטי מסלול
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={handleAddDay}>
+                            <Plus className="size-4" />
+                            הוסף יום
+                          </Button>
+                          {draft.daysCount > 1 ? (
+                            <Button size="sm" variant="outline" onClick={handleCreateAllDays}>
+                              <CalendarRange className="size-4" />
+                              צור את כל ימי הטיול ({draft.daysCount})
+                            </Button>
+                          ) : null}
+                          {draft.source === "historical_manual" ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => void onRegenerate(draft.id, "full")}
+                              disabled={isRegenerating || isSaving}
+                            >
+                              {isRegenerating ? (
+                                <LoaderCircle className="size-4 animate-spin" />
+                              ) : (
+                                <Sparkles className="size-4" />
+                              )}
+                              עזור לי לשחזר את הטיול
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                    </section>
+                  ) : null}
+
                   <section className="rounded-[28px] border border-border/60 bg-card/70 p-5 shadow-sm sm:p-6">
                     <SectionTitle
                       title="פרטי המסלול"
@@ -905,7 +1046,7 @@ export function CountryItineraryDetailsDialog({
 
                   <section className="rounded-[28px] border border-border/60 bg-card/70 p-5 shadow-sm sm:p-6">
                     <SectionTitle
-                      title="סיכום הטיול"
+                      title="סיכום מסלול"
                       description="מפה מלאה של כל הימים, הלינות, המעברים וההתפלגות הכללית של המסלול."
                       action={<Badge variant="outline">{draft.itineraryDays.length} ימים</Badge>}
                     />

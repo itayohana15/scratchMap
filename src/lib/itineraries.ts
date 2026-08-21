@@ -17,10 +17,10 @@ import {
 } from "@/lib/trip-workspace";
 
 export type CountryItineraryStatus = "draft" | "upcoming" | "active" | "completed" | "archived";
-export type CountryItinerarySource = "ai" | "manual";
+export type CountryItinerarySource = "ai" | "manual" | "historical_manual";
 export type CountryItineraryVersionSource = "ai" | "manual" | "duplicate" | "restore" | "regenerate";
 
-const REFERENCE_TODAY = parseISO("2026-08-06");
+const REFERENCE_TODAY = parseISO("2026-08-19");
 
 export interface ItineraryCostSummary {
   totalEstimatedCost: number | null;
@@ -113,6 +113,7 @@ function normalizeTripPreferences(value: unknown): TripPreferences {
     ...base,
     startDate: toText(record.startDate) || base.startDate,
     endDate: toText(record.endDate) || base.endDate,
+    partialDate: toText(record.partialDate),
     travelers: toNumber(record.travelers) ?? base.travelers,
     budget: toNumber(record.budget),
     tripStyle: toText(record.tripStyle) || base.tripStyle,
@@ -297,18 +298,39 @@ export function buildSuggestedItineraryTitle(
   return `${countryName} – ${formatDateRange(startDate, endDate) ?? "ללא תאריכים"}`;
 }
 
+/**
+ * Dates drive status when known. When they're not (e.g. a historical trip
+ * whose exact dates haven't been entered yet), `fallbackStatus` is used
+ * instead of forcing "draft" — otherwise an already-completed historical
+ * record would flip to "draft" the moment it's read back or re-saved.
+ */
 export function deriveItineraryStatus(
   startDate: string | null | undefined,
   endDate: string | null | undefined,
   archived: boolean,
+  fallbackStatus: CountryItineraryStatus = "draft",
   now = REFERENCE_TODAY
 ): CountryItineraryStatus {
   if (archived) return "archived";
-  if (!startDate || !endDate) return "draft";
+  if (!startDate || !endDate) return fallbackStatus;
   const today = format(now, "yyyy-MM-dd");
   if (endDate < today) return "completed";
   if (startDate > today) return "upcoming";
   return "active";
+}
+
+const VALID_ITINERARY_STATUSES: readonly CountryItineraryStatus[] = [
+  "draft",
+  "upcoming",
+  "active",
+  "completed",
+  "archived",
+];
+
+export function normalizeItineraryStatus(value: string): CountryItineraryStatus {
+  return (VALID_ITINERARY_STATUSES as readonly string[]).includes(value)
+    ? (value as CountryItineraryStatus)
+    : "draft";
 }
 
 export function computeItineraryCostSummary(
@@ -440,7 +462,8 @@ export function normalizeCountryItineraryRow(row: Tables<"country_itineraries">)
     travelers: row.travelers,
     budget: row.budget,
     generationMode: normalizedMode,
-    source: row.source === "manual" ? "manual" : "ai",
+    source:
+      row.source === "manual" || row.source === "historical_manual" ? row.source : "ai",
     model: row.model,
     summary: row.summary ?? "",
     preferencesSnapshot,
@@ -449,7 +472,12 @@ export function normalizeCountryItineraryRow(row: Tables<"country_itineraries">)
       : null,
     itineraryDays,
     costSummary: normalizeCostSummary(row.cost_summary, daysCount, row.travelers),
-    status: deriveItineraryStatus(row.start_date, row.end_date, row.archived),
+    status: deriveItineraryStatus(
+      row.start_date,
+      row.end_date,
+      row.archived,
+      normalizeItineraryStatus(row.status)
+    ),
     version: row.version,
     parentItineraryId: row.parent_itinerary_id,
     manuallyEdited: row.manually_edited,

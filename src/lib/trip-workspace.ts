@@ -18,9 +18,7 @@ export type TripWorkspaceTab =
   | "map"
   | "recommendations"
   | "budget"
-  | "journal"
-  | "photos"
-  | "summary"
+  | "country_summary"
   | "practical"
   | "currency";
 
@@ -56,6 +54,13 @@ export type BookingStatus = "pending" | "confirmed" | "completed";
 export interface TripPreferences {
   startDate: string;
   endDate: string;
+  /**
+   * "YYYY-MM" — set only for historical trips whose exact dates aren't known
+   * yet, so the trip can still sort/group correctly by year and month
+   * instead of falling back to its createdAt timestamp. Empty string when
+   * not applicable (exact dates already known, or a non-historical trip).
+   */
+  partialDate: string;
   travelers: number;
   budget: number | null;
   tripStyle: string;
@@ -195,15 +200,17 @@ export interface TripExpense {
 
 export interface TripJournalEntry {
   id: string;
-  dayId: string;
-  date: string;
-  dailySummary: string;
-  notes: string;
-  placesActuallyVisited: string;
-  activitiesSkipped: string;
-  favoriteMoment: string;
-  moodRating: number | null;
-  weatherNotes: string;
+  dayId: string | null;
+  date: string | null;
+  city: string | null;
+  place: string | null;
+  title: string;
+  text: string;
+  mood: number | null;
+  rating: number | null;
+  photoIds: string[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface TripMemoryPhoto {
@@ -375,9 +382,7 @@ export const WORKSPACE_TAB_LABELS: Record<TripWorkspaceTab, string> = {
   map: "מפה",
   recommendations: "המלצות",
   budget: "תקציב",
-  journal: "יומן",
-  photos: "תמונות",
-  summary: "סיכום",
+  country_summary: "סיכום המדינה",
   practical: "מידע שימושי",
   currency: "המרת מטבע",
 };
@@ -438,9 +443,7 @@ export const DEFAULT_TAB_ORDER: TripWorkspaceTab[] = [
   "map",
   "recommendations",
   "budget",
-  "journal",
-  "photos",
-  "summary",
+  "country_summary",
   "practical",
   "currency",
 ];
@@ -465,12 +468,10 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
       "overview",
       "itinerary",
       "map",
-      "journal",
       "budget",
       "plan",
       "recommendations",
-      "photos",
-      "summary",
+      "country_summary",
       "practical",
       "currency",
     ];
@@ -479,9 +480,7 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
   if (status === "completed") {
     return [
       "overview",
-      "summary",
-      "photos",
-      "journal",
+      "country_summary",
       "budget",
       "plan",
       "recommendations",
@@ -612,21 +611,6 @@ export function createEmptyDay(dayNumber: number, date = ""): TripItineraryDay {
   };
 }
 
-export function createJournalEntry(dayId: string, date = ""): TripJournalEntry {
-  return {
-    id: createId("journal"),
-    dayId,
-    date,
-    dailySummary: "",
-    notes: "",
-    placesActuallyVisited: "",
-    activitiesSkipped: "",
-    favoriteMoment: "",
-    moodRating: null,
-    weatherNotes: "",
-  };
-}
-
 export function createDefaultWorkspace(countryName: string): CountryTripWorkspaceState {
   return {
     version: 2,
@@ -634,6 +618,7 @@ export function createDefaultWorkspace(countryName: string): CountryTripWorkspac
     preferences: {
       startDate: "",
       endDate: "",
+      partialDate: "",
       travelers: 2,
       budget: null,
       tripStyle: "חוויות מגוונות",
@@ -673,17 +658,6 @@ export function createDefaultWorkspace(countryName: string): CountryTripWorkspac
   };
 }
 
-export function ensureJournalEntriesForDays(
-  entries: TripJournalEntry[],
-  days: TripItineraryDay[]
-): TripJournalEntry[] {
-  const byDay = new Map(entries.map((entry) => [entry.dayId, entry]));
-  return days.map((day) => {
-    const existing = byDay.get(day.id);
-    return existing ? { ...existing, date: day.date || existing.date } : createJournalEntry(day.id, day.date);
-  });
-}
-
 export function normalizeWorkspace(
   workspace: CountryTripWorkspaceState,
   countryName: string
@@ -709,7 +683,12 @@ export function normalizeWorkspace(
     preferences: { ...base.preferences, ...workspace.preferences },
     summary: { ...base.summary, ...workspace.summary },
     itineraryDays: days,
-    journalEntries: ensureJournalEntriesForDays(workspace.journalEntries ?? [], days),
+    // Drop legacy one-per-day placeholder entries from before the trip-scoped
+    // journal model (they never carried real content — no createdAt, no
+    // title/text — so surfacing them would just be blank noise).
+    journalEntries: (workspace.journalEntries ?? []).filter(
+      (entry) => typeof entry.createdAt === "string" && entry.createdAt.length > 0
+    ),
   };
 }
 
@@ -1771,7 +1750,6 @@ export function applyAiPlanToWorkspace(
   return {
     ...current,
     itineraryDays: nextDays,
-    journalEntries: ensureJournalEntriesForDays(current.journalEntries, nextDays),
     lastAiPlanSummary: plan.summary,
   };
 }

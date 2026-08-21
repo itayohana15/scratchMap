@@ -7,19 +7,26 @@ import { PhotoGrid } from "@/components/gallery/photo-grid";
 import { PhotoLightbox } from "@/components/gallery/photo-lightbox";
 import { PhotoUploadDialog } from "@/components/gallery/photo-upload-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useDeletePhoto, usePhotosForCity, usePhotosForCountry } from "@/lib/queries/photos";
+import {
+  usePhotosForCity,
+  usePhotosForCountry,
+  usePhotosForItinerary,
+  useDeletePhoto,
+} from "@/lib/queries/photos";
 import type { Tables } from "@/lib/supabase/types";
 
 interface PhotoGalleryProps {
   countryId?: string;
   cityId?: string;
+  itineraryId?: string;
   title?: string;
 }
 
-export function PhotoGallery({ countryId, cityId, title = "גלריה" }: PhotoGalleryProps) {
-  const countryPhotos = usePhotosForCountry(cityId ? undefined : countryId);
-  const cityPhotos = usePhotosForCity(cityId);
-  const { data: photos, isLoading } = cityId ? cityPhotos : countryPhotos;
+export function PhotoGallery({ countryId, cityId, itineraryId, title = "גלריה" }: PhotoGalleryProps) {
+  const itineraryPhotos = usePhotosForItinerary(itineraryId);
+  const countryPhotos = usePhotosForCountry(itineraryId || cityId ? undefined : countryId);
+  const cityPhotos = usePhotosForCity(itineraryId ? undefined : cityId);
+  const { data: photos, isLoading } = itineraryId ? itineraryPhotos : cityId ? cityPhotos : countryPhotos;
 
   const deletePhoto = useDeletePhoto();
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
@@ -38,7 +45,7 @@ export function PhotoGallery({ countryId, cityId, title = "גלריה" }: PhotoG
     <section className="space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="font-heading text-lg font-semibold">{title}</h2>
-        <PhotoUploadDialog countryId={countryId} cityId={cityId} />
+        <PhotoUploadDialog countryId={countryId} cityId={cityId} itineraryId={itineraryId} />
       </div>
 
       {isLoading ? (

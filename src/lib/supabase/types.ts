@@ -115,6 +115,7 @@ export interface Database {
           deleted_at: string | null;
           created_at: string;
           updated_at: string;
+          external_key: string | null;
         };
         Insert: Partial<
           Pick<
@@ -143,6 +144,7 @@ export interface Database {
             | "deleted_at"
             | "created_at"
             | "updated_at"
+            | "external_key"
           >
         > &
           Pick<
@@ -286,6 +288,10 @@ export interface Database {
           country_id: string | null;
           city_id: string | null;
           trip_id: string | null;
+          itinerary_id: string | null;
+          day_id: string | null;
+          place_id: string | null;
+          favorite: boolean;
           storage_path: string;
           caption: string | null;
           taken_at: string | null;
@@ -303,6 +309,10 @@ export interface Database {
             | "country_id"
             | "city_id"
             | "trip_id"
+            | "itinerary_id"
+            | "day_id"
+            | "place_id"
+            | "favorite"
             | "caption"
             | "taken_at"
             | "sort_order"
@@ -334,6 +344,70 @@ export interface Database {
             columns: ["trip_id"];
             isOneToOne: false;
             referencedRelation: "trips";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "photos_itinerary_id_fkey";
+            columns: ["itinerary_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itineraries";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+      trip_ratings: {
+        Row: {
+          id: string;
+          itinerary_id: string;
+          overall: number | null;
+          food: number | null;
+          culture: number | null;
+          nature: number | null;
+          attractions: number | null;
+          nightlife: number | null;
+          transportation: number | null;
+          value_for_money: number | null;
+          safety: number | null;
+          cleanliness: number | null;
+          tourist_convenience: number | null;
+          locals_hospitality: number | null;
+          shopping: number | null;
+          weather: number | null;
+          would_return: number | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["trip_ratings"]["Row"],
+            | "id"
+            | "overall"
+            | "food"
+            | "culture"
+            | "nature"
+            | "attractions"
+            | "nightlife"
+            | "transportation"
+            | "value_for_money"
+            | "safety"
+            | "cleanliness"
+            | "tourist_convenience"
+            | "locals_hospitality"
+            | "shopping"
+            | "weather"
+            | "would_return"
+            | "created_at"
+            | "updated_at"
+          >
+        > &
+          Pick<Database["public"]["Tables"]["trip_ratings"]["Row"], "itinerary_id">;
+        Update: Partial<Database["public"]["Tables"]["trip_ratings"]["Insert"]>;
+        Relationships: [
+          {
+            foreignKeyName: "trip_ratings_itinerary_id_fkey";
+            columns: ["itinerary_id"];
+            isOneToOne: true;
+            referencedRelation: "country_itineraries";
             referencedColumns: ["id"];
           },
         ];
