@@ -18,8 +18,10 @@ import {
   createDefaultWorkspace,
   estimateTravelMinutes,
   normalizeWorkspace,
+  optimizeDayItemOrder,
   type AiItineraryRequest,
   type CountryTripWorkspaceState,
+  type DayOptimizeMode,
   type TripItineraryDay,
   type TripItineraryItem,
 } from "@/lib/trip-workspace";
@@ -438,7 +440,8 @@ export async function regenerateCountryItinerary(
   guide: CountryAiRecommendation | null,
   scope: NonNullable<AiItineraryRequest["regenerationScope"]>,
   targetDayId?: string | null,
-  targetItemId?: string | null
+  targetItemId?: string | null,
+  optimizeMode?: DayOptimizeMode | null
 ) {
   const existing = await getCountryItinerary(supabase, itineraryId);
   const workspace = createWorkspaceFromItineraryRecord(existing, countryName);
@@ -473,13 +476,19 @@ export async function regenerateCountryItinerary(
   }
 
   if (scope === "optimize_route") {
-    const nextDays = workspace.itineraryDays.map((day) => recomputeDayEstimates(day, workspace.preferences));
+    const mode: DayOptimizeMode = optimizeMode ?? "less_walking";
+    const nextDays = workspace.itineraryDays.map((day) => {
+      if (targetDayId && day.id !== targetDayId) return day;
+      const reordered = { ...day, items: optimizeDayItemOrder(day.items, mode) };
+      return recomputeDayEstimates(reordered, workspace.preferences);
+    });
     return updateCountryItinerary(supabase, itineraryId, countryName, {
       itineraryDays: nextDays,
       preferencesSnapshot: workspace.preferences,
       workspaceSnapshot: { ...workspace, itineraryDays: nextDays },
       manuallyEdited: false,
-      changeReason: "optimize route without replacing activities",
+      changeReason:
+        mode === "fewer_transfers" ? "optimize day: fewer transfers" : "optimize day: less walking",
       versionSource: "regenerate",
     });
   }
@@ -518,7 +527,13 @@ export async function regenerateCountryItinerary(
         null;
       if (!replacementItem) return day;
       const nextItems = [...day.items];
-      nextItems[targetIndex] = { ...replacementItem, id: targetItem.id, locked: targetItem.locked };
+      nextItems[targetIndex] = {
+        ...replacementItem,
+        id: targetItem.id,
+        locked: targetItem.locked,
+        priority: targetItem.priority,
+        fixedTime: targetItem.fixedTime,
+      };
       return { ...day, items: nextItems };
     });
     return updateCountryItinerary(supabase, itineraryId, countryName, {

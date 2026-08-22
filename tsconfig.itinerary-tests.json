@@ -13,10 +13,15 @@
   },
   "include": [
     "src/lib/trip-workspace.ts",
+    "src/lib/itineraries.ts",
+    "src/lib/server/country-itinerary-generation.ts",
     "src/lib/server/itinerary-generation-constraints.ts",
     "src/lib/server/itinerary-planning-principles.ts",
+    "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
-    "tests/itinerary-planning-principles.test.ts"
+    "tests/itinerary-planning-principles.test.ts",
+    "tests/country-itinerary-generation.test.ts",
+    "tests/itinerary-timeline.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

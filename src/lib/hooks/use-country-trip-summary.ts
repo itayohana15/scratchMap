@@ -10,6 +10,7 @@ import {
   useTripRatingsForItineraries,
   type TripRatingCategoryKey,
 } from "@/lib/queries/trip-ratings";
+import { effectiveSortDate, hasExactDate } from "@/lib/trip-hub";
 import { journalEntries } from "@/lib/trip-journal";
 import { buildTripStatistics } from "@/lib/trip-workspace";
 import type { Tables } from "@/lib/supabase/types";
@@ -29,7 +30,9 @@ export interface CountryTripSummaryStats {
   uniqueCities: string[];
   totalPlaces: number;
   firstVisit: string | null;
+  firstVisitExact: boolean;
   mostRecentVisit: string | null;
+  mostRecentVisitExact: boolean;
   totalPhotos: number;
   totalJournalEntries: number;
 }
@@ -75,7 +78,9 @@ export function useCountryTripSummary(iso: string | undefined, countryName: stri
   }, [ratingRows]);
 
   const stats: CountryTripSummaryStats = useMemo(() => {
-    const startDates = completed.map((itinerary) => itinerary.startDate).filter(Boolean) as string[];
+    const sortedByDate = completed
+      .slice()
+      .sort((a, b) => effectiveSortDate(a).localeCompare(effectiveSortDate(b)));
     const cities = completed.flatMap((itinerary) =>
       itinerary.itineraryDays.map((day) => day.cityRegion)
     );
@@ -83,13 +88,17 @@ export function useCountryTripSummary(iso: string | undefined, countryName: stri
       const workspace = createWorkspaceFromItineraryRecord(itinerary, countryName);
       return sum + buildTripStatistics(workspace).placesVisited;
     }, 0);
+    const first = sortedByDate[0] ?? null;
+    const last = sortedByDate.at(-1) ?? null;
     return {
       tripCount: completed.length,
       totalDays: completed.reduce((sum, itinerary) => sum + itinerary.daysCount, 0),
       uniqueCities: uniqueNonEmpty(cities),
       totalPlaces,
-      firstVisit: startDates.length > 0 ? startDates.slice().sort()[0] : null,
-      mostRecentVisit: startDates.length > 0 ? startDates.slice().sort().at(-1)! : null,
+      firstVisit: first ? effectiveSortDate(first) : null,
+      firstVisitExact: first ? hasExactDate(first) : false,
+      mostRecentVisit: last ? effectiveSortDate(last) : null,
+      mostRecentVisitExact: last ? hasExactDate(last) : false,
       totalPhotos: photos.length,
       totalJournalEntries: completed.reduce(
         (sum, itinerary) => sum + journalEntries(itinerary).length,

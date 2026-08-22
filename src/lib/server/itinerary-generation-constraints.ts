@@ -9,9 +9,12 @@ import type {
 } from "../trip-workspace";
 import { estimateTravelMinutes, haversineKm } from "../trip-workspace";
 import {
+  ACTIVITY_MIX_TARGETS,
+  classifyActivityTier,
   classifyItemEnergy,
   findFramePhaseForDay,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
+  type ActivityTier,
   type EnergyLevel,
   type TripFrame,
 } from "./itinerary-planning-principles";
@@ -83,6 +86,13 @@ export interface PlanDiagnostics {
   maxConsecutiveHighEnergyDays: number;
   highEnergyRhythmViolation: boolean;
   baseMismatchDays: number;
+  /**
+   * Guidance-only signal (not a `passesValidation` gate — the target
+   * percentages are explicitly "guidelines, not rigid percentages"): tiers
+   * whose actual share of the trip's stops falls outside
+   * `ACTIVITY_MIX_TARGETS`. Empty when the mix is reasonably balanced.
+   */
+  activityMixSkew: Array<{ tier: ActivityTier; share: number; target: { min: number; max: number } }>;
 }
 
 export interface RouteProximityScore {
@@ -130,6 +140,91 @@ function computeDayEnergyLevel(anchorItems: Pick<AiGeneratedItem, "category" | "
     }
   }
   return worst;
+}
+
+export type DayIntensityLevel = "קל" | "בינוני" | "עמוס";
+
+export interface DayIntensitySummary {
+  level: DayIntensityLevel;
+  activityCount: number;
+  walkingKm: number;
+  travelMinutes: number;
+  activeMinutes: number;
+}
+
+interface DayIntensityItemInput {
+  category: RecommendationCategory;
+  name: string;
+  shortDescription: string;
+  estimatedDurationMinutes: number | null;
+  plannedStartTime: string;
+  travelMinutes: number | null;
+  lat: number | null;
+  lon: number | null;
+}
+
+function parseTimeToMinutes(value: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})/.exec(value.trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+  return hours * 60 + minutes;
+}
+
+/**
+ * Deterministic (not AI-guessed) day intensity, per the spec: combines
+ * active-hours span, walking distance, activity count, travel time, and the
+ * existing per-item energy classification into one of three UI tiers. Client
+ * usable — this file has no server-only dependency, and it's already
+ * imported client-side (via itineraries.ts's cost-summary computation).
+ */
+export function computeDayIntensity(items: DayIntensityItemInput[]): DayIntensitySummary {
+  if (items.length === 0) {
+    return { level: "קל", activityCount: 0, walkingKm: 0, travelMinutes: 0, activeMinutes: 0 };
+  }
+
+  const activityCount = items.filter(
+    (item) => item.category !== "transportation" && item.category !== "practical"
+  ).length;
+  const travelMinutes = items.reduce((sum, item) => sum + (item.travelMinutes ?? 0), 0);
+
+  let walkingKm = 0;
+  for (let index = 1; index < items.length; index += 1) {
+    const previous = items[index - 1];
+    const current = items[index];
+    const distance = haversineKm(previous.lat, previous.lon, current.lat, current.lon);
+    if (distance > 0 && distance <= 2) walkingKm += distance;
+  }
+
+  const times = items
+    .map((item) => parseTimeToMinutes(item.plannedStartTime))
+    .filter((value): value is number => value != null);
+  const lastItem = items[items.length - 1];
+  const activeMinutes =
+    times.length >= 2
+      ? Math.max(...times) - Math.min(...times) + (lastItem.estimatedDurationMinutes ?? 60)
+      : items.reduce((sum, item) => sum + (item.estimatedDurationMinutes ?? 60) + (item.travelMinutes ?? 0), 0);
+
+  const energyLevel = computeDayEnergyLevel(items);
+  let score = ENERGY_SEVERITY[energyLevel];
+  if (activeMinutes > 600) score += 1;
+  else if (activeMinutes > 0 && activeMinutes < 360) score -= 1;
+  if (travelMinutes > 150) score += 1;
+  if (walkingKm > 8) score += 1;
+  if (activityCount >= 6) score += 1;
+  else if (activityCount > 0 && activityCount <= 3) score -= 1;
+  score = Math.max(0, Math.min(4, score));
+
+  const level: DayIntensityLevel = score <= 1 ? "קל" : score <= 2 ? "בינוני" : "עמוס";
+
+  return {
+    level,
+    activityCount,
+    walkingKm: Math.round(walkingKm * 10) / 10,
+    travelMinutes,
+    activeMinutes,
+  };
 }
 
 const GENERIC_WARNING_PATTERNS = [
@@ -859,6 +954,99 @@ export function withNormalizedRecommendationPrice(
       recommendation.priceExchangeRate ?? context?.rateToTarget ?? 1,
     priceRateTimestamp:
       recommendation.priceRateTimestamp ?? context?.updatedAt ?? null,
+    convertedCurrency: recommendation.convertedCurrency ?? context?.targetCurrency ?? "ILS",
+    sourceType: recommendation.sourceType ?? "candidate",
+  };
+}
+
+interface CostSummaryDay {
+  items: Array<{ category: RecommendationCategory; approximatePrice: number | null }>;
+  estimatedCost?: number | null;
+  activityCost?: number | null;
+  foodCost?: number | null;
+  transportCost?: number | null;
+  accommodationCost?: number | null;
+}
+
+export interface ItemCostSummary {
+  totalEstimatedCost: number | null;
+  estimatedTransportCost: number | null;
+  averageDailyCost: number | null;
+  costPerTraveler: number | null;
+  categoryBreakdown: Record<string, number>;
+}
+
+/**
+ * Single source of truth for turning a list of days (each with priced
+ * items) into cost totals. Used both right after generation
+ * (`country-itinerary-generation.ts`) and at save time
+ * (`computeItineraryCostSummary` in itineraries.ts) so the two no longer
+ * risk silently diverging.
+ */
+export function summarizeItemCosts(
+  days: CostSummaryDay[],
+  travelers: number,
+  extraExpenses: Array<{ category: string; amount: number }> = []
+): ItemCostSummary {
+  const categoryBreakdown = new Map<string, number>();
+
+  for (const day of days) {
+    const derived = { accommodation: 0, food: 0, attractions: 0, transportation: 0 };
+    for (const item of day.items) {
+      const price = item.approximatePrice ?? 0;
+      if (item.category === "restaurant" || item.category === "cafe") {
+        derived.food += price;
+      } else if (item.category === "hotel") {
+        derived.accommodation += price;
+      } else if (item.category === "transportation") {
+        derived.transportation += price;
+      } else {
+        derived.attractions += price;
+      }
+    }
+
+    const groups = {
+      accommodation: day.accommodationCost ?? (derived.accommodation > 0 ? derived.accommodation : 0),
+      food: day.foodCost ?? (derived.food > 0 ? derived.food : 0),
+      attractions: day.activityCost ?? (derived.attractions > 0 ? derived.attractions : 0),
+      transportation: day.transportCost ?? (derived.transportation > 0 ? derived.transportation : 0),
+    };
+
+    const explicitTotal = groups.accommodation + groups.food + groups.attractions + groups.transportation;
+    const dayBase = day.estimatedCost ?? explicitTotal;
+
+    if (dayBase > explicitTotal && explicitTotal === 0) {
+      groups.attractions += dayBase;
+    } else if (dayBase > explicitTotal) {
+      categoryBreakdown.set("other", (categoryBreakdown.get("other") ?? 0) + (dayBase - explicitTotal));
+    }
+
+    for (const [key, amount] of Object.entries(groups)) {
+      if (amount <= 0) continue;
+      categoryBreakdown.set(key, (categoryBreakdown.get(key) ?? 0) + amount);
+    }
+  }
+
+  for (const expense of extraExpenses) {
+    const key = expense.category === "local_transportation" ? "transportation" : expense.category;
+    categoryBreakdown.set(key, (categoryBreakdown.get(key) ?? 0) + expense.amount);
+  }
+
+  const totalEstimatedCost = [...categoryBreakdown.values()].reduce((sum, amount) => sum + amount, 0);
+  const safeTravelers = Math.max(travelers, 1);
+
+  return {
+    totalEstimatedCost: totalEstimatedCost > 0 ? Math.round(totalEstimatedCost) : null,
+    estimatedTransportCost:
+      (categoryBreakdown.get("transportation") ?? 0) > 0
+        ? Math.round(categoryBreakdown.get("transportation")!)
+        : null,
+    averageDailyCost:
+      totalEstimatedCost > 0 && days.length > 0 ? Math.round(totalEstimatedCost / days.length) : null,
+    costPerTraveler: totalEstimatedCost > 0 ? Math.round(totalEstimatedCost / safeTravelers) : null,
+    categoryBreakdown: Object.fromEntries(
+      [...categoryBreakdown.entries()].map(([key, value]) => [key, Math.round(value)])
+    ),
   };
 }
 
@@ -928,6 +1116,8 @@ export function collectPlanDiagnostics(
   const matchedMustVisitKeywords = new Set<string>();
   const activityCategoryCounts = new Map<RecommendationCategory, number>();
   let totalCountedActivities = 0;
+  const tierCounts = new Map<ActivityTier, number>();
+  let totalTierStops = 0;
 
   for (const day of plan.days) {
     const hasLunch = day.items.some(
@@ -1034,6 +1224,12 @@ export function collectPlanDiagnostics(
         );
         totalCountedActivities += 1;
       }
+
+      if (item.category !== "transportation" && item.category !== "hotel") {
+        const tier = classifyActivityTier(item.category);
+        tierCounts.set(tier, (tierCounts.get(tier) ?? 0) + 1);
+        totalTierStops += 1;
+      }
     }
   }
 
@@ -1065,6 +1261,17 @@ export function collectPlanDiagnostics(
     (keyword) => !matchedMustVisitKeywords.has(keyword)
   );
 
+  const activityMixSkew: PlanDiagnostics["activityMixSkew"] =
+    totalTierStops >= 6
+      ? (Object.keys(ACTIVITY_MIX_TARGETS) as ActivityTier[])
+          .map((tier) => {
+            const share = (tierCounts.get(tier) ?? 0) / totalTierStops;
+            const target = ACTIVITY_MIX_TARGETS[tier];
+            return { tier, share, target };
+          })
+          .filter(({ share, target }) => share < target.min || share > target.max)
+      : [];
+
   return {
     totalEstimatedCost,
     missingMeals,
@@ -1089,6 +1296,7 @@ export function collectPlanDiagnostics(
     maxConsecutiveHighEnergyDays,
     highEnergyRhythmViolation: maxConsecutiveHighEnergyDays > MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
     baseMismatchDays,
+    activityMixSkew,
   };
 }
 

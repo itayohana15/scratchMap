@@ -53,6 +53,10 @@ const CATEGORY_BRIEFS: Record<RecommendationCategory, string> = {
   seasonal_event: "seasonal events or seasonal places especially worth visiting in the requested period",
   hotel: "hotels, ryokans, or resorts genuinely worth staying at",
   transportation: "major traveler-relevant transport hubs such as airports, central stations, and ferry terminals",
+  // Not requested via CATEGORY_VALUES below (practical/luggage tasks are
+  // user- or template-generated, never AI-sourced) — kept only so the
+  // Record<RecommendationCategory, ...> stays exhaustive.
+  practical: "practical logistics tasks such as luggage storage or hotel transfers",
 };
 
 interface FallbackRecommendationSeed {
@@ -84,6 +88,7 @@ const FALLBACK_DEFAULTS: Record<
   seasonal_event: { estimatedDurationMinutes: 120, recommendedTimeOfDay: "evening", reservationRequired: true },
   hotel: { estimatedDurationMinutes: null, recommendedTimeOfDay: "any", reservationRequired: false },
   transportation: { estimatedDurationMinutes: 45, recommendedTimeOfDay: "any", reservationRequired: false },
+  practical: { estimatedDurationMinutes: 30, recommendedTimeOfDay: "any", reservationRequired: false },
 };
 
 function clampCount(raw: string | null) {
@@ -236,7 +241,18 @@ async function buildFallbackRecommendations(
     await Promise.all(
       seeds.map(async (seed, index): Promise<TripRecommendation | null> => {
         try {
-          const [match] = await searchPlaces(seed.name, { countryCode: isoA2, limit: 1 });
+          // Include the seed's own city/area (required by the Gemini
+          // schema above) in the geocoding query, not just the bare place
+          // name — otherwise a same-named place in the wrong city within
+          // the country can silently win the match. Fall back to the bare
+          // name only if the city-qualified query finds nothing.
+          const qualifiedQuery = seed.location ? `${seed.name}, ${seed.location}` : seed.name;
+          const qualifiedResults = await searchPlaces(qualifiedQuery, { countryCode: isoA2, limit: 1 });
+          const match =
+            qualifiedResults[0] ??
+            (qualifiedQuery !== seed.name
+              ? (await searchPlaces(seed.name, { countryCode: isoA2, limit: 1 }))[0]
+              : undefined);
           if (!match) return null;
 
           return {

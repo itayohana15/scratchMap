@@ -2,6 +2,7 @@ import { format, isValid, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
 import { formatDateRange } from "@/lib/format";
+import { summarizeItemCosts } from "@/lib/server/itinerary-generation-constraints";
 import type { Tables } from "@/lib/supabase/types";
 import {
   createDefaultWorkspace,
@@ -336,80 +337,11 @@ export function normalizeItineraryStatus(value: string): CountryItineraryStatus 
 export function computeItineraryCostSummary(
   workspace: Pick<CountryTripWorkspaceState, "itineraryDays" | "estimatedExpenses" | "preferences">
 ): ItineraryCostSummary {
-  const categoryBreakdown = new Map<string, number>();
-
-  for (const day of workspace.itineraryDays) {
-    const derivedGroups = {
-      accommodation: 0,
-      food: 0,
-      attractions: 0,
-      transportation: 0,
-    };
-
-    for (const item of day.items) {
-      const price = item.approximatePrice ?? 0;
-      if (item.category === "restaurant" || item.category === "cafe") {
-        derivedGroups.food += price;
-      } else if (item.category === "hotel") {
-        derivedGroups.accommodation += price;
-      } else if (item.category === "transportation") {
-        derivedGroups.transportation += price;
-      } else {
-        derivedGroups.attractions += price;
-      }
-    }
-
-    const itemGroups = {
-      accommodation: day.accommodationCost ?? (derivedGroups.accommodation > 0 ? derivedGroups.accommodation : 0),
-      food: day.foodCost ?? (derivedGroups.food > 0 ? derivedGroups.food : 0),
-      attractions:
-        day.activityCost ?? (derivedGroups.attractions > 0 ? derivedGroups.attractions : 0),
-      transportation:
-        day.transportCost ?? (derivedGroups.transportation > 0 ? derivedGroups.transportation : 0),
-    };
-
-    const explicitTotal = itemGroups.accommodation + itemGroups.food + itemGroups.attractions + itemGroups.transportation;
-    const dayBase = day.estimatedCost ?? explicitTotal;
-
-    if (dayBase > explicitTotal && explicitTotal === 0) {
-      itemGroups.attractions += dayBase;
-    } else if (dayBase > explicitTotal) {
-      categoryBreakdown.set("other", (categoryBreakdown.get("other") ?? 0) + (dayBase - explicitTotal));
-    }
-
-    for (const [key, amount] of Object.entries(itemGroups)) {
-      if (amount <= 0) continue;
-      categoryBreakdown.set(key, (categoryBreakdown.get(key) ?? 0) + amount);
-    }
-  }
-
-  for (const expense of normalizeExpenseList(workspace.estimatedExpenses)) {
-    const key =
-      expense.category === "local_transportation"
-        ? "transportation"
-        : expense.category === "food"
-          ? "food"
-          : expense.category === "accommodation"
-            ? "accommodation"
-            : expense.category === "attractions"
-              ? "attractions"
-              : expense.category;
-    categoryBreakdown.set(key, (categoryBreakdown.get(key) ?? 0) + expense.amount);
-  }
-
-  const totalEstimatedCost = [...categoryBreakdown.values()].reduce((sum, amount) => sum + amount, 0);
-  const daysCount = workspace.itineraryDays.length;
-  const travelers = Math.max(workspace.preferences.travelers, 1);
-
-  return {
-    totalEstimatedCost: totalEstimatedCost > 0 ? Math.round(totalEstimatedCost) : null,
-    estimatedTransportCost: categoryBreakdown.get("transportation") ?? null,
-    averageDailyCost:
-      totalEstimatedCost > 0 && daysCount > 0 ? Math.round(totalEstimatedCost / daysCount) : null,
-    costPerTraveler:
-      totalEstimatedCost > 0 && travelers > 0 ? Math.round(totalEstimatedCost / travelers) : null,
-    categoryBreakdown: Object.fromEntries(categoryBreakdown.entries()),
-  };
+  return summarizeItemCosts(
+    workspace.itineraryDays,
+    workspace.preferences.travelers,
+    normalizeExpenseList(workspace.estimatedExpenses)
+  );
 }
 
 export function createWorkspaceFromItineraryRecord(

@@ -3,7 +3,11 @@
 import {
   Archive,
   BedDouble,
+  Bike,
+  Bus,
   CalendarRange,
+  Car,
+  CarTaxiFront,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -11,17 +15,24 @@ import {
   Copy,
   Download,
   Ellipsis,
+  Footprints,
+  Gauge,
   History,
   ImagePlus,
   LoaderCircle,
+  LuggageIcon,
   MapPin,
   NotebookPen,
+  Plane,
   Plus,
   RefreshCcw,
   Route,
   Save,
+  Ship,
   Sparkles,
   Star,
+  TrainFront,
+  TramFront,
   Trash2,
   TriangleAlert,
   Wallet,
@@ -47,15 +58,22 @@ import {
 import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
 import type { Tables } from "@/lib/supabase/types";
 import {
+  computeDayIntensity,
+} from "@/lib/server/itinerary-generation-constraints";
+import {
+  buildMapLink,
   createEmptyDay,
   createEmptyItineraryItem,
   createId,
   dateForDayNumber,
   DAY_PART_LABELS,
+  ITEM_PRIORITY_LABELS,
   ITINERARY_GENERATION_MODE_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
   type CountryTripWorkspaceState,
+  type DayOptimizeMode,
   type DayPart,
+  type ItemPriority,
   type TripItineraryDay,
   type TripItineraryItem,
 } from "@/lib/trip-workspace";
@@ -194,11 +212,38 @@ function activityStateBadges(item: TripItineraryItem) {
   } else if (item.reservationRequired) {
     badges.push({ key: "reservation", label: "דורש הזמנה" });
   }
-  if (item.optional) badges.push({ key: "optional", label: "אופציונלי" });
+  badges.push({ key: "priority", label: ITEM_PRIORITY_LABELS[item.priority] });
+  if (item.fixedTime) badges.push({ key: "fixedTime", label: "שעה קבועה" });
   if (item.locked) badges.push({ key: "locked", label: "נעול" });
   if (item.completed) badges.push({ key: "completed", label: "בוצע" });
   if (item.skipped) badges.push({ key: "skipped", label: "דולג" });
   return badges;
+}
+
+// Standard checkout -> travel -> check-in sequence for a hotel-change day,
+// inserted as explicit practical-type timeline items so the day doesn't
+// silently "teleport" the traveler between bases.
+const HOTEL_CHANGE_DAY_TEMPLATE: Array<{ slot: DayPart; fields: Partial<TripItineraryItem> }> = [
+  { slot: "morning", fields: { name: "צ'ק-אאוט", category: "practical", plannedStartTime: "08:00", estimatedDurationMinutes: 30 } },
+  { slot: "morning", fields: { name: "נסיעה לתחנה/שדה תעופה", category: "practical", plannedStartTime: "08:30", estimatedDurationMinutes: 40 } },
+  { slot: "morning", fields: { name: "רכבת/טיסה", category: "transportation", plannedStartTime: "09:10", estimatedDurationMinutes: 170 } },
+  { slot: "afternoon", fields: { name: "הגעה ליעד", category: "practical", plannedStartTime: "12:00", estimatedDurationMinutes: 20 } },
+  { slot: "afternoon", fields: { name: "הפקדת מזוודות", category: "practical", plannedStartTime: "12:20", estimatedDurationMinutes: 20 } },
+  { slot: "evening", fields: { name: "צ'ק-אין", category: "practical", plannedStartTime: "18:00", estimatedDurationMinutes: 30 } },
+];
+
+function transportModeIcon(mode: string) {
+  const lower = mode.toLowerCase();
+  if (/walk|הליכ/.test(lower)) return Footprints;
+  if (/metro|subway|תחתית|רכבת תחתית/.test(lower)) return TramFront;
+  if (/train|רכבת/.test(lower)) return TrainFront;
+  if (/bus|אוטובוס/.test(lower)) return Bus;
+  if (/taxi|מונית|uber/.test(lower)) return CarTaxiFront;
+  if (/car|רכב|נהיגה|drive/.test(lower)) return Car;
+  if (/bike|bicycle|אופני/.test(lower)) return Bike;
+  if (/ferry|מעבור|boat|סירה/.test(lower)) return Ship;
+  if (/flight|טיסה|plane/.test(lower)) return Plane;
+  return Route;
 }
 
 function dayMealHighlights(day: TripItineraryDay) {
@@ -285,7 +330,8 @@ interface CountryItineraryDetailsDialogProps {
     itineraryId: string,
     scope: RegenerateScope,
     targetDayId?: string | null,
-    targetItemId?: string | null
+    targetItemId?: string | null,
+    optimizeMode?: DayOptimizeMode | null
   ) => Promise<void> | void;
   onRestore: (versionId: string) => Promise<void> | void;
   onDuplicate: (itineraryId: string) => Promise<void> | void;
@@ -322,6 +368,8 @@ export function CountryItineraryDetailsDialog({
   const [selectedTab, setSelectedTab] = useState<string>("");
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [activeMapItemIdsByDay, setActiveMapItemIdsByDay] = useState<Record<string, string[]>>({});
+  const [timelineFocusItemId, setTimelineFocusItemId] = useState<string | null>(null);
+  const itemCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [shouldLoadSummaryMap, setShouldLoadSummaryMap] = useState(false);
   const bodyViewportRef = useRef<HTMLDivElement | null>(null);
   const tabListRef = useRef<HTMLDivElement | null>(null);
@@ -350,7 +398,12 @@ export function CountryItineraryDetailsDialog({
     setIsEditMode(false);
     setEditingItemId(null);
     setActiveMapItemIdsByDay({});
+    setTimelineFocusItemId(null);
   }, [draftDayIdSet, draftDayIdsKey, draftId, draftVersion, firstDayId]);
+
+  useEffect(() => {
+    setTimelineFocusItemId(null);
+  }, [effectiveSelectedTab]);
 
   useEffect(() => {
     setShouldLoadSummaryMap(false);
@@ -390,6 +443,21 @@ export function CountryItineraryDetailsDialog({
     return draft?.itineraryDays.find((day) => day.id === selectedDayId) ?? null;
   }, [draft, selectedDayId]);
 
+  // Map marker click -> scroll the matching timeline card into view (the
+  // reverse of clicking a timeline card, which sets timelineFocusItemId and
+  // pans the map via ItineraryDayRouteSection's focusItemId prop below).
+  const activeMapItemIds = selectedDayId ? activeMapItemIdsByDay[selectedDayId] : undefined;
+  useEffect(() => {
+    if (!activeMapItemIds || activeMapItemIds.length !== 1) return;
+    const frame = window.requestAnimationFrame(() => {
+      itemCardRefs.current[activeMapItemIds[0]]?.scrollIntoView({
+        block: "center",
+        behavior: getScrollBehavior(),
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeMapItemIds]);
+
   if (!draft) {
     return null;
   }
@@ -426,6 +494,7 @@ export function CountryItineraryDetailsDialog({
   const selectedDayActivityCost = selectedDay
     ? selectedDay.items.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0)
     : 0;
+  const selectedDayIntensity = selectedDay ? computeDayIntensity(selectedDay.items) : null;
 
   function handleAddDay() {
     if (!draft) {
@@ -647,14 +716,28 @@ export function CountryItineraryDetailsDialog({
               {activeSection === "route" ? (
               <>
               <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  onClick={() => void onRegenerate(draft.id, "optimize_route")}
-                  disabled={isRegenerating || isSaving}
-                >
-                  {isRegenerating ? <LoaderCircle className="size-4 animate-spin" /> : <Route className="size-4" />}
-                  Optimize route
-                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger render={<Button size="sm" disabled={isRegenerating || isSaving} />}>
+                    {isRegenerating ? <LoaderCircle className="size-4 animate-spin" /> : <Route className="size-4" />}
+                    אופטימיזציה למסלול
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start">
+                    <DropdownMenuItem
+                      onClick={() =>
+                        void onRegenerate(draft.id, "optimize_route", selectedDayId ?? null, null, "fewer_transfers")
+                      }
+                    >
+                      פחות מעברים{selectedDayId ? " (היום הנוכחי)" : " (כל הימים)"}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() =>
+                        void onRegenerate(draft.id, "optimize_route", selectedDayId ?? null, null, "less_walking")
+                      }
+                    >
+                      פחות הליכה{selectedDayId ? " (היום הנוכחי)" : " (כל הימים)"}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
                 <Button
                   variant="secondary"
                   size="sm"
@@ -1135,6 +1218,27 @@ export function CountryItineraryDetailsDialog({
 
                     <div className="border-t border-border/60 px-4 py-5 sm:px-5">
                       <div className="space-y-5">
+                        {selectedDayIntensity ? (
+                          <div className="flex flex-wrap items-center gap-2 rounded-[18px] border border-border/60 bg-muted/20 p-3 text-xs">
+                            <Badge variant="outline">{selectedDayIntensity.activityCount} פעילויות</Badge>
+                            <Badge variant="outline" className="gap-1">
+                              <Footprints className="size-3.5" />
+                              {selectedDayIntensity.walkingKm.toFixed(1)} ק&quot;מ הליכה
+                            </Badge>
+                            <Badge variant="outline" className="gap-1">
+                              <Route className="size-3.5" />
+                              {selectedDayIntensity.travelMinutes} דק׳ נסיעות
+                            </Badge>
+                            <Badge variant="outline">{formatCurrency(selectedDay.estimatedCost)}</Badge>
+                            <Badge
+                              variant={selectedDayIntensity.level === "עמוס" ? "secondary" : "outline"}
+                              className="gap-1"
+                            >
+                              <Gauge className="size-3.5" />
+                              עומס: {selectedDayIntensity.level}
+                            </Badge>
+                          </div>
+                        ) : null}
                         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                           <SummaryField
                             label="סיכום היום"
@@ -1150,10 +1254,40 @@ export function CountryItineraryDetailsDialog({
                           <SummaryField
                             label="לינה"
                             value={
-                              <div className="flex items-center gap-2">
-                                <BedDouble className="size-4 text-primary" />
-                                <span>{selectedDay.accommodation || "לא צוין בסיס לינה"}</span>
-                              </div>
+                              selectedDay.accommodation ? (
+                                <div className="space-y-1.5">
+                                  <div className="flex items-center gap-2">
+                                    <BedDouble className="size-4 text-primary" />
+                                    <span className="font-medium">{selectedDay.accommodation}</span>
+                                  </div>
+                                  {selectedDay.accommodationCost != null ? (
+                                    <p className="text-xs text-muted-foreground">
+                                      {formatCurrency(selectedDay.accommodationCost)} / לילה
+                                    </p>
+                                  ) : null}
+                                  {selectedDay.accommodationMapLink ||
+                                  (selectedDay.accommodationLat != null && selectedDay.accommodationLon != null) ? (
+                                    <a
+                                      href={
+                                        selectedDay.accommodationMapLink ||
+                                        buildMapLink(
+                                          selectedDay.accommodation,
+                                          selectedDay.accommodationLat,
+                                          selectedDay.accommodationLon
+                                        )
+                                      }
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+                                    >
+                                      <MapPin className="size-3.5" />
+                                      פתח במפה
+                                    </a>
+                                  ) : null}
+                                </div>
+                              ) : (
+                                <span className="text-muted-foreground">לא צוין בסיס לינה</span>
+                              )
                             }
                           />
                           <SummaryField
@@ -1194,7 +1328,28 @@ export function CountryItineraryDetailsDialog({
 
                         {isEditMode ? (
                           <section className="rounded-[24px] border border-border/60 bg-background/55 p-4">
-                            <SectionTitle title="עריכת היום" description="שדות העריכה מוצגים רק בזמן edit mode." />
+                            <SectionTitle
+                              title="עריכת היום"
+                              description="שדות העריכה מוצגים רק בזמן edit mode."
+                              action={
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() =>
+                                    onPatchDay(selectedDay.id, (current) => ({
+                                      ...current,
+                                      items: [...HOTEL_CHANGE_DAY_TEMPLATE.map((template) => ({
+                                        ...createEmptyItineraryItem(template.slot),
+                                        ...template.fields,
+                                      })), ...current.items],
+                                    }))
+                                  }
+                                >
+                                  <LuggageIcon className="size-4" />
+                                  הוסף לוגיסטיקת מעבר מלונות
+                                </Button>
+                              }
+                            />
                             <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                               <div className="space-y-2">
                                 <label className="text-xs font-medium text-muted-foreground">כותרת</label>
@@ -1387,21 +1542,33 @@ export function CountryItineraryDetailsDialog({
                               const showEditor = isEditMode && editingItemId === item.id;
                               const badges = activityStateBadges(item);
                               const isMapActive = (activeMapItemIdsByDay[selectedDay.id] ?? []).includes(item.id);
+                              const ConnectorIcon = transportModeIcon(item.transportation);
 
                               return (
                                 <div key={item.id} className="space-y-3">
                                   {itemIndex > 0 && (item.transportation || item.travelMinutes) ? (
-                                    <div className="flex items-center gap-2 rounded-[18px] border border-dashed border-border/60 bg-background/55 px-4 py-2 text-xs text-muted-foreground">
-                                      <Route className="size-3.5" />
+                                    <button
+                                      type="button"
+                                      onClick={() => setTimelineFocusItemId(item.id)}
+                                      className="flex w-full items-center gap-2 rounded-[18px] border border-dashed border-border/60 bg-background/55 px-4 py-2 text-right text-xs text-muted-foreground transition-colors hover:bg-muted/40"
+                                    >
+                                      <ConnectorIcon className="size-3.5 shrink-0" />
                                       <span>{item.transportation || "מעבר מקומי"}</span>
                                       {item.travelMinutes ? <span>· {item.travelMinutes} דק׳</span> : null}
-                                    </div>
+                                    </button>
                                   ) : null}
 
                                   <div
+                                    ref={(element) => {
+                                      itemCardRefs.current[item.id] = element;
+                                    }}
+                                    onClick={() => {
+                                      if (!showEditor) setTimelineFocusItemId(item.id);
+                                    }}
                                     className={cn(
                                       "rounded-[24px] border bg-background/70 p-4",
-                                      isMapActive
+                                      !showEditor ? "cursor-pointer" : "",
+                                      isMapActive || timelineFocusItemId === item.id
                                         ? "border-primary/40 ring-1 ring-primary/20"
                                         : "border-border/60"
                                     )}
@@ -1647,15 +1814,39 @@ export function CountryItineraryDetailsDialog({
                                               />
                                             </div>
 
+                                            <div className="flex flex-wrap items-center gap-2">
+                                              <Select
+                                                value={item.priority}
+                                                onValueChange={(value) =>
+                                                  onPatchItem(selectedDay.id, item.id, (current) => ({
+                                                    ...current,
+                                                    priority: value as ItemPriority,
+                                                    optional: value === "optional",
+                                                  }))
+                                                }
+                                              >
+                                                <SelectTrigger size="sm" className="min-w-32">
+                                                  <span>{ITEM_PRIORITY_LABELS[item.priority]}</span>
+                                                </SelectTrigger>
+                                                <SelectContent>
+                                                  {Object.entries(ITEM_PRIORITY_LABELS).map(([value, label]) => (
+                                                    <SelectItem key={value} value={value}>
+                                                      {label}
+                                                    </SelectItem>
+                                                  ))}
+                                                </SelectContent>
+                                              </Select>
+                                            </div>
+
                                             <div className="flex flex-wrap gap-2">
                                               {[
                                                 {
-                                                  label: "אופציונלי",
-                                                  active: item.optional,
+                                                  label: "שעה קבועה",
+                                                  active: item.fixedTime,
                                                   onToggle: () =>
                                                     onPatchItem(selectedDay.id, item.id, (current) => ({
                                                       ...current,
-                                                      optional: !current.optional,
+                                                      fixedTime: !current.fixedTime,
                                                     })),
                                                 },
                                                 {
@@ -1668,7 +1859,7 @@ export function CountryItineraryDetailsDialog({
                                                     })),
                                                 },
                                                 {
-                                                  label: "נעול",
+                                                  label: item.locked ? "נעול 🔒" : "פתוח 🔓",
                                                   active: item.locked,
                                                   onToggle: () =>
                                                     onPatchItem(selectedDay.id, item.id, (current) => ({
@@ -1855,6 +2046,7 @@ export function CountryItineraryDetailsDialog({
                           isoA2={draft.isoA2}
                           onPatchDay={onPatchDay}
                           onPatchItem={onPatchItem}
+                          focusItemId={timelineFocusItemId}
                           onActiveItemIdsChange={(itemIds) =>
                             setActiveMapItemIdsByDay((current) => ({
                               ...current,

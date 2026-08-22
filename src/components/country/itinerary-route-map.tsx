@@ -4,7 +4,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 import { BadgeAlert, BedDouble, LoaderCircle, MapPinned, RotateCcw, Shrink, Expand } from "lucide-react";
 import { useTheme } from "next-themes";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -154,6 +154,7 @@ function readCssColor(name: string, fallback: string) {
 function classifyStopKind(item: TripItineraryItem): MapStopKind {
   const haystack = `${item.name} ${item.location} ${item.shortDescription}`.toLowerCase();
 
+  if (item.category === "practical") return "practical";
   if (item.category === "restaurant" || item.category === "cafe") return "meal";
   if (item.category === "transportation") {
     if (/airport|שדה|נמל תעופה/.test(haystack)) return "airport";
@@ -360,12 +361,15 @@ function buildPendingDayTargets(day: TripItineraryDay) {
 }
 
 function buildTripStops(days: TripItineraryDay[], countryName: string) {
-  return offsetDuplicateStops(
-    days.flatMap((day) => {
-      const perDay = buildDayStops(day, countryName);
-      return perDay.filter((stop, index) => stop.kind !== "accommodation" || index === 0);
-    })
-  );
+  const raw = days.flatMap((day) => {
+    const perDay = buildDayStops(day, countryName);
+    return perDay.filter((stop, index) => stop.kind !== "accommodation" || index === 0);
+  });
+  // buildDayStops numbers markers 1..N within each day — fine for the
+  // single-day map, but on one shared trip map that resets the count every
+  // day and reads as a bug. Renumber once, globally, across the whole trip.
+  const renumbered = raw.map((stop, index) => ({ ...stop, order: index + 1 }));
+  return offsetDuplicateStops(renumbered);
 }
 
 function buildPendingTripTargets(days: TripItineraryDay[]) {
@@ -633,10 +637,8 @@ function useDayRouteData(args: {
 }) {
   const { day, countryName, isoA2, onPatchDay, onPatchItem } = args;
   const pendingTargets = useMemo(() => buildPendingDayTargets(day), [day]);
-  const geocoding = useResolvedCoordinates({
-    pendingTargets,
-    isoA2,
-    onResolveDayAccommodation: (dayId, coords, query) => {
+  const handleResolveDayAccommodation = useCallback(
+    (dayId: string, coords: GeocodedResult, query: string) => {
       onPatchDay(dayId, (current) =>
         current.accommodationLat != null && current.accommodationLon != null
           ? current
@@ -649,7 +651,10 @@ function useDayRouteData(args: {
             }
       );
     },
-    onResolveItem: (dayId, itemId, coords, query) => {
+    [onPatchDay]
+  );
+  const handleResolveItem = useCallback(
+    (dayId: string, itemId: string, coords: GeocodedResult, query: string) => {
       onPatchItem(dayId, itemId, (current) =>
         current.lat != null && current.lon != null
           ? current
@@ -661,6 +666,13 @@ function useDayRouteData(args: {
             }
       );
     },
+    [onPatchItem]
+  );
+  const geocoding = useResolvedCoordinates({
+    pendingTargets,
+    isoA2,
+    onResolveDayAccommodation: handleResolveDayAccommodation,
+    onResolveItem: handleResolveItem,
   });
 
   const hydratedDay = useMemo(() => {
@@ -737,10 +749,8 @@ function useTripRouteData(args: {
 }) {
   const { days, countryName, isoA2, onPatchDay, onPatchItem } = args;
   const pendingTargets = useMemo(() => buildPendingTripTargets(days), [days]);
-  const geocoding = useResolvedCoordinates({
-    pendingTargets,
-    isoA2,
-    onResolveDayAccommodation: (dayId, coords, query) => {
+  const handleResolveDayAccommodation = useCallback(
+    (dayId: string, coords: GeocodedResult, query: string) => {
       onPatchDay(dayId, (current) =>
         current.accommodationLat != null && current.accommodationLon != null
           ? current
@@ -753,7 +763,10 @@ function useTripRouteData(args: {
             }
       );
     },
-    onResolveItem: (dayId, itemId, coords, query) => {
+    [onPatchDay]
+  );
+  const handleResolveItem = useCallback(
+    (dayId: string, itemId: string, coords: GeocodedResult, query: string) => {
       onPatchItem(dayId, itemId, (current) =>
         current.lat != null && current.lon != null
           ? current
@@ -765,6 +778,13 @@ function useTripRouteData(args: {
             }
       );
     },
+    [onPatchItem]
+  );
+  const geocoding = useResolvedCoordinates({
+    pendingTargets,
+    isoA2,
+    onResolveDayAccommodation: handleResolveDayAccommodation,
+    onResolveItem: handleResolveItem,
   });
 
   const hydratedDays = useMemo(
@@ -875,6 +895,16 @@ function DayMapCanvas({
       maxZoom: coords.length === 1 ? 15 : 13,
     });
   }, [mapRef, ready, stops]);
+
+  // Timeline item clicked -> pan/zoom to its marker (the reverse of clicking
+  // a marker, which already highlights + scrolls the timeline via
+  // onSelectStop/onActiveItemIdsChange in the parent).
+  useEffect(() => {
+    if (!ready || !mapRef.current || !activeStopKey) return;
+    const stop = stops.find((entry) => entry.key === activeStopKey);
+    if (!stop) return;
+    mapRef.current.flyTo({ center: [stop.lon, stop.lat], zoom: 15, duration: 600 });
+  }, [activeStopKey, mapRef, ready, stops]);
 
   useEffect(() => {
     if (!ready || !mapRef.current) return;
@@ -1215,6 +1245,7 @@ export function ItineraryDayRouteSection({
   onPatchDay,
   onPatchItem,
   onActiveItemIdsChange,
+  focusItemId,
 }: {
   day: TripItineraryDay;
   countryName: string;
@@ -1226,6 +1257,8 @@ export function ItineraryDayRouteSection({
     updater: (item: TripItineraryItem) => TripItineraryItem
   ) => void;
   onActiveItemIdsChange: (itemIds: string[]) => void;
+  /** Set from the timeline (outside this component) to pan the map to that item's marker. */
+  focusItemId?: string | null;
 }) {
   const [mapCollapsed, setMapCollapsed] = useState(false);
   const [fullscreenOpen, setFullscreenOpen] = useState(false);
@@ -1238,6 +1271,15 @@ export function ItineraryDayRouteSection({
     onPatchDay,
     onPatchItem,
   });
+
+  useEffect(() => {
+    if (!focusItemId) return;
+    const stop = stops.find((entry) => entry.itemId === focusItemId);
+    if (stop) {
+      setSelectedStopKey(stop.key);
+      setSelectedSegmentKey(null);
+    }
+  }, [focusItemId, stops]);
 
   useEffect(() => {
     if (selectedSegmentKey) {
@@ -1317,8 +1359,7 @@ export function ItineraryDayRouteSection({
       {!mapCollapsed ? (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(20rem,0.95fr)]">
           <div className="space-y-3">
-            <DayMapCanvas {...sharedMapProps} className="hidden lg:block" />
-            <DayMapCanvas {...sharedMapProps} className="lg:hidden" />
+            <DayMapCanvas {...sharedMapProps} />
             {stops.length < 2 ? (
               <div className="rounded-[22px] border border-dashed border-border/70 bg-background/70 p-4 text-sm text-muted-foreground">
                 {stops.length === 1

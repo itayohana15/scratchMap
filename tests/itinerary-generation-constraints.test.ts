@@ -25,6 +25,7 @@ import type {
 const basePreferences: TripPreferences = {
   startDate: "2026-10-06",
   endDate: "2026-10-07",
+  partialDate: "",
   travelers: 2,
   budget: 22500,
   tripStyle: "culture and food",
@@ -88,6 +89,8 @@ function buildItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
     priceConvertedAmount: overrides.priceConvertedAmount ?? overrides.approximatePrice ?? 100,
     priceExchangeRate: overrides.priceExchangeRate ?? 1,
     priceRateTimestamp: overrides.priceRateTimestamp ?? "2026-08-08T00:00:00.000Z",
+    convertedCurrency: overrides.convertedCurrency ?? null,
+    sourceType: overrides.sourceType ?? null,
     travelMinutes: overrides.travelMinutes ?? 20,
     openingHours: overrides.openingHours ?? "09:00-18:00",
     reservationRequired: overrides.reservationRequired ?? false,
@@ -98,6 +101,9 @@ function buildItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
     bookingWarning: overrides.bookingWarning ?? "",
     alternativeSuggestion: overrides.alternativeSuggestion ?? "",
     recommendationId: overrides.recommendationId ?? null,
+    locked: overrides.locked ?? false,
+    priority: overrides.priority ?? "preferred",
+    fixedTime: overrides.fixedTime ?? false,
   };
 }
 

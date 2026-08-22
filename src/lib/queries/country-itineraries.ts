@@ -10,6 +10,7 @@ import type {
 import type {
   AiItineraryRequest,
   CountryTripWorkspaceState,
+  DayOptimizeMode,
 } from "@/lib/trip-workspace";
 
 export const countryItineraryKeys = {
@@ -216,17 +217,19 @@ export function useRegenerateCountryItinerary(iso: string) {
       scope,
       targetDayId,
       targetItemId,
+      optimizeMode,
     }: {
       itineraryId: string;
       scope: NonNullable<AiItineraryRequest["regenerationScope"]>;
       targetDayId?: string | null;
       targetItemId?: string | null;
+      optimizeMode?: DayOptimizeMode | null;
     }) => {
       const data = await parseJson<{ itinerary: CountryItineraryRecord }>(
         await fetch(`/api/countries/${iso.toLowerCase()}/itineraries/${itineraryId}/regenerate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scope, targetDayId, targetItemId }),
+          body: JSON.stringify({ scope, targetDayId, targetItemId, optimizeMode }),
         })
       );
       return data.itinerary;

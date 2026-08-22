@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
 import type { CountryItineraryRecord } from "@/lib/itineraries";
@@ -13,7 +13,7 @@ import {
   useRestoreCountryItineraryVersion,
   useUpdateCountryItinerary,
 } from "@/lib/queries/country-itineraries";
-import type { TripItineraryDay, TripItineraryItem } from "@/lib/trip-workspace";
+import type { DayOptimizeMode, TripItineraryDay, TripItineraryItem } from "@/lib/trip-workspace";
 
 function cloneItinerary(itinerary: CountryItineraryRecord) {
   return JSON.parse(JSON.stringify(itinerary)) as CountryItineraryRecord;
@@ -63,27 +63,36 @@ export function useItineraryDialogController(iso: string) {
     setDraft(null);
   }
 
-  const patchDraft = (updater: (current: CountryItineraryRecord) => CountryItineraryRecord) => {
-    setDraft((current) => (current ? updater(current) : current));
-  };
+  // Stable identity matters here: these are threaded down into the route-map
+  // components' effect dependency arrays, and a function literal recreated
+  // on every render there was the root cause of a "Maximum update depth
+  // exceeded" loop when the map and timeline stayed mounted together.
+  const patchDraft = useCallback(
+    (updater: (current: CountryItineraryRecord) => CountryItineraryRecord) => {
+      setDraft((current) => (current ? updater(current) : current));
+    },
+    []
+  );
 
-  const patchDay = (dayId: string, updater: (day: TripItineraryDay) => TripItineraryDay) => {
-    patchDraft((current) => ({
-      ...current,
-      itineraryDays: current.itineraryDays.map((day) => (day.id === dayId ? updater(day) : day)),
-    }));
-  };
+  const patchDay = useCallback(
+    (dayId: string, updater: (day: TripItineraryDay) => TripItineraryDay) => {
+      patchDraft((current) => ({
+        ...current,
+        itineraryDays: current.itineraryDays.map((day) => (day.id === dayId ? updater(day) : day)),
+      }));
+    },
+    [patchDraft]
+  );
 
-  const patchItem = (
-    dayId: string,
-    itemId: string,
-    updater: (item: TripItineraryItem) => TripItineraryItem
-  ) => {
-    patchDay(dayId, (day) => ({
-      ...day,
-      items: day.items.map((item) => (item.id === itemId ? updater(item) : item)),
-    }));
-  };
+  const patchItem = useCallback(
+    (dayId: string, itemId: string, updater: (item: TripItineraryItem) => TripItineraryItem) => {
+      patchDay(dayId, (day) => ({
+        ...day,
+        items: day.items.map((item) => (item.id === itemId ? updater(item) : item)),
+      }));
+    },
+    [patchDay]
+  );
 
   async function saveDraft() {
     if (!draft) return;
@@ -164,7 +173,8 @@ export function useItineraryDialogController(iso: string) {
     itineraryId: string,
     scope: "full" | "day" | "activity" | "optimize_route" | "recalculate_costs",
     targetDayId?: string | null,
-    targetItemId?: string | null
+    targetItemId?: string | null,
+    optimizeMode?: DayOptimizeMode | null
   ) {
     try {
       const itinerary = await regenerateItinerary.mutateAsync({
@@ -172,6 +182,7 @@ export function useItineraryDialogController(iso: string) {
         scope,
         targetDayId,
         targetItemId,
+        optimizeMode,
       });
       toast.success("המסלול עודכן מחדש");
       if (activeItinerary?.id === itineraryId) {

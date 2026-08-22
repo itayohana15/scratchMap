@@ -35,7 +35,10 @@ export type RecommendationCategory =
   | "day_trip"
   | "seasonal_event"
   | "hotel"
-  | "transportation";
+  | "transportation"
+  | "practical";
+
+export type ItemPriority = "must" | "preferred" | "optional";
 
 export type DayPart = "morning" | "lunch" | "afternoon" | "dinner" | "evening" | "night";
 
@@ -77,6 +80,14 @@ export interface TripPreferences {
   safetyConstraints: string;
 }
 
+/**
+ * "candidate" = the price came from a real, pre-priced candidate
+ * recommendation. "ai_estimate" = the LLM invented the item and its price
+ * was deterministically converted from the destination's local currency —
+ * see `resolveItemPriceFields` in country-itinerary-generation.ts.
+ */
+export type PriceSourceType = "candidate" | "ai_estimate";
+
 export interface TripRecommendation {
   id: string;
   name: string;
@@ -93,6 +104,8 @@ export interface TripRecommendation {
   priceConvertedAmount?: number | null;
   priceExchangeRate?: number | null;
   priceRateTimestamp?: string | null;
+  convertedCurrency?: string | null;
+  sourceType?: PriceSourceType | null;
   mapLink: string;
   imageUrl: string;
   imageQuery: string;
@@ -125,6 +138,8 @@ export interface TripItineraryItem {
   priceConvertedAmount: number | null;
   priceExchangeRate: number | null;
   priceRateTimestamp: string | null;
+  convertedCurrency: string | null;
+  sourceType: PriceSourceType | null;
   actualCost: number | null;
   travelMinutes: number | null;
   transportation: string;
@@ -134,6 +149,8 @@ export interface TripItineraryItem {
   bookingCompleted: boolean;
   optional: boolean;
   locked: boolean;
+  priority: ItemPriority;
+  fixedTime: boolean;
   completed: boolean;
   skipped: boolean;
   plannedNotes: string;
@@ -311,6 +328,8 @@ export interface AiGeneratedItem {
   priceConvertedAmount: number | null;
   priceExchangeRate: number | null;
   priceRateTimestamp: string | null;
+  convertedCurrency: string | null;
+  sourceType: PriceSourceType | null;
   travelMinutes: number | null;
   openingHours: string;
   reservationRequired: boolean;
@@ -321,6 +340,9 @@ export interface AiGeneratedItem {
   bookingWarning: string;
   alternativeSuggestion: string;
   recommendationId: string | null;
+  locked: boolean;
+  priority: ItemPriority;
+  fixedTime: boolean;
 }
 
 export interface AiGeneratedDay {
@@ -401,6 +423,13 @@ export const RECOMMENDATION_CATEGORY_LABELS: Record<RecommendationCategory, stri
   seasonal_event: "אירועים עונתיים",
   hotel: "מלונות",
   transportation: "תחבורה",
+  practical: "סידורים",
+};
+
+export const ITEM_PRIORITY_LABELS: Record<ItemPriority, string> = {
+  must: "חובה",
+  preferred: "רוצה",
+  optional: "אופציונלי",
 };
 
 export const DAY_PART_LABELS: Record<DayPart, string> = {
@@ -534,6 +563,8 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     priceConvertedAmount: null,
     priceExchangeRate: null,
     priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: null,
     actualCost: null,
     travelMinutes: null,
     transportation: "",
@@ -543,6 +574,8 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     bookingCompleted: false,
     optional: false,
     locked: false,
+    priority: "preferred",
+    fixedTime: false,
     completed: false,
     skipped: false,
     plannedNotes: "",
@@ -759,6 +792,89 @@ export function estimateTravelMinutes(
   return km > 0 ? Math.round((km / speed) * 60 * buffer) : 0;
 }
 
+export type DayOptimizeMode = "fewer_transfers" | "less_walking";
+
+const OPTIMIZE_CLUSTER_RADIUS_KM = 1.2;
+
+function nearestNeighborOrder<T extends { lat: number | null; lon: number | null }>(
+  pool: T[],
+  start: { lat: number | null; lon: number | null }
+): T[] {
+  const remaining = [...pool];
+  const ordered: T[] = [];
+  let current = start;
+  while (remaining.length > 0) {
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    remaining.forEach((item, index) => {
+      const distance = haversineKm(current.lat, current.lon, item.lat, item.lon);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    });
+    const [next] = remaining.splice(bestIndex, 1);
+    ordered.push(next);
+    current = { lat: next.lat, lon: next.lon };
+  }
+  return ordered;
+}
+
+/**
+ * Deterministic (non-AI) day reorder — locked and fixedTime items are never
+ * moved from their current position; only the remaining items are
+ * resequenced. "less_walking" runs a greedy nearest-neighbor pass over every
+ * movable item. "fewer_transfers" first groups items into geographic
+ * clusters (anything within ~1.2km of another item in the group) so the
+ * route doesn't zig-zag between distant areas, then nearest-neighbors within
+ * and across those clusters.
+ */
+export function optimizeDayItemOrder(
+  items: TripItineraryItem[],
+  mode: DayOptimizeMode
+): TripItineraryItem[] {
+  const anchoredIndices = new Set<number>();
+  items.forEach((item, index) => {
+    if (item.locked || item.fixedTime) anchoredIndices.add(index);
+  });
+
+  const movablePool = items.filter((item) => !item.locked && !item.fixedTime);
+  if (movablePool.length <= 1) return items;
+
+  const startCoords = { lat: movablePool[0].lat, lon: movablePool[0].lon };
+
+  let orderedMovable: TripItineraryItem[];
+  if (mode === "less_walking") {
+    orderedMovable = nearestNeighborOrder(movablePool, startCoords);
+  } else {
+    const clusters: TripItineraryItem[][] = [];
+    for (const item of movablePool) {
+      const cluster = clusters.find((group) =>
+        group.some((member) => haversineKm(member.lat, member.lon, item.lat, item.lon) <= OPTIMIZE_CLUSTER_RADIUS_KM)
+      );
+      if (cluster) cluster.push(item);
+      else clusters.push([item]);
+    }
+    const orderedClusterReps = nearestNeighborOrder(
+      clusters.map((group) => group[0]),
+      startCoords
+    );
+    orderedMovable = orderedClusterReps.flatMap((representative) => {
+      const group = clusters.find((cluster) => cluster.includes(representative));
+      return group ? nearestNeighborOrder(group, startCoords) : [representative];
+    });
+  }
+
+  const result = [...items];
+  let cursor = 0;
+  for (let index = 0; index < result.length; index += 1) {
+    if (anchoredIndices.has(index)) continue;
+    result[index] = orderedMovable[cursor];
+    cursor += 1;
+  }
+  return result;
+}
+
 export function buildTripStatistics(workspace: CountryTripWorkspaceState): TripStatistics {
   const plannedItems = workspace.itineraryDays.flatMap((day) => day.items);
   const completedItems = plannedItems.filter((item) => item.completed);
@@ -840,6 +956,7 @@ function categoryPriority(category: RecommendationCategory) {
       return 3;
     case "hotel":
     case "transportation":
+    case "practical":
       return 1;
     default:
       return 2;
@@ -1348,6 +1465,8 @@ function createFallbackMealPlaceholder(
     priceConvertedAmount: null,
     priceExchangeRate: null,
     priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: null,
     travelMinutes: 10,
     openingHours: "לא זמין",
     reservationRequired: false,
@@ -1358,6 +1477,9 @@ function createFallbackMealPlaceholder(
     bookingWarning: "",
     alternativeSuggestion: "",
     recommendationId: null,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
   };
 }
 
@@ -1369,7 +1491,7 @@ function createFallbackPracticalItem(
   if (template.kind === "transfer") {
     return {
       name: "צ'ק-אאוט, שמירת מזוודות ומעבר לבסיס הבא",
-      category: "transportation",
+      category: "practical",
       location: dayArea || input.countryName,
       shortDescription: "בלוק פרקטי ליציאה מהלינה, נסיעה מסודרת וצ'ק-אין לפני שמעמיסים עוד פעילויות.",
       slot: "morning",
@@ -1381,6 +1503,8 @@ function createFallbackPracticalItem(
       priceConvertedAmount: null,
       priceExchangeRate: null,
       priceRateTimestamp: null,
+      convertedCurrency: null,
+      sourceType: null,
       travelMinutes: 0,
       openingHours: "לא זמין",
       reservationRequired: false,
@@ -1391,13 +1515,16 @@ function createFallbackPracticalItem(
       bookingWarning: "בדקו שעות צ'ק-אאוט, אחסון מזוודות והגעה ללינה החדשה.",
       alternativeSuggestion: "",
       recommendationId: null,
+      locked: false,
+      priority: "preferred",
+      fixedTime: false,
     };
   }
 
   if (template.kind === "practical") {
     return {
       name: "חלון סידורים, כביסה ותכנון המשך",
-      category: "transportation",
+      category: "practical",
       location: dayArea || input.countryName,
       shortDescription: "זמן ייעודי לקניית כרטיסים, כביסה, סידורים קטנים ותכנון רגוע של הימים הבאים.",
       slot: "morning",
@@ -1409,6 +1536,8 @@ function createFallbackPracticalItem(
       priceConvertedAmount: null,
       priceExchangeRate: null,
       priceRateTimestamp: null,
+      convertedCurrency: null,
+      sourceType: null,
       travelMinutes: 0,
       openingHours: "לא זמין",
       reservationRequired: false,
@@ -1419,6 +1548,9 @@ function createFallbackPracticalItem(
       bookingWarning: "",
       alternativeSuggestion: "",
       recommendationId: null,
+      locked: false,
+      priority: "preferred",
+      fixedTime: false,
     };
   }
 
@@ -1524,6 +1656,8 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         priceConvertedAmount: next.priceConvertedAmount ?? next.approximatePrice,
         priceExchangeRate: next.priceExchangeRate ?? null,
         priceRateTimestamp: next.priceRateTimestamp ?? null,
+        convertedCurrency: next.convertedCurrency ?? null,
+        sourceType: next.sourceType ?? (next.approximatePrice != null ? "candidate" : null),
         travelMinutes,
         openingHours: next.openingHours || "לא זמין",
         reservationRequired: next.reservationRequired,
@@ -1545,6 +1679,9 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
           usageCounts
         ),
         recommendationId: next.id,
+        locked: false,
+        priority: "preferred",
+        fixedTime: false,
       });
     }
 
@@ -1563,6 +1700,8 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         priceConvertedAmount: null,
         priceExchangeRate: null,
         priceRateTimestamp: null,
+        convertedCurrency: null,
+        sourceType: null,
         travelMinutes: 0,
         openingHours: "",
         reservationRequired: false,
@@ -1573,6 +1712,9 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         bookingWarning: "",
         alternativeSuggestion: "",
         recommendationId: null,
+        locked: false,
+        priority: "preferred",
+        fixedTime: false,
       });
     }
 
@@ -1693,10 +1835,40 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
   };
 }
 
+// Items have no stable id across regenerations (the AI rebuilds the whole
+// plan), so we match previous items by recommendationId first, falling back
+// to name+location — the same heuristic `findItineraryPlacement` already
+// uses — to decide whether a lock/priority/fixedTime flag the user set
+// should survive onto the newly generated item.
+function buildPreviousItemLookup(days: TripItineraryDay[]) {
+  const byRecommendationId = new Map<string, TripItineraryItem>();
+  const byNameLocation = new Map<string, TripItineraryItem>();
+  for (const day of days) {
+    for (const item of day.items) {
+      if (item.recommendationId) byRecommendationId.set(item.recommendationId, item);
+      byNameLocation.set(`${item.name.toLowerCase()}::${item.location.toLowerCase()}`, item);
+    }
+  }
+  return { byRecommendationId, byNameLocation };
+}
+
+function findPreviousItem(
+  lookup: ReturnType<typeof buildPreviousItemLookup>,
+  item: Pick<AiGeneratedItem, "recommendationId" | "name" | "location">
+) {
+  if (item.recommendationId) {
+    const match = lookup.byRecommendationId.get(item.recommendationId);
+    if (match) return match;
+  }
+  return lookup.byNameLocation.get(`${item.name.toLowerCase()}::${item.location.toLowerCase()}`) ?? null;
+}
+
 export function applyAiPlanToWorkspace(
   current: CountryTripWorkspaceState,
   plan: AiItineraryResponse
 ): CountryTripWorkspaceState {
+  const previousItemLookup = buildPreviousItemLookup(current.itineraryDays);
+
   const nextDays = plan.days.map((day) => ({
     ...createEmptyDay(day.dayNumber, day.date),
     id: current.itineraryDays[day.dayNumber - 1]?.id ?? createId("day"),
@@ -1705,6 +1877,9 @@ export function applyAiPlanToWorkspace(
     date: day.date,
     cityRegion: day.cityRegion,
     accommodation: day.accommodation,
+    accommodationMapLink: current.itineraryDays[day.dayNumber - 1]?.accommodationMapLink ?? "",
+    accommodationLat: current.itineraryDays[day.dayNumber - 1]?.accommodationLat ?? null,
+    accommodationLon: current.itineraryDays[day.dayNumber - 1]?.accommodationLon ?? null,
     notes: day.notes,
     transportation: day.transportation,
     estimatedCost: day.estimatedCost,
@@ -1719,32 +1894,40 @@ export function applyAiPlanToWorkspace(
     safetyNotes: day.safetyNotes,
     restWindow: day.restWindow,
     transportSegments: day.transportSegments,
-    items: day.items.map((item) => ({
-      ...createEmptyItineraryItem(item.slot),
-      recommendationId: item.recommendationId,
-      name: item.name,
-      category: item.category,
-      location: item.location,
-      shortDescription: item.shortDescription,
-      slot: item.slot,
-      plannedStartTime: item.plannedStartTime,
-      estimatedDurationMinutes: item.estimatedDurationMinutes,
-      approximatePrice: item.approximatePrice,
-      priceOriginalAmount: item.priceOriginalAmount,
-      priceOriginalCurrency: item.priceOriginalCurrency,
-      priceConvertedAmount: item.priceConvertedAmount,
-      priceExchangeRate: item.priceExchangeRate,
-      priceRateTimestamp: item.priceRateTimestamp,
-      travelMinutes: item.travelMinutes,
-      transportation: item.transportation,
-      openingHours: item.openingHours,
-      reservationRequired: item.reservationRequired,
-      mapLink: item.mapLink,
-      lat: item.lat,
-      lon: item.lon,
-      alternativeSuggestion: item.alternativeSuggestion,
-      bookingWarning: item.bookingWarning,
-    })),
+    items: day.items.map((item) => {
+      const previous = findPreviousItem(previousItemLookup, item);
+      return {
+        ...createEmptyItineraryItem(item.slot),
+        recommendationId: item.recommendationId,
+        name: item.name,
+        category: item.category,
+        location: item.location,
+        shortDescription: item.shortDescription,
+        slot: item.slot,
+        plannedStartTime: item.plannedStartTime,
+        estimatedDurationMinutes: item.estimatedDurationMinutes,
+        approximatePrice: item.approximatePrice,
+        priceOriginalAmount: item.priceOriginalAmount,
+        priceOriginalCurrency: item.priceOriginalCurrency,
+        priceConvertedAmount: item.priceConvertedAmount,
+        priceExchangeRate: item.priceExchangeRate,
+        priceRateTimestamp: item.priceRateTimestamp,
+        convertedCurrency: item.convertedCurrency,
+        sourceType: item.sourceType,
+        travelMinutes: item.travelMinutes,
+        transportation: item.transportation,
+        openingHours: item.openingHours,
+        reservationRequired: item.reservationRequired,
+        mapLink: item.mapLink,
+        lat: item.lat,
+        lon: item.lon,
+        alternativeSuggestion: item.alternativeSuggestion,
+        bookingWarning: item.bookingWarning,
+        locked: previous?.locked ?? item.locked,
+        priority: previous?.priority ?? item.priority,
+        fixedTime: previous?.fixedTime ?? item.fixedTime,
+      };
+    }),
   }));
 
   return {

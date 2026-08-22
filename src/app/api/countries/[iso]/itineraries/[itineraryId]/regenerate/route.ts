@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { normalizeCountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import { regenerateCountryItinerary } from "@/lib/server/country-itineraries";
 import { createAdminClient } from "@/lib/supabase/admin";
-import type { AiItineraryRequest } from "@/lib/trip-workspace";
+import type { AiItineraryRequest, DayOptimizeMode } from "@/lib/trip-workspace";
 
 export async function POST(
   request: Request,
@@ -14,6 +14,7 @@ export async function POST(
     scope?: NonNullable<AiItineraryRequest["regenerationScope"]>;
     targetDayId?: string | null;
     targetItemId?: string | null;
+    optimizeMode?: DayOptimizeMode | null;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -44,7 +45,8 @@ export async function POST(
       guide,
       scope,
       body.targetDayId,
-      body.targetItemId
+      body.targetItemId,
+      body.optimizeMode
     );
     return NextResponse.json({ itinerary });
   } catch (error) {

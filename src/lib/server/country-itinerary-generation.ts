@@ -19,14 +19,17 @@ import {
   normalizeActionableMessages,
   scoreRouteProximity,
   scoreBudgetFitness,
+  summarizeItemCosts,
   withNormalizedRecommendationPrice,
   type ExchangeRateContext,
+  type PlanDiagnostics,
   type TripFrame,
   type TripFramePhase,
   type TripPreferenceProfile,
 } from "@/lib/server/itinerary-generation-constraints";
 import {
   buildTripFramePhases,
+  classifyActivityTier,
   classifyItemEnergy,
   getTripLengthBucket,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
@@ -48,7 +51,9 @@ import {
   type AiItineraryRequest,
   type AiItineraryResponse,
   type DayPart,
+  type ItemPriority,
   type RecommendationCategory,
+  type TripRecommendation,
 } from "@/lib/trip-workspace";
 
 export const ITINERARY_MODEL = "gemini-flash-lite-latest";
@@ -57,7 +62,7 @@ interface RawCountryFactsRecord {
   currencies?: Array<{ code?: string }>;
 }
 
-interface RawGeneratedItem {
+export interface RawGeneratedItem {
   name: string;
   category: string;
   location: string;
@@ -74,7 +79,7 @@ interface RawGeneratedItem {
   alternativeSuggestion?: string;
 }
 
-interface RawGeneratedDay {
+export interface RawGeneratedDay {
   dayNumber: number;
   date: string;
   title: string;
@@ -97,7 +102,7 @@ interface RawGeneratedDay {
   items: RawGeneratedItem[];
 }
 
-interface RawGeneratedPlan {
+export interface RawGeneratedPlan {
   title: string;
   summary: string;
   totalEstimatedCost?: number;
@@ -760,6 +765,9 @@ function buildPrompt(
     `Budget allocation in percent: accommodation ${Math.round(profile.budgetAllocation.accommodation * 100)}%, food ${Math.round(profile.budgetAllocation.food * 100)}%, transportation ${Math.round(profile.budgetAllocation.transportation * 100)}%, attractions ${Math.round(profile.budgetAllocation.attractions * 100)}%, buffer ${Math.round(profile.budgetAllocation.buffer * 100)}%.`,
     `Budget caps in ILS: per day ${profile.perDayBudget ?? "unknown"}, lunch ${profile.mealBudgetLunch ?? "unknown"}, dinner ${profile.mealBudgetDinner ?? "unknown"}, activity stop ${profile.activityBudgetPerStop ?? "unknown"}, transport day ${profile.transportBudgetPerDay ?? "unknown"}, accommodation day ${profile.accommodationBudgetPerDay ?? "unknown"}.`,
     `Candidate prices were normalized to ILS${exchangeRateContext ? ` from ${exchangeRateContext.sourceCurrency} using rate ${exchangeRateContext.rateToTarget} updated ${exchangeRateContext.updatedAt}` : ""}.`,
+    exchangeRateContext && exchangeRateContext.sourceCurrency !== exchangeRateContext.targetCurrency
+      ? `Local currency for this destination is ${exchangeRateContext.sourceCurrency} (1 ${exchangeRateContext.sourceCurrency} ≈ ${exchangeRateContext.rateToTarget} ILS) — this is for your own rough judgment only, you do not need to convert anything yourself.`
+      : "",
     `Existing bookings JSON: ${JSON.stringify(bookings, null, 2)}`,
     `Static country guide JSON: ${summarizeCountryKnowledge(knowledge)}`,
     "Use provided candidates first whenever they fit. Preserve chosen candidate names exactly.",
@@ -769,13 +777,15 @@ function buildPrompt(
     "restWindow should be explicit on lighter days, buffer days, laundry/planning days, or recovery mornings.",
     "notes should explain the planning logic of the day, not just repeat the stop names.",
     "transportSegments should be specific and practical, for example: origin -> destination · mode · duration · cost estimate.",
-    "The output prices must be in ILS after conversion, not in the local destination currency.",
-    "Include realistic accommodationCost, foodCost, transportCost, and activityCost so the total trip cost includes accommodation, food, local transport, intercity transport, and paid attractions.",
+    "Every item's approximatePrice must be a realistic estimate in the destination's local currency (not ILS) — do not attempt to convert it yourself. The system converts every price to ILS and enforces the budget automatically after generation, using the local-currency estimate you provide.",
+    "Include realistic accommodationCost, foodCost, transportCost, and activityCost (also in local currency) so the total trip cost includes accommodation, food, local transport, intercity transport, and paid attractions.",
     "Output categoryBreakdown numbers so they sum roughly to the total estimated cost.",
     `Candidate categories JSON: ${JSON.stringify(candidateCategorySummary, null, 2)}`,
     `Candidate areas JSON: ${JSON.stringify(candidateAreaSummary, null, 2)}`,
     `Candidate places JSON: ${JSON.stringify(candidates, null, 2)}`,
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function slotOrderIndex(slot: DayPart) {
@@ -823,6 +833,78 @@ function isAccessibilityConflict(
   payload: AiItineraryRequest
 ) {
   return requiresAccessibilitySupport(payload) && recommendation.wheelchairAccessible === false;
+}
+
+const EXPLICITLY_CLOSED_SIGNALS = [
+  "סגור לצמיתות",
+  "סגור באופן זמני",
+  "אינו פעיל יותר",
+  "permanently closed",
+  "temporarily closed",
+  "no longer open",
+  "closed down",
+  "out of business",
+];
+
+/**
+ * Opening-hours source text (Overpass/Gemini free text) is too unreliable
+ * for real time-window parsing — a wrong "definitely open" inference would
+ * be worse than the current "hours not available" display. This only
+ * catches the one case worth acting on: a place explicitly marked closed.
+ */
+function isExplicitlyClosed(openingHours: string) {
+  const text = openingHours.trim().toLowerCase();
+  if (!text || text === "לא זמין") return false;
+  return EXPLICITLY_CLOSED_SIGNALS.some((signal) => text.includes(signal));
+}
+
+const VEGETARIAN_OR_VEGAN_SIGNALS = ["vegetarian", "vegan", "plant-based", "צמחוני", "טבעוני"];
+const MEAT_FOCUSED_SIGNALS = [
+  "steakhouse",
+  "steak house",
+  "bbq",
+  "barbecue",
+  "grill house",
+  "meat house",
+  "סטייק",
+  "סטייקיה",
+  "בשרים",
+  "צלעות",
+  "המבורגריה",
+];
+const KOSHER_OR_HALAL_SIGNALS = ["kosher", "halal", "כשר", "חלאל"];
+const PORK_SIGNALS = ["pork", "bacon", "ham sandwich", "חזיר", "נקניק חזיר"];
+
+/**
+ * Hard-conflict check, mirroring `isAccessibilityConflict`'s pattern — only
+ * fires on a clear signal pair (e.g. an explicit vegetarian/vegan
+ * preference against an explicitly meat-focused venue name), never on
+ * ambiguous free text. Dietary preferences are classified as a hard
+ * constraint but were previously only a small score nudge; this makes a
+ * genuine conflict a real filter instead.
+ */
+function isDietaryConflict(
+  recommendation: AiItineraryRequest["recommendations"][number],
+  profile: TripPreferenceProfile
+) {
+  if (profile.dietaryKeywords.length === 0) return false;
+  const text = `${recommendation.name} ${recommendation.category} ${recommendation.shortDescription}`.toLowerCase();
+
+  const wantsVegetarianOrVegan = profile.dietaryKeywords.some((keyword) =>
+    VEGETARIAN_OR_VEGAN_SIGNALS.some((signal) => keyword.includes(signal))
+  );
+  if (wantsVegetarianOrVegan && MEAT_FOCUSED_SIGNALS.some((signal) => text.includes(signal))) {
+    return true;
+  }
+
+  const wantsKosherOrHalal = profile.dietaryKeywords.some((keyword) =>
+    KOSHER_OR_HALAL_SIGNALS.some((signal) => keyword.includes(signal))
+  );
+  if (wantsKosherOrHalal && PORK_SIGNALS.some((signal) => text.includes(signal))) {
+    return true;
+  }
+
+  return false;
 }
 
 function isAnchorDayItem(
@@ -1061,7 +1143,7 @@ function findMissingMealSlots(items: AiGeneratedItem[]) {
   return missingSlots;
 }
 
-function scoreMealCandidate(
+export function scoreMealCandidate(
   recommendation: AiItineraryRequest["recommendations"][number],
   day: AiGeneratedDay,
   slot: DayPart,
@@ -1117,6 +1199,10 @@ function scoreMealCandidate(
     score -= 4;
   }
 
+  if (isExplicitlyClosed(recommendation.openingHours)) {
+    score -= 40;
+  }
+
   if (anchor) {
     const anchorArea = normalizeAreaLabel(anchor.location).toLowerCase();
     const candidateArea = normalizeAreaLabel(recommendation.location).toLowerCase();
@@ -1143,7 +1229,7 @@ function scoreMealCandidate(
   return score;
 }
 
-function pickNearbyMealRecommendation(
+export function pickNearbyMealRecommendation(
   payload: AiItineraryRequest,
   day: AiGeneratedDay,
   slot: DayPart,
@@ -1154,6 +1240,7 @@ function pickNearbyMealRecommendation(
   const ranked = [...payload.recommendations, ...payload.selectedPlaces]
     .filter((recommendation) => isFoodItem(recommendation.category))
     .filter((recommendation) => !isAccessibilityConflict(recommendation, payload))
+    .filter((recommendation) => !isDietaryConflict(recommendation, profile))
     .filter((recommendation) => !usedNames.has(recommendation.name.trim().toLowerCase()))
     .map((recommendation) => ({
       recommendation,
@@ -1214,14 +1301,7 @@ function buildSupplementalMealItem(
     plannedStartTime: defaultSlotTime(slot),
     estimatedDurationMinutes:
       recommendation.estimatedDurationMinutes ?? (slot === "lunch" ? 60 : 75),
-    approximatePrice: recommendation.approximatePrice ?? null,
-    priceOriginalAmount:
-      recommendation.priceOriginalAmount ?? recommendation.approximatePrice ?? null,
-    priceOriginalCurrency: recommendation.priceOriginalCurrency ?? null,
-    priceConvertedAmount:
-      recommendation.priceConvertedAmount ?? recommendation.approximatePrice ?? null,
-    priceExchangeRate: recommendation.priceExchangeRate ?? null,
-    priceRateTimestamp: recommendation.priceRateTimestamp ?? null,
+    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null),
     travelMinutes,
     openingHours: recommendation.openingHours || "לא זמין",
     reservationRequired: recommendation.reservationRequired,
@@ -1235,6 +1315,9 @@ function buildSupplementalMealItem(
     bookingWarning: recommendation.reservationRequired ? "כדאי לבדוק זמינות או להזמין מראש." : "",
     alternativeSuggestion: "",
     recommendationId: recommendation.id,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
   };
 }
 
@@ -1261,6 +1344,8 @@ function buildFallbackMealPlaceholder(
     priceConvertedAmount: null,
     priceExchangeRate: null,
     priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: null,
     travelMinutes: 10,
     openingHours: "לא זמין",
     reservationRequired: false,
@@ -1271,6 +1356,9 @@ function buildFallbackMealPlaceholder(
     bookingWarning: "",
     alternativeSuggestion: "",
     recommendationId: null,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
   };
 }
 
@@ -1313,34 +1401,35 @@ function fillDerivedDayFields(
       };
     });
 
-  const itemActivityCost = items
-    .filter(
-      (item) =>
-        !isFoodItem(item.category) &&
-        item.category !== "transportation" &&
-        item.category !== "hotel"
-    )
-    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
-  const itemFoodCost = items
-    .filter((item) => isFoodItem(item.category))
-    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
-  const itemTransportCost = items
-    .filter((item) => item.category === "transportation")
-    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
-  const itemAccommodationCost = items
-    .filter((item) => item.category === "hotel")
-    .reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const activityItems = items.filter(
+    (item) => !isFoodItem(item.category) && item.category !== "transportation" && item.category !== "hotel"
+  );
+  const foodItems = items.filter((item) => isFoodItem(item.category));
+  const transportItems = items.filter((item) => item.category === "transportation");
+  const accommodationItems = items.filter((item) => item.category === "hotel");
+  const itemActivityCost = activityItems.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const itemFoodCost = foodItems.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const itemTransportCost = transportItems.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
+  const itemAccommodationCost = accommodationItems.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0);
   const totalTravelMinutes = items.reduce((sum, item) => sum + (item.travelMinutes ?? 0), 0);
-  const activityCost = day.activityCost ?? (itemActivityCost > 0 ? itemActivityCost : null);
-  const foodCost = day.foodCost ?? (itemFoodCost > 0 ? itemFoodCost : null);
-  const transportCost = day.transportCost ?? (itemTransportCost > 0 ? itemTransportCost : null);
+  // Always trust the sum of (now currency-converted) item prices over the
+  // model's own day-level cost fields, including when it's genuinely 0 —
+  // never fall back to a day-level number here. That fallback used to kick
+  // in whenever a category's items summed to 0, which silently resurrected
+  // a stale, pre-repair total once every item in a category had been
+  // replaced down to a free placeholder (e.g. by enforceBudgetOnDays) —
+  // repeatedly "fixing" a day would each time zero out its own items but
+  // the day's headline cost would refuse to actually drop. Accommodation
+  // stays the one exception: it's usually represented only as `day.accommodation`
+  // free text with no corresponding item to sum, so a reasonable estimate
+  // is still worth falling back to there.
+  const activityCost = itemActivityCost;
+  const foodCost = itemFoodCost;
+  const transportCost = itemTransportCost;
   const accommodationCost =
-    day.accommodationCost ??
-    (itemAccommodationCost > 0
+    accommodationItems.length > 0
       ? itemAccommodationCost
-      : day.accommodation
-        ? profile?.accommodationBudgetPerDay ?? null
-        : null);
+      : (day.accommodationCost ?? (day.accommodation ? (profile?.accommodationBudgetPerDay ?? null) : null));
   const estimatedCost =
     (activityCost ?? 0) +
     (foodCost ?? 0) +
@@ -1383,7 +1472,10 @@ function fillDerivedDayFields(
   return {
     ...day,
     items,
-    estimatedCost: estimatedCost > 0 ? estimatedCost : day.estimatedCost,
+    // Same reasoning as activity/food/transport above: trust the freshly
+    // computed total, including a genuine 0, rather than falling back to
+    // the day's previous estimatedCost.
+    estimatedCost,
     activityCost,
     foodCost,
     transportCost,
@@ -1418,20 +1510,60 @@ function replaceItemInDay(
   };
 }
 
-function repairDayGeography(
+export function repairDayGeography(
   day: AiGeneratedDay,
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile
 ) {
+  // Items with genuinely impossible coordinates (e.g. lat/lon far outside
+  // real-world range) must be caught here, on the raw input, before
+  // `fillDerivedDayFields` normalizes/nulls them out below — once nulled,
+  // `analyzeDayGeography` can no longer tell "invalid" apart from
+  // "legitimately has no coordinates yet" and would otherwise leave a
+  // nameless, coordinate-less item sitting in the itinerary forever instead
+  // of replacing it with a real nearby alternative.
+  const rawInvalidNames = new Set(
+    day.items
+      .filter(
+        (item) =>
+          (item.lat != null || item.lon != null) &&
+          !normalizeCoordinatePair(item.lat, item.lon).isValid
+      )
+      .map((item) => item.name)
+  );
+
   let nextDay = fillDerivedDayFields(resequenceDayItems(day), payload, profile);
+
+  if (rawInvalidNames.size > 0) {
+    const invalidItem = nextDay.items.find(
+      (item) => rawInvalidNames.has(item.name) && !item.locked && !item.fixedTime
+    );
+    if (invalidItem) {
+      const replacement = pickReplacementRecommendation({
+        payload,
+        day: nextDay,
+        item: invalidItem,
+        profile,
+        usedPlaceKeys: new Set(nextDay.items.map((item) => buildItemKey(item))),
+      });
+      const nextItem = replacement
+        ? buildReplacementItem(replacement, invalidItem, nextDay, payload)
+        : buildFreeExplorationReplacement(invalidItem, nextDay);
+      nextDay = fillDerivedDayFields(
+        resequenceDayItems(replaceItemInDay(nextDay, invalidItem, nextItem)),
+        payload,
+        profile
+      );
+    }
+  }
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const diagnostics = analyzeDayGeography(nextDay, profile);
     let changed = false;
 
     if (diagnostics.invalidCoordinateItems.length > 0) {
-      const invalidItem = nextDay.items.find((item) =>
-        diagnostics.invalidCoordinateItems.includes(item.name)
+      const invalidItem = nextDay.items.find(
+        (item) => diagnostics.invalidCoordinateItems.includes(item.name) && !item.locked && !item.fixedTime
       );
 
       if (invalidItem) {
@@ -1455,7 +1587,9 @@ function repairDayGeography(
     }
 
     if (!changed && diagnostics.foodDominant) {
-      const extraFoodItem = sortItems(nextDay.items).find((item) => isFoodItem(item.category));
+      const extraFoodItem = sortItems(nextDay.items).find(
+        (item) => isFoodItem(item.category) && !item.locked && !item.fixedTime
+      );
       if (extraFoodItem) {
         const replacement = pickReplacementRecommendation({
           payload,
@@ -1485,8 +1619,11 @@ function repairDayGeography(
     }
 
     if (!changed && diagnostics.longMealDetours.length > 0) {
-      const mealToReplace = sortItems(nextDay.items).find((item) =>
-        diagnostics.longMealDetours.some((segment) => segment.toName === item.name)
+      const mealToReplace = sortItems(nextDay.items).find(
+        (item) =>
+          diagnostics.longMealDetours.some((segment) => segment.toName === item.name) &&
+          !item.locked &&
+          !item.fixedTime
       );
 
       if (mealToReplace) {
@@ -1538,7 +1675,7 @@ function repairDayGeography(
     ) {
       const primaryAnchor = getPrimaryAnchor(nextDay);
       const outlier = getOrderedAnchorItems(nextDay)
-        .filter((item) => item !== primaryAnchor)
+        .filter((item) => item !== primaryAnchor && !item.locked && !item.fixedTime)
         .sort((left, right) => {
           const leftDistance = primaryAnchor
             ? haversineKm(primaryAnchor.lat, primaryAnchor.lon, left.lat, left.lon)
@@ -1664,7 +1801,92 @@ function repairDayStructure(
   return fillDerivedDayFields(resequenceDayItems(nextDay), payload, profile);
 }
 
-function enrichAiDay(day: RawGeneratedDay, payload: AiItineraryRequest): AiGeneratedDay {
+/**
+ * Prices coming straight from a priced candidate recommendation already
+ * carry a real, auditable currency context (set once, before generation, by
+ * `withNormalizedRecommendationPrice`). Anything the LLM invented on the
+ * spot has no such context — the prompt asks it to price those in the
+ * destination's local currency, so this treats the raw number as local
+ * currency and converts it deterministically rather than trusting any
+ * in-model arithmetic (never confusing e.g. JPY for ILS).
+ */
+export function resolveItemPriceFields(
+  rawPrice: number | null | undefined,
+  matchedRecommendation: TripRecommendation | null,
+  exchangeRateContext: ExchangeRateContext | null
+): Pick<
+  AiGeneratedItem,
+  | "approximatePrice"
+  | "priceOriginalAmount"
+  | "priceOriginalCurrency"
+  | "priceConvertedAmount"
+  | "priceExchangeRate"
+  | "priceRateTimestamp"
+  | "convertedCurrency"
+  | "sourceType"
+> {
+  if (matchedRecommendation?.priceOriginalCurrency && matchedRecommendation.priceConvertedAmount != null) {
+    return {
+      approximatePrice: matchedRecommendation.priceConvertedAmount,
+      priceOriginalAmount: matchedRecommendation.priceOriginalAmount ?? rawPrice ?? null,
+      priceOriginalCurrency: matchedRecommendation.priceOriginalCurrency,
+      priceConvertedAmount: matchedRecommendation.priceConvertedAmount,
+      priceExchangeRate: matchedRecommendation.priceExchangeRate ?? null,
+      priceRateTimestamp: matchedRecommendation.priceRateTimestamp ?? null,
+      convertedCurrency: exchangeRateContext?.targetCurrency ?? "ILS",
+      sourceType: "candidate",
+    };
+  }
+
+  const price = rawPrice ?? matchedRecommendation?.approximatePrice ?? null;
+  if (price != null && exchangeRateContext) {
+    const convertedAmount = Math.round(price * exchangeRateContext.rateToTarget * 100) / 100;
+    return {
+      approximatePrice: convertedAmount,
+      priceOriginalAmount: price,
+      priceOriginalCurrency: exchangeRateContext.sourceCurrency,
+      priceConvertedAmount: convertedAmount,
+      priceExchangeRate: exchangeRateContext.rateToTarget,
+      priceRateTimestamp: exchangeRateContext.updatedAt,
+      convertedCurrency: exchangeRateContext.targetCurrency,
+      sourceType: "ai_estimate",
+    };
+  }
+
+  return {
+    approximatePrice: price,
+    priceOriginalAmount: price,
+    priceOriginalCurrency: null,
+    priceConvertedAmount: price,
+    priceExchangeRate: null,
+    priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: price != null ? "ai_estimate" : null,
+  };
+}
+
+// Carries a user's lock/priority/fixed-time flags forward into freshly
+// (re)generated items, matched the same way `applyAiPlanToWorkspace` matches
+// items across regenerations — by recommendationId, else by name+location —
+// so repair functions can see and respect them even before the plan is
+// saved back onto the workspace.
+function findExistingItemFlags(payload: AiItineraryRequest, name: string, location: string, recommendationId: string | null) {
+  for (const day of payload.existingDays) {
+    for (const item of day.items) {
+      if (recommendationId && item.recommendationId === recommendationId) return item;
+      if (item.name.trim().toLowerCase() === name.trim().toLowerCase() && item.location.trim().toLowerCase() === location.trim().toLowerCase()) {
+        return item;
+      }
+    }
+  }
+  return null;
+}
+
+function enrichAiDay(
+  day: RawGeneratedDay,
+  payload: AiItineraryRequest,
+  exchangeRateContext: ExchangeRateContext | null
+): AiGeneratedDay {
   const items: AiGeneratedItem[] = day.items.map((item) => {
     const matchedRecommendation =
       payload.recommendations.find(
@@ -1681,6 +1903,9 @@ function enrichAiDay(day: RawGeneratedDay, payload: AiItineraryRequest): AiGener
     const location = item.location || matchedRecommendation?.location || payload.countryName;
     const lat = matchedRecommendation?.lat ?? null;
     const lon = matchedRecommendation?.lon ?? null;
+    const priceFields = resolveItemPriceFields(item.approximatePrice, matchedRecommendation, exchangeRateContext);
+    const recommendationId = matchedRecommendation?.id ?? null;
+    const existingFlags = findExistingItemFlags(payload, item.name, location, recommendationId);
 
     return {
       name: item.name,
@@ -1690,14 +1915,7 @@ function enrichAiDay(day: RawGeneratedDay, payload: AiItineraryRequest): AiGener
       slot: normalizeSlot(item.slot),
       plannedStartTime: item.plannedStartTime,
       estimatedDurationMinutes: item.estimatedDurationMinutes ?? matchedRecommendation?.estimatedDurationMinutes ?? null,
-      approximatePrice: item.approximatePrice ?? matchedRecommendation?.approximatePrice ?? null,
-      priceOriginalAmount:
-        matchedRecommendation?.priceOriginalAmount ?? item.approximatePrice ?? matchedRecommendation?.approximatePrice ?? null,
-      priceOriginalCurrency: matchedRecommendation?.priceOriginalCurrency ?? null,
-      priceConvertedAmount:
-        matchedRecommendation?.priceConvertedAmount ?? item.approximatePrice ?? matchedRecommendation?.approximatePrice ?? null,
-      priceExchangeRate: matchedRecommendation?.priceExchangeRate ?? null,
-      priceRateTimestamp: matchedRecommendation?.priceRateTimestamp ?? null,
+      ...priceFields,
       travelMinutes: item.travelMinutes ?? null,
       openingHours: item.openingHours ?? matchedRecommendation?.openingHours ?? "לא זמין",
       reservationRequired: item.reservationRequired ?? matchedRecommendation?.reservationRequired ?? false,
@@ -1707,7 +1925,10 @@ function enrichAiDay(day: RawGeneratedDay, payload: AiItineraryRequest): AiGener
       lon,
       bookingWarning: item.bookingWarning ?? "",
       alternativeSuggestion: item.alternativeSuggestion ?? "",
-      recommendationId: matchedRecommendation?.id ?? null,
+      recommendationId,
+      locked: existingFlags?.locked ?? false,
+      priority: existingFlags?.priority ?? "preferred",
+      fixedTime: existingFlags?.fixedTime ?? false,
     };
   });
 
@@ -1765,7 +1986,7 @@ async function generateWithGemini(
   return JSON.parse(raw) as RawGeneratedPlan;
 }
 
-function buildItemKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
+export function buildItemKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
   if (item.recommendationId) return `id:${item.recommendationId}`;
   if (item.lat != null && item.lon != null) {
     return `coords:${item.lat.toFixed(4)}:${item.lon.toFixed(4)}`;
@@ -1781,45 +2002,8 @@ function isAvoidedItem(item: Pick<AiGeneratedItem, "name" | "location" | "shortD
   );
 }
 
-function buildCostsFromDays(days: AiGeneratedDay[]) {
-  const categoryBreakdown = {
-    attractions: 0,
-    food: 0,
-    transportation: 0,
-    accommodation: 0,
-    other: 0,
-  };
-
-  for (const day of days) {
-    categoryBreakdown.attractions += day.activityCost ?? 0;
-    categoryBreakdown.food += day.foodCost ?? 0;
-    categoryBreakdown.transportation += day.transportCost ?? 0;
-    categoryBreakdown.accommodation += day.accommodationCost ?? 0;
-
-    const explicitTotal =
-      (day.activityCost ?? 0) +
-      (day.foodCost ?? 0) +
-      (day.transportCost ?? 0) +
-      (day.accommodationCost ?? 0);
-
-    if ((day.estimatedCost ?? 0) > explicitTotal) {
-      categoryBreakdown.other += (day.estimatedCost ?? 0) - explicitTotal;
-    }
-  }
-
-  const totalEstimatedCost = Object.values(categoryBreakdown).reduce((sum, value) => sum + value, 0);
-
-  return {
-    totalEstimatedCost: totalEstimatedCost > 0 ? Math.round(totalEstimatedCost) : null,
-    estimatedTransportCost:
-      categoryBreakdown.transportation > 0 ? Math.round(categoryBreakdown.transportation) : null,
-    averageDailyCost:
-      totalEstimatedCost > 0 && days.length > 0 ? Math.round(totalEstimatedCost / days.length) : null,
-    costPerTraveler: totalEstimatedCost,
-    categoryBreakdown: Object.fromEntries(
-      Object.entries(categoryBreakdown).map(([key, value]) => [key, Math.round(value)])
-    ),
-  };
+function buildCostsFromDays(days: AiGeneratedDay[], travelers: number) {
+  return summarizeItemCosts(days, travelers);
 }
 
 function buildReplacementItem(
@@ -1924,7 +2108,7 @@ function buildInsertedRecommendationItem(
   recommendation: AiItineraryRequest["recommendations"][number],
   day: AiGeneratedDay,
   payload: AiItineraryRequest
-) {
+): AiGeneratedItem {
   if (isFoodItem(recommendation.category)) {
     const slot =
       recommendation.recommendedTimeOfDay === "lunch" ||
@@ -1964,14 +2148,7 @@ function buildInsertedRecommendationItem(
     slot,
     plannedStartTime: slot === "morning" ? "10:00" : slot === "afternoon" ? "15:30" : "19:30",
     estimatedDurationMinutes: recommendation.estimatedDurationMinutes ?? 90,
-    approximatePrice: recommendation.approximatePrice ?? null,
-    priceOriginalAmount:
-      recommendation.priceOriginalAmount ?? recommendation.approximatePrice ?? null,
-    priceOriginalCurrency: recommendation.priceOriginalCurrency ?? null,
-    priceConvertedAmount:
-      recommendation.priceConvertedAmount ?? recommendation.approximatePrice ?? null,
-    priceExchangeRate: recommendation.priceExchangeRate ?? null,
-    priceRateTimestamp: recommendation.priceRateTimestamp ?? null,
+    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null),
     travelMinutes,
     openingHours: recommendation.openingHours || "לא זמין",
     reservationRequired: recommendation.reservationRequired,
@@ -1984,6 +2161,9 @@ function buildInsertedRecommendationItem(
     bookingWarning: recommendation.reservationRequired ? "מומלץ לבדוק זמינות מראש." : "",
     alternativeSuggestion: "",
     recommendationId: recommendation.id,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
   };
 }
 
@@ -2024,6 +2204,7 @@ function pickReplacementRecommendation(args: {
     )
     .filter((candidate) => !includesAnyKeyword(`${candidate.name} ${candidate.location}`, args.profile.avoidKeywords))
     .filter((candidate) => !isAccessibilityConflict(candidate, args.payload))
+    .filter((candidate) => !isDietaryConflict(candidate, args.profile))
     .sort((left, right) => {
       const leftAreaScore =
         normalizeAreaLabel(left.location).toLowerCase() === area.toLowerCase() ? 18 : 0;
@@ -2238,13 +2419,22 @@ function ensureMustVisitCoverage(
   return mutableDays;
 }
 
-function diversifyActivities(
+export function diversifyActivities(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
-  dominantCategory: RecommendationCategory | null
+  dominantCategory: RecommendationCategory | null,
+  activityMixSkew: PlanDiagnostics["activityMixSkew"] = []
 ) {
   if (!dominantCategory) return days;
+
+  // Guidance only (spec: "guidelines, not rigid percentages") — when the mix
+  // is skewed, prefer swapping toward whichever tier is furthest under its
+  // target range, instead of an arbitrary replacement category.
+  const underRepresentedTier = activityMixSkew
+    .filter((entry) => entry.share < entry.target.min)
+    .sort((left, right) => left.target.min - left.share - (right.target.min - right.share))
+    .at(-1)?.tier;
 
   const mutableDays = [...days];
   const usedPlaceKeys = new Set(
@@ -2256,19 +2446,22 @@ function diversifyActivities(
     const day = mutableDays[dayIndex];
     const replaceableEntry = [...day.items]
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => item.category === dominantCategory)
+      .filter(({ item }) => item.category === dominantCategory && !item.locked && !item.fixedTime)
       .filter(
         ({ item }) =>
           !profile.mustVisitKeywords.some((keyword) =>
             includesAnyKeyword(`${item.name} ${item.location}`, [keyword])
           )
       )
-      .sort(
-        (left, right) =>
+      .sort((left, right) => {
+        const priorityDelta = priorityRemovalWeight(left.item.priority) - priorityRemovalWeight(right.item.priority);
+        if (priorityDelta !== 0) return priorityDelta;
+        return (
           (right.item.approximatePrice ?? 0) +
           (right.item.travelMinutes ?? 0) -
           ((left.item.approximatePrice ?? 0) + (left.item.travelMinutes ?? 0))
-      )[0];
+        );
+      })[0];
 
     if (!replaceableEntry) {
       continue;
@@ -2309,10 +2502,15 @@ function diversifyActivities(
           left.recommendedTimeOfDay === "any" ? "afternoon" : left.recommendedTimeOfDay;
         const rightSlot =
           right.recommendedTimeOfDay === "any" ? "afternoon" : right.recommendedTimeOfDay;
+        const leftTierScore =
+          underRepresentedTier && classifyActivityTier(left.category) === underRepresentedTier ? 20 : 0;
+        const rightTierScore =
+          underRepresentedTier && classifyActivityTier(right.category) === underRepresentedTier ? 20 : 0;
         return (
           rightAreaScore +
+          rightTierScore +
           scoreBudgetFitness(right, rightSlot, profile) -
-          (leftAreaScore + scoreBudgetFitness(left, leftSlot, profile))
+          (leftAreaScore + leftTierScore + scoreBudgetFitness(left, leftSlot, profile))
         );
       })[0];
 
@@ -2349,7 +2547,7 @@ function normalizeDayCollections(day: AiGeneratedDay) {
   };
 }
 
-function rebalanceDayItems(
+export function rebalanceDayItems(
   day: AiGeneratedDay,
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
@@ -2366,7 +2564,7 @@ function rebalanceDayItems(
       (mealNamesInDay.has(item.name.trim().toLowerCase()) ||
         (!profile.luxuryEnabled && isPremiumVenue(item)));
 
-    if (isAvoidedItem(item, profile) || duplicatePlace || premiumConflict) {
+    if ((isAvoidedItem(item, profile) || duplicatePlace || premiumConflict) && !item.locked && !item.fixedTime) {
       const replacement = pickReplacementRecommendation({
         payload,
         day: { ...day, items: nextItems },
@@ -2395,6 +2593,21 @@ function rebalanceDayItems(
   return { ...day, items: nextItems };
 }
 
+// Optional items are shed first, must-do items only as an absolute last
+// resort (spec: MUST DO "preserve unless impossible", OPTIONAL "first items
+// removed"). Used to order candidates within functions that already exclude
+// locked/fixedTime items from the candidate pool entirely.
+function priorityRemovalWeight(priority: ItemPriority): number {
+  switch (priority) {
+    case "optional":
+      return 0;
+    case "preferred":
+      return 1;
+    case "must":
+      return 2;
+  }
+}
+
 function moveOverflowItem(
   days: AiGeneratedDay[],
   dayIndex: number,
@@ -2417,7 +2630,7 @@ function moveOverflowItem(
   return false;
 }
 
-function fixOverloadedDays(
+export function fixOverloadedDays(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile
@@ -2432,8 +2645,10 @@ function fixOverloadedDays(
       attempts += 1;
       const movableIndex = [...currentDay.items]
         .map((item, index) => ({ item, index }))
-        .filter(({ item }) => !isFoodItem(item.category))
+        .filter(({ item }) => !isFoodItem(item.category) && !item.locked && !item.fixedTime)
         .sort((left, right) => {
+          const priorityDelta = priorityRemovalWeight(left.item.priority) - priorityRemovalWeight(right.item.priority);
+          if (priorityDelta !== 0) return priorityDelta;
           const leftScore =
             (left.item.slot === "evening" || left.item.slot === "night" ? 30 : 0) +
             (left.item.approximatePrice ?? 0) +
@@ -2470,7 +2685,7 @@ function fixOverloadedDays(
   return mutableDays;
 }
 
-function enforceBudgetOnDays(
+export function enforceBudgetOnDays(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile
@@ -2489,14 +2704,19 @@ function enforceBudgetOnDays(
 
     for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
       const day = mutableDays[dayIndex];
-      const expensiveIndex = day.items.findIndex((item) => {
-        const cap = getBudgetCapForItem(item, profile);
-        if (cap == null || item.approximatePrice == null) return false;
-        return (
-          item.approximatePrice > cap ||
-          (!profile.luxuryEnabled && isFoodItem(item.category) && isPremiumVenue(item))
-        );
-      });
+      const overCapCandidates = day.items
+        .map((item, index) => ({ item, index }))
+        .filter(({ item }) => {
+          if (item.locked || item.fixedTime) return false;
+          const cap = getBudgetCapForItem(item, profile);
+          if (cap == null || item.approximatePrice == null) return false;
+          return (
+            item.approximatePrice > cap ||
+            (!profile.luxuryEnabled && isFoodItem(item.category) && isPremiumVenue(item))
+          );
+        })
+        .sort((left, right) => priorityRemovalWeight(left.item.priority) - priorityRemovalWeight(right.item.priority));
+      const expensiveIndex = overCapCandidates[0]?.index ?? -1;
 
       if (expensiveIndex !== -1) {
         const targetItem = day.items[expensiveIndex];
@@ -2700,7 +2920,7 @@ async function applyBestEffortRoutingValidation(
     })
   );
 
-  const costs = buildCostsFromDays(days);
+  const costs = buildCostsFromDays(days, payload.preferences.travelers);
   return {
     ...plan,
     days,
@@ -2711,11 +2931,12 @@ async function applyBestEffortRoutingValidation(
   };
 }
 
-function repairPlan(
+export function repairPlan(
   raw: RawGeneratedPlan,
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
-  tripFrame: TripFrame
+  tripFrame: TripFrame,
+  exchangeRateContext: ExchangeRateContext | null
 ): AiItineraryResponse {
   const fallback = buildFallbackAiItinerary(payload);
   const dayCount = getTripDayCount(payload.preferences.startDate, payload.preferences.endDate, 0);
@@ -2740,7 +2961,8 @@ function repairPlan(
         dayNumber: expectedDayNumber,
         date: dateForDayNumber(payload.preferences.startDate, expectedDayNumber) || rawDay.date,
       },
-      payload
+      payload,
+      exchangeRateContext
     );
 
     const fallbackDay = fallback.days[index];
@@ -2773,8 +2995,15 @@ function repairPlan(
   let repairedDays = days;
   let lastPlan: AiItineraryResponse | null = null;
 
+  // Shared across every repair attempt (not recreated per attempt) so
+  // repeat-restaurant suppression pressure accumulates instead of being
+  // wiped on every retry. (`usedPlaceKeys` below stays attempt-scoped and
+  // freshly built each time on purpose — `rebalanceDayItems` relies on
+  // seeing each item's *first* occurrence as non-duplicate while it builds
+  // that set up incrementally as it walks the days in order.)
+  const iterationMealNames = new Set(usedMealNames);
+
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const iterationMealNames = new Set<string>();
     repairedDays = repairedDays.map((day, index) =>
       repairDayStructure(normalizeDayCollections(day), payload, profile, index, dayCount, iterationMealNames)
     );
@@ -2792,7 +3021,7 @@ function repairPlan(
       fillDerivedDayFields(normalizeDayCollections(day), payload, profile)
     );
 
-    let computedCosts = buildCostsFromDays(repairedDays);
+    let computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers);
     let totalEstimatedCost = computedCosts.totalEstimatedCost;
     let estimatedTransportCost = computedCosts.estimatedTransportCost;
     let averageDailyCost = computedCosts.averageDailyCost;
@@ -2818,10 +3047,11 @@ function repairPlan(
         repairedDays,
         payload,
         profile,
-        diagnostics.dominantCategory
+        diagnostics.dominantCategory,
+        diagnostics.activityMixSkew
       ).map((day) => fillDerivedDayFields(normalizeDayCollections(day), payload, profile));
 
-      computedCosts = buildCostsFromDays(repairedDays);
+      computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers);
       totalEstimatedCost = computedCosts.totalEstimatedCost;
       estimatedTransportCost = computedCosts.estimatedTransportCost;
       averageDailyCost = computedCosts.averageDailyCost;
@@ -2862,7 +3092,7 @@ function isPlanComplete(plan: RawGeneratedPlan, payload: AiItineraryRequest) {
   return dayCount > 0 && Array.isArray(plan.days) && plan.days.length === dayCount;
 }
 
-function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagnostics>) {
+export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagnostics>) {
   return (
     diagnostics.missingMeals === 0 &&
     diagnostics.duplicatePlaces === 0 &&
@@ -2966,7 +3196,7 @@ export async function generateCountryItineraryPlan(
         tripFrame,
         knowledge
       );
-      const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame);
+      const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext);
       const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame);
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
@@ -2983,8 +3213,21 @@ export async function generateCountryItineraryPlan(
     toRawGeneratedPlan(buildFallbackAiItinerary(normalizedPayload)),
     normalizedPayload,
     profile,
-    tripFrame
+    tripFrame,
+    exchangeRateContext
   );
+  const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame);
+  if (fallbackDiagnostics.outOfBudget || fallbackDiagnostics.duplicatePlaces > 0) {
+    // The deterministic template is budget-driven by construction, so this
+    // should be unreachable in practice — but per spec, a severely broken
+    // plan must never be saved silently. Fail loudly with a clear reason
+    // instead of returning something invalid.
+    throw new Error(
+      fallbackDiagnostics.outOfBudget
+        ? "לא הצלחנו לבנות מסלול בטווח התקציב שהוגדר, גם אחרי תיקון אוטומטי."
+        : "לא הצלחנו להסיר כפילויות מהמסלול, גם אחרי תיקון אוטומטי."
+    );
+  }
 
   return {
     ...fallback,

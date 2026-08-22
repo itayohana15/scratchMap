@@ -75,6 +75,8 @@ export interface TripHubTrip {
   hasAnyActualData: boolean;
   tripStyle: string | null;
   isHistorical: boolean;
+  /** Best-known date for sorting; see `effectiveSortDate`. */
+  sortDate: string;
 }
 
 export const TRIP_HUB_STATUS_LABELS: Record<TripHubStatus, string> = {
@@ -120,12 +122,17 @@ function mapItineraryStatus(status: CountryItineraryStatus): TripHubStatus {
  * known, else the "YYYY-MM" partialDate (for historical trips with only a
  * known month), else its createdAt as a last resort.
  */
-function effectiveSortDate(itinerary: CountryItineraryRecord) {
+export function effectiveSortDate(itinerary: CountryItineraryRecord) {
   if (itinerary.startDate) return itinerary.startDate;
   if (itinerary.endDate) return itinerary.endDate;
   const partial = itinerary.preferencesSnapshot.partialDate;
   if (isMeaningfulText(partial)) return `${partial.trim()}-01`;
   return itinerary.createdAt;
+}
+
+/** True when the trip's date is exactly known (not just a "YYYY-MM" guess or createdAt fallback). */
+export function hasExactDate(itinerary: CountryItineraryRecord) {
+  return Boolean(itinerary.startDate);
 }
 
 function determineYear(itinerary: CountryItineraryRecord) {
@@ -289,7 +296,10 @@ export function buildTripHubTrip(
   const actualCost = determineActualCost(workspace);
   const statistics = buildTripStatistics(workspace);
   const comparison = buildTripComparison(workspace);
-  const hasStarted = Boolean(itinerary.startDate && itinerary.startDate <= TRIP_HUB_TODAY);
+  const hasStarted =
+    status === "completed" ||
+    status === "active" ||
+    Boolean(itinerary.startDate && itinerary.startDate <= TRIP_HUB_TODAY);
 
   return {
     id: itinerary.id,
@@ -349,5 +359,6 @@ export function buildTripHubTrip(
       ? itinerary.preferencesSnapshot.tripStyle.trim()
       : null,
     isHistorical: itinerary.source === "historical_manual",
+    sortDate: effectiveSortDate(itinerary),
   };
 }

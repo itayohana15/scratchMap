@@ -147,15 +147,10 @@ function compareTrips(a: TripHubTrip, b: TripHubTrip, sortBy: SortOption) {
       const rank = { upcoming: 0, planning: 1, completed: 2, archived: 3, active: -1 } as const;
       const rankDiff = rank[a.status] - rank[b.status];
       if (rankDiff !== 0) return rankDiff;
-      const aDate = a.startDate ?? a.createdAt;
-      const bDate = b.startDate ?? b.createdAt;
-      return aDate.localeCompare(bDate);
+      return a.sortDate.localeCompare(b.sortDate);
     }
-    case "most_recently_completed": {
-      const aDate = a.endDate ?? a.updatedAt;
-      const bDate = b.endDate ?? b.updatedAt;
-      return bDate.localeCompare(aDate);
-    }
+    case "most_recently_completed":
+      return b.sortDate.localeCompare(a.sortDate);
     case "longest_trip":
       return b.daysCount - a.daysCount || b.updatedAt.localeCompare(a.updatedAt);
     case "highest_cost":

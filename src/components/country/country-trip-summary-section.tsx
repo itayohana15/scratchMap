@@ -19,6 +19,7 @@ import { useCountryTripSummary } from "@/lib/hooks/use-country-trip-summary";
 import { createWorkspaceFromItineraryRecord, type CountryItineraryRecord } from "@/lib/itineraries";
 import { photoPublicUrl } from "@/lib/queries/photos";
 import type { Tables } from "@/lib/supabase/types";
+import { effectiveSortDate, hasExactDate } from "@/lib/trip-hub";
 import { buildTripComparison, buildTripStatistics } from "@/lib/trip-workspace";
 
 interface CountryTripSummarySectionProps {
@@ -27,6 +28,11 @@ interface CountryTripSummarySectionProps {
 }
 
 const ALL_TRIPS_VALUE = "__all__";
+
+function formatVisitDate(date: string | null, exact: boolean) {
+  if (!date) return "—";
+  return formatDate(date, exact ? "d בMMM yyyy" : "MMMM yyyy") ?? "—";
+}
 
 function ScoreBar({ label, value }: { label: string; value: number | null }) {
   return (
@@ -155,6 +161,14 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
         </div>
       </div>
 
+      {summary.stats.firstVisit ? (
+        <p className="text-sm text-muted-foreground">
+          ביקור ראשון: {formatVisitDate(summary.stats.firstVisit, summary.stats.firstVisitExact)}
+          {" · "}
+          ביקור אחרון: {formatVisitDate(summary.stats.mostRecentVisit, summary.stats.mostRecentVisitExact)}
+        </p>
+      ) : null}
+
       <div className="section-card space-y-3 p-4">
         <h3 className="font-heading text-lg font-semibold">דירוג ממוצע</h3>
         <div className="grid gap-2.5 md:grid-cols-2">
@@ -174,7 +188,7 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
         <div className="space-y-2">
           {summary.completed
             .slice()
-            .sort((a, b) => (b.startDate ?? "").localeCompare(a.startDate ?? ""))
+            .sort((a, b) => effectiveSortDate(b).localeCompare(effectiveSortDate(a)))
             .map((itinerary) => (
               <button
                 key={itinerary.id}
@@ -185,7 +199,7 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
                 <div className="min-w-0">
                   <p className="truncate font-medium text-foreground">{itinerary.title}</p>
                   <p className="text-xs text-muted-foreground">
-                    {formatDate(itinerary.startDate, "d בMMM yyyy")}
+                    {formatVisitDate(effectiveSortDate(itinerary), hasExactDate(itinerary))}
                   </p>
                 </div>
                 {summary.ratingsByItinerary.get(itinerary.id)?.overall != null ? (
@@ -304,7 +318,7 @@ function UpcomingTripsList({
           >
             <p className="truncate font-medium text-foreground">{itinerary.title}</p>
             <span className="shrink-0 text-xs text-muted-foreground">
-              {formatDate(itinerary.startDate, "d בMMM yyyy")}
+              {formatVisitDate(effectiveSortDate(itinerary), hasExactDate(itinerary))}
             </span>
           </button>
         ))}
@@ -322,7 +336,7 @@ function TripComparisonTable({
   country: Tables<"countries">;
   ratingsByItinerary: Map<string, Tables<"trip_ratings">>;
 }) {
-  const sorted = itineraries.slice().sort((a, b) => (a.startDate ?? "").localeCompare(b.startDate ?? ""));
+  const sorted = itineraries.slice().sort((a, b) => effectiveSortDate(a).localeCompare(effectiveSortDate(b)));
   const rows: Array<{ label: string; values: (itinerary: CountryItineraryRecord) => string }> = [
     {
       label: "דירוג כללי",
