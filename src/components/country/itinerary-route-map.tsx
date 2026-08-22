@@ -14,6 +14,7 @@ import { useCountryMiniMap } from "@/components/country/use-country-mini-map";
 import { formatCurrency } from "@/lib/format";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import { fetchDrivingRouteGeometry } from "@/lib/routing/osrm";
+import { actualMapItemIds } from "@/lib/trip-actual";
 import {
   buildMapLink,
   DAY_PART_LABELS,
@@ -42,6 +43,11 @@ interface MapStop {
   durationMinutes: number | null;
   approximatePrice: number | null;
   transportation: string;
+  // Live Trip Mode (Stage 4) — undefined for accommodation anchors and any
+  // day not currently being lived; when set, the marker gets a distinct
+  // style so a live-mode map visually separates completed/skipped stops
+  // from what's still ahead.
+  liveStatus?: "completed" | "skipped";
 }
 
 interface MapSegment {
@@ -295,6 +301,7 @@ function buildDayStops(day: TripItineraryDay, countryName: string) {
       durationMinutes: item.estimatedDurationMinutes,
       approximatePrice: item.approximatePrice,
       transportation: item.transportation || day.transportation || "תחבורה מקומית",
+      liveStatus: item.completed ? "completed" : item.skipped ? "skipped" : undefined,
     });
   }
 
@@ -924,16 +931,21 @@ function DayMapCanvas({
       for (const stop of stops) {
         const markerNode = document.createElement("button");
         markerNode.type = "button";
+        const isLiveCompleted = stop.liveStatus === "completed";
+        const isLiveSkipped = stop.liveStatus === "skipped";
         markerNode.className = cn(
           "flex min-w-[2.1rem] items-center justify-center gap-1 border px-2 py-1 text-[11px] font-semibold shadow-lg",
           getMarkerShapeClass(stop.kind),
-          activeStopKey === stop.key ? "ring-2 ring-offset-2" : ""
+          activeStopKey === stop.key ? "ring-2 ring-offset-2" : "",
+          isLiveCompleted || isLiveSkipped ? "opacity-50" : "",
+          isLiveSkipped ? "line-through" : ""
         );
         markerNode.style.background = surface;
         markerNode.style.borderColor = activeStopKey === stop.key ? accent : border;
         markerNode.style.color = foreground;
         markerNode.style.setProperty("--tw-ring-color", accent);
-        markerNode.textContent = `${stop.order}`;
+        markerNode.textContent = isLiveCompleted ? "✓" : isLiveSkipped ? "✕" : `${stop.order}`;
+        markerNode.setAttribute("aria-label", isLiveCompleted ? "הושלם" : isLiveSkipped ? "דולג" : `עצירה ${stop.order}`);
         markerNode.addEventListener("click", () => {
           onSelectStop(stop.key);
           if (onMarkerOpenDay) {
@@ -1264,13 +1276,29 @@ export function ItineraryDayRouteSection({
   const [fullscreenOpen, setFullscreenOpen] = useState(false);
   const [selectedStopKey, setSelectedStopKey] = useState<string | null>(null);
   const [selectedSegmentKey, setSelectedSegmentKey] = useState<string | null>(null);
-  const { hydratedDay, stops, segments, geocoding, routing } = useDayRouteData({
+  const [viewMode, setViewMode] = useState<"planned" | "actual">("planned");
+  const { hydratedDay, stops: plannedStops, segments: plannedSegments, geocoding, routing } = useDayRouteData({
     day,
     countryName,
     isoA2,
     onPatchDay,
     onPatchItem,
   });
+
+  const hasActualData = hydratedDay.items.some((item) => item.completed || item.skipped || item.spontaneous);
+  const visibleItemIds = useMemo(() => actualMapItemIds(hydratedDay), [hydratedDay]);
+  const stops = useMemo(
+    () =>
+      viewMode === "planned"
+        ? plannedStops
+        : plannedStops.filter((stop) => stop.itemId == null || visibleItemIds.has(stop.itemId)),
+    [viewMode, plannedStops, visibleItemIds]
+  );
+  const segments = useMemo(() => {
+    if (viewMode === "planned") return plannedSegments;
+    const visibleKeys = new Set(stops.map((stop) => stop.key));
+    return plannedSegments.filter((segment) => visibleKeys.has(segment.from.key) && visibleKeys.has(segment.to.key));
+  }, [viewMode, plannedSegments, stops]);
 
   useEffect(() => {
     if (!focusItemId) return;
@@ -1333,6 +1361,23 @@ export function ItineraryDayRouteSection({
               <LoaderCircle className="size-3.5 animate-spin" />
               מחשבים מסלול
             </Badge>
+          ) : null}
+          {hasActualData ? (
+            <div className="flex items-center gap-1 rounded-full border border-border/60 bg-background/60 p-1">
+              {(["planned", "actual"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setViewMode(mode)}
+                  className={cn(
+                    "rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+                    viewMode === mode ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted/60"
+                  )}
+                >
+                  {mode === "planned" ? "מתוכנן" : "בפועל"}
+                </button>
+              ))}
+            </div>
           ) : null}
           <Button variant="outline" size="sm" onClick={() => setMapCollapsed((current) => !current)}>
             {mapCollapsed ? <Expand className="size-4" /> : <Shrink className="size-4" />}
@@ -1439,6 +1484,9 @@ export function ItineraryTripSummarySection({
   const [showAccommodations, setShowAccommodations] = useState(true);
   const [showActivities, setShowActivities] = useState(true);
   const [showTransport, setShowTransport] = useState(true);
+  // Overview (cities/bases + major movements) vs. detail (every place) —
+  // spec §6: default to overview, avoid cluttering with hundreds of markers.
+  const [mapLevel, setMapLevel] = useState<"overview" | "detail">("overview");
   const [selectedSegmentKey, setSelectedSegmentKey] = useState<string | null>(null);
   const { hydratedDays, stops, segments, geocoding, routing } = useTripRouteData({
     days,
@@ -1477,6 +1525,27 @@ export function ItineraryTripSummarySection({
       ),
     [filteredStops, segments, visibleDayIds]
   );
+
+  // Overview collapses to one marker per distinct accommodation base
+  // (city-level), skipping consecutive repeats of the same base — the
+  // "major movements only" view. Detail is the existing full stop set,
+  // unchanged.
+  const levelStops = useMemo(() => {
+    if (mapLevel === "detail") return filteredStops;
+    const accommodationStops = filteredStops.filter((stop) => stop.kind === "accommodation");
+    const deduped: typeof accommodationStops = [];
+    for (const stop of accommodationStops) {
+      if (deduped.at(-1)?.name === stop.name) continue;
+      deduped.push(stop);
+    }
+    return deduped;
+  }, [filteredStops, mapLevel]);
+
+  const levelSegments = useMemo(() => {
+    if (mapLevel === "detail") return filteredSegments;
+    const levelKeys = new Set(levelStops.map((stop) => stop.key));
+    return filteredSegments.filter((segment) => levelKeys.has(segment.from.key) && levelKeys.has(segment.to.key));
+  }, [filteredSegments, levelStops, mapLevel]);
 
   const totalDistanceKm = filteredSegments.reduce((sum, segment) => sum + (segment.distanceKm ?? 0), 0);
   const totalTravelMinutes = filteredSegments.reduce((sum, segment) => sum + (segment.durationMinutes ?? 0), 0);
@@ -1534,6 +1603,13 @@ export function ItineraryTripSummarySection({
           <Button variant={showTransport ? "secondary" : "outline"} size="sm" onClick={() => setShowTransport((current) => !current)}>
             תחבורה
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setMapLevel((current) => (current === "overview" ? "detail" : "overview"))}
+          >
+            {mapLevel === "overview" ? "הצג את כל המקומות" : "תצוגת ערים בלבד"}
+          </Button>
         </div>
       </div>
 
@@ -1563,8 +1639,8 @@ export function ItineraryTripSummarySection({
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(22rem,0.95fr)]">
         <DayMapCanvas
           mapId={summaryMapId}
-          stops={filteredStops}
-          segments={filteredSegments.map((segment) => ({
+          stops={levelStops}
+          segments={levelSegments.map((segment) => ({
             ...segment,
             sourceLabel: `Day ${segment.dayNumber}`,
           }))}
@@ -1572,12 +1648,12 @@ export function ItineraryTripSummarySection({
           activeStopKey={null}
           activeSegmentKey={selectedSegmentKey}
           onSelectStop={(stopKey) => {
-            const stop = filteredStops.find((entry) => entry.key === stopKey);
+            const stop = levelStops.find((entry) => entry.key === stopKey);
             if (stop) onOpenDay(stop.dayId);
           }}
           onSelectSegment={(segmentKey) => {
             setSelectedSegmentKey(segmentKey);
-            const segment = filteredSegments.find((entry) => entry.key === segmentKey);
+            const segment = levelSegments.find((entry) => entry.key === segmentKey);
             if (segment) onOpenDay(segment.dayId);
           }}
         />

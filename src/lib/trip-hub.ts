@@ -5,6 +5,7 @@ import {
   type CountryItineraryRecord,
   type CountryItineraryStatus,
 } from "@/lib/itineraries";
+import { getDestinationDateString } from "@/lib/live-trip-time";
 import type { Status } from "@/lib/supabase/types";
 import {
   buildTripComparison,
@@ -15,8 +16,6 @@ import {
   type TripItineraryItem,
   type TripStatistics,
 } from "@/lib/trip-workspace";
-
-export const TRIP_HUB_TODAY = "2026-08-19";
 
 export type TripHubStatus = "planning" | "upcoming" | "active" | "completed" | "archived";
 export type TripDurationFilter = "all" | "short" | "medium" | "long" | "extended";
@@ -174,18 +173,19 @@ function determinePlanningCompletion(itinerary: CountryItineraryRecord, days: Tr
 function determineCurrentDay(
   status: TripHubStatus,
   startDate: string | null,
-  days: TripItineraryDay[]
+  days: TripItineraryDay[],
+  today: string
 ) {
   if (status !== "active" || !startDate) {
     return { currentDayNumber: null, currentDay: null, visitedDayCount: status === "completed" ? days.length : 0 };
   }
 
   const currentDayNumber = Math.max(
-    differenceInCalendarDays(parseISO(TRIP_HUB_TODAY), parseISO(startDate)) + 1,
+    differenceInCalendarDays(parseISO(today), parseISO(startDate)) + 1,
     1
   );
   const currentDay =
-    days.find((day) => day.date === TRIP_HUB_TODAY) ??
+    days.find((day) => day.date === today) ??
     days.find((day) => day.dayNumber === currentDayNumber) ??
     null;
 
@@ -205,13 +205,13 @@ function determineNextActivity(day: TripItineraryDay | null) {
   );
 }
 
-function determineVisitedCities(status: TripHubStatus, days: TripItineraryDay[]) {
+function determineVisitedCities(status: TripHubStatus, days: TripItineraryDay[], today: string) {
   if (status === "planning" || status === "upcoming") return [];
 
   if (status === "active") {
     return uniqueStrings(
       days
-        .filter((day) => !day.date || day.date <= TRIP_HUB_TODAY)
+        .filter((day) => !day.date || day.date <= today)
         .map((day) => day.cityRegion)
     );
   }
@@ -219,9 +219,9 @@ function determineVisitedCities(status: TripHubStatus, days: TripItineraryDay[])
   return uniqueStrings(days.map((day) => day.cityRegion));
 }
 
-function determineCountdownDays(status: TripHubStatus, startDate: string | null) {
+function determineCountdownDays(status: TripHubStatus, startDate: string | null, today: string) {
   if (status !== "upcoming" || !startDate) return null;
-  return Math.max(differenceInCalendarDays(parseISO(startDate), parseISO(TRIP_HUB_TODAY)), 0);
+  return Math.max(differenceInCalendarDays(parseISO(startDate), parseISO(today)), 0);
 }
 
 function determineJournalCount(workspace: CountryTripWorkspaceState) {
@@ -249,13 +249,13 @@ function determineReservations(days: TripItineraryDay[]) {
 
 function determineTransportBookings(workspace: CountryTripWorkspaceState) {
   const transportBookings = workspace.bookings.filter(
-    (booking) => booking.type === "flight" || booking.type === "transport"
+    (booking) => booking.type === "flight" || booking.type === "train" || booking.type === "bus" || booking.type === "ferry"
   );
 
   return {
     total: transportBookings.length,
     confirmed: transportBookings.filter(
-      (booking) => booking.status === "confirmed" || booking.status === "completed"
+      (booking) => booking.status === "booked" || booking.status === "reserved"
     ).length,
   };
 }
@@ -279,15 +279,17 @@ export function buildTripHubTrip(
   const countryName = country?.name ?? itinerary.isoA2.toUpperCase();
   const workspace = createWorkspaceFromItineraryRecord(itinerary, countryName);
   const status = mapItineraryStatus(itinerary.status);
+  const today = getDestinationDateString(itinerary.isoA2);
   const destinationFallback = isMeaningfulText(workspace.preferences.accommodationArea)
     ? workspace.preferences.accommodationArea.trim()
     : countryName;
   const routeCities = determineRouteCities(workspace.itineraryDays, destinationFallback);
-  const visitedCityNames = determineVisitedCities(status, workspace.itineraryDays);
+  const visitedCityNames = determineVisitedCities(status, workspace.itineraryDays, today);
   const { currentDayNumber, currentDay, visitedDayCount } = determineCurrentDay(
     status,
     itinerary.startDate,
-    workspace.itineraryDays
+    workspace.itineraryDays,
+    today
   );
   const nextActivity = determineNextActivity(currentDay);
   const reservations = determineReservations(workspace.itineraryDays);
@@ -299,7 +301,7 @@ export function buildTripHubTrip(
   const hasStarted =
     status === "completed" ||
     status === "active" ||
-    Boolean(itinerary.startDate && itinerary.startDate <= TRIP_HUB_TODAY);
+    Boolean(itinerary.startDate && itinerary.startDate <= today);
 
   return {
     id: itinerary.id,
@@ -327,7 +329,7 @@ export function buildTripHubTrip(
     visitedCityNames,
     routePreviewCities: routeCities.slice(0, 4),
     cityCount: routeCities.length,
-    countdownDays: determineCountdownDays(status, itinerary.startDate),
+    countdownDays: determineCountdownDays(status, itinerary.startDate, today),
     currentDayNumber,
     visitedDayCount:
       status === "completed" || (status === "archived" && hasStarted)
@@ -339,7 +341,7 @@ export function buildTripHubTrip(
     itineraryDaysGenerated: workspace.itineraryDays.length,
     totalBookings: workspace.bookings.length,
     confirmedBookings: workspace.bookings.filter(
-      (booking) => booking.status === "confirmed" || booking.status === "completed"
+      (booking) => booking.status === "booked" || booking.status === "reserved"
     ).length,
     transportBookingsTotal: transportBookings.total,
     transportBookingsConfirmed: transportBookings.confirmed,

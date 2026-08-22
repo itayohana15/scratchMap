@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { Sparkles } from "lucide-react";
+
 import { AttractionActionBar } from "@/components/country/attraction-modal/action-bar";
 import { DescriptionSection } from "@/components/country/attraction-modal/description";
 import { AttractionHero } from "@/components/country/attraction-modal/hero";
@@ -10,12 +12,20 @@ import { ItineraryIntegrationSection } from "@/components/country/attraction-mod
 import { NearbySection } from "@/components/country/attraction-modal/nearby";
 import { PersonalLogSection } from "@/components/country/attraction-modal/personal-log";
 import { QuickInfoGrid } from "@/components/country/attraction-modal/quick-info-grid";
+import { RecommendationFeedbackButtons } from "@/components/country/recommendation-feedback-buttons";
 import { SafetySection } from "@/components/country/attraction-modal/safety";
 import { TravelInfoSection } from "@/components/country/attraction-modal/travel-info";
 import { useAttractionModalData } from "@/components/country/attraction-modal/use-attraction-modal-data";
 import type { useCountryTripWorkspace } from "@/components/country/use-country-trip-workspace";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { usePreferenceProfile } from "@/lib/queries/preference-profile";
+import { useAllRecommendationFeedback } from "@/lib/queries/recommendation-feedback";
+import {
+  aggregateFeedbackByPlace,
+  computeRecommendationScore,
+  explainRecommendation,
+} from "@/lib/preference-learning";
 import { buildMapLink } from "@/lib/trip-workspace";
 import type { CountryTripWorkspaceState, TripRecommendation } from "@/lib/trip-workspace";
 
@@ -55,12 +65,25 @@ export function AttractionModal({
     workspace
   );
   const [activeTab, setActiveTab] = useState<ModalTab>("info");
+  const { data: preferenceProfile } = usePreferenceProfile();
+  const { data: recommendationFeedback = [] } = useAllRecommendationFeedback();
 
   useEffect(() => {
     if (open) setActiveTab("info");
   }, [open, recommendation?.id]);
 
   if (!recommendation) return null;
+
+  const explanation = explainRecommendation(
+    recommendation,
+    computeRecommendationScore(recommendation, {
+      explicitPreferences: preferenceProfile?.explicit_preferences ?? {},
+      inferredPreferences: {},
+      feedbackByPlaceKey: aggregateFeedbackByPlace(recommendationFeedback),
+      alreadyVisited: new Map(),
+    }),
+    preferenceProfile?.explicit_preferences ?? {}
+  );
 
   const isSaved = workspace.recommendations.some((item) => item.id === recommendation.id);
   const isInItinerary = placement != null;
@@ -152,6 +175,16 @@ export function AttractionModal({
                 wikipedia={wikipedia.data}
                 wikipediaLoading={wikipedia.isLoading}
               />
+              <div className="section-card space-y-2 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="size-4 text-primary" />
+                    <p className="text-sm font-medium text-foreground">למה זה מתאים לי</p>
+                  </div>
+                  <RecommendationFeedbackButtons place={recommendation} category={recommendation.category} tripId={null} />
+                </div>
+                <p className="text-sm leading-6 text-muted-foreground">{explanation}</p>
+              </div>
             </TabsContent>
 
             <TabsContent value="trip" className="space-y-4 pt-0">

@@ -390,15 +390,31 @@ export function useCountryTripWorkspace(countryId: string, countryName: string) 
         setWorkspace(normalizeWorkspace(nextWorkspace, countryName));
       },
       createBooking(): TripBooking {
+        const now = new Date().toISOString();
         return {
           id: createId("booking"),
-          name: "",
-          type: "activity",
-          date: "",
-          time: "",
-          reference: "",
-          status: "pending",
+          tripId: "",
+          dayId: null,
+          itineraryItemId: null,
+          type: "other",
+          title: "",
+          provider: "",
+          confirmationNumber: "",
+          bookingReference: "",
+          startDateTime: "",
+          endDateTime: "",
+          location: "",
+          status: "not_booked",
+          paymentStatus: "unpaid",
+          amountOriginal: null,
+          amountOriginalCurrency: null,
+          amountConverted: null,
+          exchangeRate: null,
+          rateTimestamp: null,
+          documentIds: [],
           notes: "",
+          createdAt: now,
+          updatedAt: now,
         };
       },
       createMemory(): TripMemoryPhoto {

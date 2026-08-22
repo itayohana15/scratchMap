@@ -29,6 +29,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
+import { photoPublicUrl, usePhotosForItineraries } from "@/lib/queries/photos";
 import { useTripHubTrips } from "@/lib/queries/trip-hub";
 import {
   getTripDurationBucket,
@@ -265,13 +266,26 @@ function UpcomingTripCard({
 
 function HistoryTripCard({
   trip,
+  favoritePhotoUrl,
   onOpen,
   onOpenCountryPage,
 }: {
   trip: TripHubTrip;
+  favoritePhotoUrl?: string;
   onOpen: (trip: TripHubTrip) => void;
   onOpenCountryPage: (trip: TripHubTrip) => void;
 }) {
+  const bannerOverlay = (
+    <div className="flex h-full items-start justify-between gap-3 p-4 text-white">
+      <Badge className={cn("border", statusBadgeClass(trip.status))}>
+        {trip.status === "active" ? "בטיול עכשיו" : TRIP_HUB_STATUS_LABELS[trip.status]}
+      </Badge>
+      <div className="rounded-full bg-black/25 px-3 py-1 text-xs backdrop-blur-sm">
+        {headlineForTrip(trip)}
+      </div>
+    </div>
+  );
+
   return (
     <article
       onClick={() => onOpen(trip)}
@@ -282,23 +296,23 @@ function HistoryTripCard({
         trip.status === "archived" && "opacity-80"
       )}
     >
-      <CountryBanner
-        isoA2={trip.isoA2}
-        countryName={trip.countryName}
-        className="h-40 rounded-none"
-        showCaption={false}
-        scrimClassName="bg-gradient-to-t from-black/65 via-black/10 to-transparent"
-        overlay={
-          <div className="flex h-full items-start justify-between gap-3 p-4 text-white">
-            <Badge className={cn("border", statusBadgeClass(trip.status))}>
-              {trip.status === "active" ? "בטיול עכשיו" : TRIP_HUB_STATUS_LABELS[trip.status]}
-            </Badge>
-            <div className="rounded-full bg-black/25 px-3 py-1 text-xs backdrop-blur-sm">
-              {headlineForTrip(trip)}
-            </div>
-          </div>
-        }
-      />
+      {favoritePhotoUrl ? (
+        <div className="relative h-40 w-full overflow-hidden bg-muted">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={favoritePhotoUrl} alt="" className="absolute inset-0 size-full object-cover" />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-black/10 to-transparent" />
+          {bannerOverlay}
+        </div>
+      ) : (
+        <CountryBanner
+          isoA2={trip.isoA2}
+          countryName={trip.countryName}
+          className="h-40 rounded-none"
+          showCaption={false}
+          scrimClassName="bg-gradient-to-t from-black/65 via-black/10 to-transparent"
+          overlay={bannerOverlay}
+        />
+      )}
 
       <div className="space-y-4 p-5">
         <div>
@@ -386,7 +400,18 @@ function HistoryTripCard({
         ) : null}
 
         {trip.status === "active" && trip.currentDay ? (
-          <div className="space-y-3 rounded-2xl border border-primary/15 bg-primary/6 p-4">
+          <div className="space-y-3 rounded-2xl border border-primary/30 bg-primary/8 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Badge variant="secondary" className="gap-1.5">
+                <Sparkles className="size-3.5" />
+                בטיול עכשיו
+              </Badge>
+              {trip.currentDayNumber != null ? (
+                <span className="text-sm font-medium text-foreground">
+                  יום {trip.currentDayNumber} / {trip.daysCount}
+                </span>
+              ) : null}
+            </div>
             <div className="grid gap-3 sm:grid-cols-3">
               <div>
                 <p className="text-xs text-muted-foreground">העיר של היום</p>
@@ -463,12 +488,27 @@ export function TripsPageClient() {
   const router = useRouter();
   const { data: trips = [], isLoading } = useTripHubTrips();
 
+  const completedTripIds = useMemo(
+    () => trips.filter((trip) => trip.status === "completed").map((trip) => trip.id),
+    [trips]
+  );
+  const { data: tripPhotos = [] } = usePhotosForItineraries(completedTripIds);
+  const favoritePhotoByTrip = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const photo of tripPhotos) {
+      if (!photo.favorite || !photo.itinerary_id || map.has(photo.itinerary_id)) continue;
+      map.set(photo.itinerary_id, photoPublicUrl(photo.storage_path));
+    }
+    return map;
+  }, [tripPhotos]);
+
   const [filter, setFilter] = useState<TripFilter>("all");
   const [search, setSearch] = useState("");
   const [yearFilter, setYearFilter] = useState("all");
   const [countryFilter, setCountryFilter] = useState("all");
   const [durationFilter, setDurationFilter] = useState<TripDurationFilter>("all");
   const [styleFilter, setStyleFilter] = useState("all");
+  const [ratingFilter, setRatingFilter] = useState("all");
   const [sortBy, setSortBy] = useState<SortOption>("nearest_upcoming");
   const [viewMode, setViewMode] = useState<ViewMode>("cards");
   const [selectedTripMeta, setSelectedTripMeta] = useState<{ isoA2: string; countryName: string } | null>(
@@ -540,8 +580,9 @@ export function TripsPageClient() {
           durationFilter === "all" ? true : getTripDurationBucket(trip.daysCount) === durationFilter
         )
         .filter((trip) => (styleFilter === "all" ? true : trip.tripStyle === styleFilter))
+        .filter((trip) => (ratingFilter === "all" ? true : (trip.personalRating ?? 0) >= Number(ratingFilter)))
         .sort((a, b) => compareTrips(a, b, sortBy)),
-    [countryFilter, durationFilter, filter, normalizedSearch, sortBy, styleFilter, trips, yearFilter]
+    [countryFilter, durationFilter, filter, normalizedSearch, ratingFilter, sortBy, styleFilter, trips, yearFilter]
   );
 
   const featuredUpcomingTrips = useMemo(
@@ -734,6 +775,22 @@ export function TripsPageClient() {
               </SelectContent>
             </Select>
 
+            <Select value={ratingFilter} onValueChange={(value) => setRatingFilter(value ?? "all")}>
+              <SelectTrigger className="w-full">
+                <span className="flex flex-1 text-right">
+                  {ratingFilter === "all" ? "כל הדירוגים" : `${ratingFilter}+ כוכבים`}
+                </span>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">כל הדירוגים</SelectItem>
+                {[9, 7, 5].map((value) => (
+                  <SelectItem key={value} value={value.toString()}>
+                    {value}+ כוכבים
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
             <Select value={sortBy} onValueChange={(value) => setSortBy(value as SortOption)}>
               <SelectTrigger className="w-full">
                 <span className="flex flex-1 text-right">{SORT_LABELS[sortBy]}</span>
@@ -812,6 +869,7 @@ export function TripsPageClient() {
                       <HistoryTripCard
                         key={trip.id}
                         trip={trip}
+                        favoritePhotoUrl={favoritePhotoByTrip.get(trip.id)}
                         onOpen={openTrip}
                         onOpenCountryPage={openCountryPage}
                       />

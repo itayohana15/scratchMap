@@ -51,8 +51,20 @@ export type ExpenseCategory =
   | "shopping"
   | "other";
 
-export type BookingType = "flight" | "hotel" | "restaurant" | "activity" | "transport";
-export type BookingStatus = "pending" | "confirmed" | "completed";
+export type BookingType =
+  | "flight"
+  | "accommodation"
+  | "train"
+  | "bus"
+  | "ferry"
+  | "car_rental"
+  | "attraction"
+  | "restaurant"
+  | "event"
+  | "tour"
+  | "other";
+export type BookingStatus = "not_required" | "not_booked" | "booking_needed" | "reserved" | "booked" | "cancelled";
+export type PaymentStatus = "unpaid" | "partially_paid" | "paid" | "refunded";
 
 export interface TripPreferences {
   startDate: string;
@@ -129,6 +141,13 @@ export interface TripItineraryItem {
   shortDescription: string;
   slot: DayPart;
   plannedStartTime: string;
+  // Live Trip Mode delay/reorder response (Stage 4) — a temporary, in-day
+  // rescheduling estimate distinct from BOTH `plannedStartTime` (the
+  // original plan, never overwritten — spec: planned data must never be
+  // destroyed) and `actualStartTime` (only set once the activity truly
+  // happens). Null once the item completes/is skipped, or when nothing has
+  // shifted it.
+  liveScheduledStartTime: string | null;
   actualStartTime: string;
   actualEndTime: string;
   estimatedDurationMinutes: number | null;
@@ -152,7 +171,10 @@ export interface TripItineraryItem {
   priority: ItemPriority;
   fixedTime: boolean;
   completed: boolean;
+  completedAt: string | null;
   skipped: boolean;
+  skippedAt: string | null;
+  skipReason: string | null;
   plannedNotes: string;
   journalNotes: string;
   mapLink: string;
@@ -165,6 +187,17 @@ export interface TripItineraryItem {
   personalRating: number | null;
   wouldVisitAgain: boolean | null;
   actualDurationMinutes: number | null;
+  // Stage 5 — Planned vs Actual.
+  favorite: boolean;
+  // Set when the traveler ate/visited somewhere different than planned
+  // (e.g. the planned restaurant was full) — `name`/`location` stay the
+  // planned place untouched, this is the actual one.
+  actualPlaceName: string;
+  // Forward-compatible marker for a future "replaced" item-status distinct
+  // from skipped; not yet set by any replacement flow (Stage 4's
+  // applyDeterministicReplacement/mergeLiveReplanResult still fully remove
+  // the old item rather than flagging it — see Stage 5 plan's scope note).
+  replaced: boolean;
 }
 
 export interface TripItineraryDay {
@@ -192,17 +225,104 @@ export interface TripItineraryDay {
   restWindow: string;
   transportSegments: string[];
   items: TripItineraryItem[];
+  // Day-end flow (Stage 4) — intentionally minimal, not the full post-trip
+  // journal (that's a later stage).
+  favoriteMoment: string;
+  dayEndNote: string;
+  dayCompletedAt: string | null;
+  // Stage 5 — day rating + actual accommodation (if it differed from plan).
+  dayRating: number | null;
+  dayRatingCategories: Partial<Record<"activities" | "food" | "pace" | "weather", number>>;
+  actualAccommodation: string;
 }
 
 export interface TripBooking {
   id: string;
-  name: string;
+  tripId: string;
+  dayId: string | null;
+  itineraryItemId: string | null;
   type: BookingType;
-  date: string;
-  time: string;
-  reference: string;
+  title: string;
+  provider: string;
+  confirmationNumber: string;
+  bookingReference: string;
+  startDateTime: string;
+  endDateTime: string;
+  location: string;
   status: BookingStatus;
+  paymentStatus: PaymentStatus;
+  amountOriginal: number | null;
+  amountOriginalCurrency: string | null;
+  amountConverted: number | null;
+  exchangeRate: number | null;
+  rateTimestamp: string | null;
+  documentIds: string[];
   notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TripDocumentType =
+  | "boarding_pass"
+  | "flight_confirmation"
+  | "hotel_confirmation"
+  | "train_ticket"
+  | "attraction_ticket"
+  | "restaurant_reservation"
+  | "insurance"
+  | "passport"
+  | "visa"
+  | "car_rental_confirmation"
+  | "other";
+
+// Metadata only — the file itself lives in Supabase Storage (private bucket,
+// accessed only via a server-minted signed URL). This record is safe to keep
+// in the same workspace_snapshot JSONB blob as everything else.
+export interface TripDocument {
+  id: string;
+  tripId: string;
+  bookingId: string | null;
+  itineraryItemId: string | null;
+  type: TripDocumentType;
+  title: string;
+  fileName: string;
+  mimeType: string;
+  notes: string;
+  isSensitive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ChecklistCategory =
+  | "documents"
+  | "money"
+  | "health"
+  | "transport"
+  | "accommodation"
+  | "bookings"
+  | "packing"
+  | "connectivity"
+  | "home"
+  | "other";
+
+export interface TripChecklistItem {
+  id: string;
+  tripId: string;
+  title: string;
+  category: ChecklistCategory;
+  dueDate: string | null;
+  completed: boolean;
+  source: "auto" | "user";
+  // Stable key for auto-generated items (e.g. "flight-passport") so
+  // regeneration can update an existing item in place instead of duplicating
+  // it — user items always have autoKey: null and are never touched by
+  // regeneration.
+  autoKey: string | null;
+  linkedBookingId: string | null;
+  linkedDocumentId: string | null;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface TripExpense {
@@ -210,8 +330,16 @@ export interface TripExpense {
   category: ExpenseCategory;
   label: string;
   amount: number;
+  // Additive currency context (Stage 4) — `amount` keeps its existing
+  // meaning (the displayed/converted total) so the legacy budget UI in
+  // country-trip-workspace.tsx keeps working unchanged; these are optional
+  // extra fields, not a rename.
+  amountOriginalCurrency: string | null;
+  exchangeRate: number | null;
+  rateTimestamp: string | null;
   date: string;
   dayId: string | null;
+  itemId: string | null;
   notes: string;
 }
 
@@ -219,6 +347,7 @@ export interface TripJournalEntry {
   id: string;
   dayId: string | null;
   date: string | null;
+  time: string;
   city: string | null;
   place: string | null;
   title: string;
@@ -226,9 +355,57 @@ export interface TripJournalEntry {
   mood: number | null;
   rating: number | null;
   photoIds: string[];
+  // Stage 5 additions.
+  tags: string[];
+  activityId: string | null;
+  favoriteMemory: boolean;
   createdAt: string;
   updatedAt: string;
 }
+
+export type PackingCategory =
+  | "documents"
+  | "clothing"
+  | "shoes"
+  | "electronics"
+  | "health"
+  | "toiletries"
+  | "weather"
+  | "outdoor"
+  | "beach"
+  | "formal_nightlife"
+  | "travel_accessories"
+  | "medication"
+  | "special_activities"
+  | "other";
+
+export interface PackingItem {
+  id: string;
+  category: PackingCategory;
+  name: string;
+  quantity: number;
+  packed: boolean;
+  required: boolean;
+  source: "automatic" | "user";
+  notes: string;
+}
+
+export const PACKING_CATEGORY_LABELS: Record<PackingCategory, string> = {
+  documents: "מסמכים",
+  clothing: "בגדים",
+  shoes: "נעליים",
+  electronics: "אלקטרוניקה",
+  health: "בריאות",
+  toiletries: "טואלטיקה",
+  weather: "מזג אוויר",
+  outdoor: "פעילות בחוץ",
+  beach: "חוף",
+  formal_nightlife: "אירועים/חיי לילה",
+  travel_accessories: "אביזרי נסיעה",
+  medication: "תרופות",
+  special_activities: "פעילויות מיוחדות",
+  other: "אחר",
+};
 
 export interface TripMemoryPhoto {
   id: string;
@@ -255,6 +432,27 @@ export interface TripSummary {
   recommendationsForOthers: string;
 }
 
+export type LiveTripEventType =
+  | "activity_completed"
+  | "activity_skipped"
+  | "delay_reported"
+  | "activity_replaced"
+  | "route_changed"
+  | "spontaneous_activity_added"
+  | "day_completed";
+
+// Meaningful live-trip actions only — never UI-only noise (tab switches,
+// map pans, etc). Useful later for post-trip history/summary.
+export interface LiveTripEvent {
+  id: string;
+  tripId: string;
+  dayId: string | null;
+  itemId: string | null;
+  type: LiveTripEventType;
+  timestamp: string;
+  detail: string;
+}
+
 export interface CountryTripWorkspaceState {
   version: 2;
   tripStatus: TripPhase;
@@ -262,12 +460,19 @@ export interface CountryTripWorkspaceState {
   recommendations: TripRecommendation[];
   itineraryDays: TripItineraryDay[];
   bookings: TripBooking[];
+  documents: TripDocument[];
+  checklist: TripChecklistItem[];
   estimatedExpenses: TripExpense[];
   actualExpenses: TripExpense[];
   journalEntries: TripJournalEntry[];
   memories: TripMemoryPhoto[];
+  liveEvents: LiveTripEvent[];
+  packingList: PackingItem[];
   summary: TripSummary;
   lastAiPlanSummary: string;
+  // Stage 6 — AI Trip Story, regenerated on demand only, never auto-invoked.
+  tripStory: string;
+  tripStoryGeneratedAt: string | null;
 }
 
 export interface TripStatistics {
@@ -309,9 +514,26 @@ export interface AiItineraryRequest {
   recommendations: TripRecommendation[];
   bookings: TripBooking[];
   existingDays: TripItineraryDay[];
-  regenerationScope?: "full" | "day" | "activity" | "optimize_route" | "recalculate_costs";
+  regenerationScope?:
+    | "full"
+    | "day"
+    | "activity"
+    | "optimize_route"
+    | "recalculate_costs"
+    | "live_replan"
+    | "live_replace_item";
   targetDayId?: string | null;
   targetItemId?: string | null;
+  // Live Trip Mode (Stage 4): a free-text traveler instruction ("אני עייף",
+  // "המקום סגור") threaded into the prompt only for regenerationScope ===
+  // "live_replan" — see buildPrompt's liveReplanGuidance block.
+  liveInstruction?: string | null;
+  // Stage 7 — a compact, capped summary of explicit + accepted-learned
+  // preferences (buildPersonalizationSummary in preference-learning.ts),
+  // explicitly secondary to the trip-specific preferences already stated
+  // above it in the prompt. Optional and safe to omit on any failure —
+  // generation must never depend on personalization succeeding.
+  personalizationSummary?: string | null;
 }
 
 export interface AiGeneratedItem {
@@ -453,16 +675,59 @@ export const EXPENSE_CATEGORY_LABELS: Record<ExpenseCategory, string> = {
 
 export const BOOKING_TYPE_LABELS: Record<BookingType, string> = {
   flight: "טיסה",
-  hotel: "מלון",
+  accommodation: "לינה",
+  train: "רכבת",
+  bus: "אוטובוס",
+  ferry: "מעבורת",
+  car_rental: "השכרת רכב",
+  attraction: "אטרקציה",
   restaurant: "מסעדה",
-  activity: "פעילות",
-  transport: "תחבורה",
+  event: "אירוע",
+  tour: "סיור",
+  other: "אחר",
 };
 
 export const BOOKING_STATUS_LABELS: Record<BookingStatus, string> = {
-  pending: "ממתין",
-  confirmed: "מאושר",
-  completed: "בוצע",
+  not_required: "לא נדרש",
+  not_booked: "לא הוזמן",
+  booking_needed: "דרושה הזמנה",
+  reserved: "משוריין",
+  booked: "הוזמן",
+  cancelled: "בוטל",
+};
+
+export const PAYMENT_STATUS_LABELS: Record<PaymentStatus, string> = {
+  unpaid: "לא שולם",
+  partially_paid: "שולם חלקית",
+  paid: "שולם",
+  refunded: "הוחזר",
+};
+
+export const TRIP_DOCUMENT_TYPE_LABELS: Record<TripDocumentType, string> = {
+  boarding_pass: "כרטיס עלייה למטוס",
+  flight_confirmation: "אישור טיסה",
+  hotel_confirmation: "אישור מלון",
+  train_ticket: "כרטיס רכבת",
+  attraction_ticket: "כרטיס לאטרקציה",
+  restaurant_reservation: "הזמנת מסעדה",
+  insurance: "ביטוח נסיעות",
+  passport: "דרכון",
+  visa: "ויזה",
+  car_rental_confirmation: "אישור השכרת רכב",
+  other: "אחר",
+};
+
+export const CHECKLIST_CATEGORY_LABELS: Record<ChecklistCategory, string> = {
+  documents: "מסמכים",
+  money: "כסף",
+  health: "בריאות",
+  transport: "תחבורה",
+  accommodation: "לינה",
+  bookings: "הזמנות",
+  packing: "אריזה",
+  connectivity: "טלפון/אינטרנט",
+  home: "בית",
+  other: "אחר",
 };
 
 export const DEFAULT_TAB_ORDER: TripWorkspaceTab[] = [
@@ -554,6 +819,7 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     shortDescription: "",
     slot,
     plannedStartTime: "",
+    liveScheduledStartTime: null,
     actualStartTime: "",
     actualEndTime: "",
     estimatedDurationMinutes: null,
@@ -577,7 +843,10 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     priority: "preferred",
     fixedTime: false,
     completed: false,
+    completedAt: null,
     skipped: false,
+    skippedAt: null,
+    skipReason: null,
     plannedNotes: "",
     journalNotes: "",
     mapLink: "",
@@ -589,6 +858,41 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     personalRating: null,
     wouldVisitAgain: null,
     actualDurationMinutes: null,
+    favorite: false,
+    actualPlaceName: "",
+    replaced: false,
+  };
+}
+
+// Shared completed/skipped mutual-exclusion helpers (Stage 4) — the one
+// place this dialog already handled it inline did so ad hoc; this is the
+// single source of truth new Live Mode code should use instead of
+// duplicating the toggle logic again.
+export function markItemCompleted(
+  item: TripItineraryItem,
+  patch?: Partial<Pick<TripItineraryItem, "actualCost" | "actualStartTime" | "actualEndTime" | "journalNotes" | "personalRating">>
+): TripItineraryItem {
+  return {
+    ...item,
+    ...patch,
+    completed: true,
+    completedAt: new Date().toISOString(),
+    skipped: false,
+    skippedAt: null,
+    skipReason: null,
+    liveScheduledStartTime: null,
+  };
+}
+
+export function markItemSkipped(item: TripItineraryItem, reason: string | null = null): TripItineraryItem {
+  return {
+    ...item,
+    skipped: true,
+    skippedAt: new Date().toISOString(),
+    skipReason: reason,
+    completed: false,
+    completedAt: null,
+    liveScheduledStartTime: null,
   };
 }
 
@@ -641,6 +945,12 @@ export function createEmptyDay(dayNumber: number, date = ""): TripItineraryDay {
     restWindow: "",
     transportSegments: [],
     items: [],
+    favoriteMoment: "",
+    dayEndNote: "",
+    dayCompletedAt: null,
+    dayRating: null,
+    dayRatingCategories: {},
+    actualAccommodation: "",
   };
 }
 
@@ -670,10 +980,16 @@ export function createDefaultWorkspace(countryName: string): CountryTripWorkspac
     recommendations: [],
     itineraryDays: [createEmptyDay(1), createEmptyDay(2), createEmptyDay(3)],
     bookings: [],
+    documents: [],
+    checklist: [],
     estimatedExpenses: [],
     actualExpenses: [],
     journalEntries: [],
     memories: [],
+    liveEvents: [],
+    packingList: [],
+    tripStory: "",
+    tripStoryGeneratedAt: null,
     summary: {
       overallTripSummary: `טיול ב${countryName}`,
       favoriteMemory: "",
@@ -710,18 +1026,60 @@ export function normalizeWorkspace(
         }))
       : base.itineraryDays;
 
+  // Defensive defaulting for bookings — the shape changed in Stage 3
+  // (name/date/time/reference/status -> title/startDateTime/.../richer
+  // status enum). Any pre-existing booking JSON just gets the new fields
+  // backfilled rather than dropped, matching how items/days are normalized.
+  const now = new Date().toISOString();
+  const bookings = (workspace.bookings ?? []).map((booking) => ({
+    id: booking.id ?? createId("booking"),
+    tripId: booking.tripId ?? "",
+    dayId: booking.dayId ?? null,
+    itineraryItemId: booking.itineraryItemId ?? null,
+    type: booking.type ?? "other",
+    title: booking.title ?? "",
+    provider: booking.provider ?? "",
+    confirmationNumber: booking.confirmationNumber ?? "",
+    bookingReference: booking.bookingReference ?? "",
+    startDateTime: booking.startDateTime ?? "",
+    endDateTime: booking.endDateTime ?? "",
+    location: booking.location ?? "",
+    status: booking.status ?? "not_booked",
+    paymentStatus: booking.paymentStatus ?? "unpaid",
+    amountOriginal: booking.amountOriginal ?? null,
+    amountOriginalCurrency: booking.amountOriginalCurrency ?? null,
+    amountConverted: booking.amountConverted ?? null,
+    exchangeRate: booking.exchangeRate ?? null,
+    rateTimestamp: booking.rateTimestamp ?? null,
+    documentIds: booking.documentIds ?? [],
+    notes: booking.notes ?? "",
+    createdAt: booking.createdAt ?? now,
+    updatedAt: booking.updatedAt ?? now,
+  }));
+
   return {
     ...base,
     ...workspace,
     preferences: { ...base.preferences, ...workspace.preferences },
     summary: { ...base.summary, ...workspace.summary },
     itineraryDays: days,
+    bookings,
+    documents: workspace.documents ?? [],
+    checklist: workspace.checklist ?? [],
+    liveEvents: workspace.liveEvents ?? [],
+    packingList: workspace.packingList ?? [],
     // Drop legacy one-per-day placeholder entries from before the trip-scoped
     // journal model (they never carried real content — no createdAt, no
     // title/text — so surfacing them would just be blank noise).
-    journalEntries: (workspace.journalEntries ?? []).filter(
-      (entry) => typeof entry.createdAt === "string" && entry.createdAt.length > 0
-    ),
+    journalEntries: (workspace.journalEntries ?? [])
+      .filter((entry) => typeof entry.createdAt === "string" && entry.createdAt.length > 0)
+      .map((entry) => ({
+        ...entry,
+        time: entry.time ?? "",
+        tags: entry.tags ?? [],
+        activityId: entry.activityId ?? null,
+        favoriteMemory: entry.favoriteMemory ?? false,
+      })),
   };
 }
 
@@ -758,6 +1116,17 @@ export function buildMapLink(name: string, lat: number | null, lon: number | nul
     return `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
   }
   return name ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}` : "";
+}
+
+// A directions/navigate link (destination-only, uses the device's current
+// location as the implicit origin) — distinct from buildMapLink above,
+// which only opens a search/pin. Promoted from the same pattern already
+// duplicated once in attraction-modal/index.tsx.
+export function buildDirectionsLink(lat: number | null, lon: number | null, name: string) {
+  if (lat != null && lon != null) {
+    return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`;
+  }
+  return name ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(name)}` : "";
 }
 
 export function haversineKm(
@@ -1868,6 +2237,10 @@ export function applyAiPlanToWorkspace(
   plan: AiItineraryResponse
 ): CountryTripWorkspaceState {
   const previousItemLookup = buildPreviousItemLookup(current.itineraryDays);
+  // Old item id -> new item id, for items matched by recommendationId/name+location
+  // (see findPreviousItem above) — used below to keep booking/document links
+  // pointed at the right item instead of a stale id after regeneration.
+  const itemIdRemap = new Map<string, string>();
 
   const nextDays = plan.days.map((day) => ({
     ...createEmptyDay(day.dayNumber, day.date),
@@ -1896,7 +2269,7 @@ export function applyAiPlanToWorkspace(
     transportSegments: day.transportSegments,
     items: day.items.map((item) => {
       const previous = findPreviousItem(previousItemLookup, item);
-      return {
+      const nextItem = {
         ...createEmptyItineraryItem(item.slot),
         recommendationId: item.recommendationId,
         name: item.name,
@@ -1927,12 +2300,29 @@ export function applyAiPlanToWorkspace(
         priority: previous?.priority ?? item.priority,
         fixedTime: previous?.fixedTime ?? item.fixedTime,
       };
+      if (previous) itemIdRemap.set(previous.id, nextItem.id);
+      return nextItem;
     }),
   }));
+
+  // Keep booking/document links pointed at the regenerated item instead of a
+  // stale id (spec: booking/document links must survive regeneration).
+  const bookings = current.bookings.map((booking) =>
+    booking.itineraryItemId && itemIdRemap.has(booking.itineraryItemId)
+      ? { ...booking, itineraryItemId: itemIdRemap.get(booking.itineraryItemId)! }
+      : booking
+  );
+  const documents = current.documents.map((document) =>
+    document.itineraryItemId && itemIdRemap.has(document.itineraryItemId)
+      ? { ...document, itineraryItemId: itemIdRemap.get(document.itineraryItemId)! }
+      : document
+  );
 
   return {
     ...current,
     itineraryDays: nextDays,
+    bookings,
+    documents,
     lastAiPlanSummary: plan.summary,
   };
 }

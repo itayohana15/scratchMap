@@ -128,6 +128,55 @@ export function useCountryTripSummary(iso: string | undefined, countryName: stri
     return counts;
   }, [favoritePhotos]);
 
+  // Favorite places (attractions/restaurants/experiences), deduped by
+  // normalized name with a visit count — spec §22: the same place favorited
+  // on 3 trips shows once, "❤️ Visited 3 times", not three rows.
+  const favoritePlaces = useMemo(() => {
+    const counts = new Map<string, { name: string; category: string; count: number }>();
+    for (const itinerary of completed) {
+      for (const day of itinerary.itineraryDays) {
+        for (const item of day.items) {
+          if (!item.favorite || !item.name.trim()) continue;
+          const key = item.name.trim().toLowerCase();
+          const existing = counts.get(key);
+          if (existing) existing.count += 1;
+          else counts.set(key, { name: item.name.trim(), category: item.category, count: 1 });
+        }
+      }
+    }
+    return [...counts.values()].sort((a, b) => b.count - a.count);
+  }, [completed]);
+
+  // New vs. repeated places per completed trip, compared against every
+  // earlier completed trip to this country (spec §21) — place names
+  // normalized case/whitespace-insensitively, never comparing across
+  // countries since `completed` is already scoped to this one iso.
+  const newVsRepeatedPlaces = useMemo(() => {
+    const sortedByDate = completed
+      .slice()
+      .sort((a, b) => effectiveSortDate(a).localeCompare(effectiveSortDate(b)));
+
+    const result = new Map<string, { newPlaces: string[]; repeatedPlaces: string[] }>();
+    const seenSoFar = new Set<string>();
+
+    for (const itinerary of sortedByDate) {
+      const placesThisTrip = uniqueNonEmpty(
+        itinerary.itineraryDays.flatMap((day) => day.items.filter((item) => item.completed).map((item) => item.name))
+      );
+      const newPlaces: string[] = [];
+      const repeatedPlaces: string[] = [];
+      for (const place of placesThisTrip) {
+        const key = place.toLowerCase();
+        if (seenSoFar.has(key)) repeatedPlaces.push(place);
+        else newPlaces.push(place);
+      }
+      for (const place of placesThisTrip) seenSoFar.add(place.toLowerCase());
+      result.set(itinerary.id, { newPlaces, repeatedPlaces });
+    }
+
+    return result;
+  }, [completed]);
+
   return {
     isLoading: isLoadingItineraries || isLoadingRatings || isLoadingPhotos,
     completed,
@@ -140,6 +189,8 @@ export function useCountryTripSummary(iso: string | undefined, countryName: stri
     favoritePhotos,
     favoriteJournalEntries,
     favoriteCities,
+    favoritePlaces,
+    newVsRepeatedPlaces,
   };
 }
 

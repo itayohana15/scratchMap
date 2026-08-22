@@ -3,11 +3,7 @@
 import {
   Archive,
   BedDouble,
-  Bike,
-  Bus,
   CalendarRange,
-  Car,
-  CarTaxiFront,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -23,16 +19,13 @@ import {
   LuggageIcon,
   MapPin,
   NotebookPen,
-  Plane,
   Plus,
   RefreshCcw,
   Route,
   Save,
-  Ship,
   Sparkles,
   Star,
-  TrainFront,
-  TramFront,
+  Ticket,
   Trash2,
   TriangleAlert,
   Wallet,
@@ -40,12 +33,15 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 
+import { BookingCenterSection } from "@/components/country/booking-center-section";
 import {
   ItineraryDayRouteSection,
   ItineraryTripSummarySection,
 } from "@/components/country/itinerary-route-map";
+import { TripChecklistSection } from "@/components/country/trip-checklist-section";
 import { TripJournalSection } from "@/components/country/trip-journal-section";
 import { TripSummarySection } from "@/components/country/trip-summary-section";
+import { TravelWalletSection } from "@/components/country/travel-wallet-section";
 import { PhotoGallery } from "@/components/gallery/photo-gallery";
 import {
   buildSuggestedItineraryTitle,
@@ -60,6 +56,14 @@ import type { Tables } from "@/lib/supabase/types";
 import {
   computeDayIntensity,
 } from "@/lib/server/itinerary-generation-constraints";
+import { bookings, createBookingLinkedToItem, upsertBooking } from "@/lib/trip-bookings";
+import { activityStateBadges, bookingStatusForItem, transportModeIcon } from "@/lib/trip-item-status";
+import { appendDocument } from "@/lib/trip-documents";
+import { computeTripReadiness, isReadinessApplicable, type ReadinessCategory } from "@/lib/trip-readiness";
+import { isTripActiveNow } from "@/lib/live-trip-time";
+import { LiveTripTodaySection } from "@/components/country/live-trip-today-section";
+import { TripActualSection } from "@/components/country/trip-actual-section";
+import { TripPackingSection } from "@/components/country/trip-packing-section";
 import {
   buildMapLink,
   createEmptyDay,
@@ -105,7 +109,14 @@ import {
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 
-type RegenerateScope = "full" | "day" | "activity" | "optimize_route" | "recalculate_costs";
+type RegenerateScope =
+  | "full"
+  | "day"
+  | "activity"
+  | "optimize_route"
+  | "recalculate_costs"
+  | "live_replan"
+  | "live_replace_item";
 
 const ITINERARY_STATUS_LABELS: Record<CountryItineraryStatus, string> = {
   draft: "טיוטה",
@@ -157,6 +168,11 @@ function ItemActualFields({
         onChange={(event) => onPatch({ actualTransportation: event.target.value })}
         placeholder="תחבורה בפועל"
       />
+      <Input
+        value={item.actualPlaceName}
+        onChange={(event) => onPatch({ actualPlaceName: event.target.value })}
+        placeholder="מקום בפועל (אם היה שונה מהמתוכנן)"
+      />
       <Textarea
         value={item.journalNotes}
         onChange={(event) => onPatch({ journalNotes: event.target.value })}
@@ -205,21 +221,6 @@ function SectionTitle({
   );
 }
 
-function activityStateBadges(item: TripItineraryItem) {
-  const badges: Array<{ key: string; label: string }> = [];
-  if (item.reservationRequired && item.bookingCompleted) {
-    badges.push({ key: "booked", label: "הוזמן" });
-  } else if (item.reservationRequired) {
-    badges.push({ key: "reservation", label: "דורש הזמנה" });
-  }
-  badges.push({ key: "priority", label: ITEM_PRIORITY_LABELS[item.priority] });
-  if (item.fixedTime) badges.push({ key: "fixedTime", label: "שעה קבועה" });
-  if (item.locked) badges.push({ key: "locked", label: "נעול" });
-  if (item.completed) badges.push({ key: "completed", label: "בוצע" });
-  if (item.skipped) badges.push({ key: "skipped", label: "דולג" });
-  return badges;
-}
-
 // Standard checkout -> travel -> check-in sequence for a hotel-change day,
 // inserted as explicit practical-type timeline items so the day doesn't
 // silently "teleport" the traveler between bases.
@@ -231,20 +232,6 @@ const HOTEL_CHANGE_DAY_TEMPLATE: Array<{ slot: DayPart; fields: Partial<TripItin
   { slot: "afternoon", fields: { name: "הפקדת מזוודות", category: "practical", plannedStartTime: "12:20", estimatedDurationMinutes: 20 } },
   { slot: "evening", fields: { name: "צ'ק-אין", category: "practical", plannedStartTime: "18:00", estimatedDurationMinutes: 30 } },
 ];
-
-function transportModeIcon(mode: string) {
-  const lower = mode.toLowerCase();
-  if (/walk|הליכ/.test(lower)) return Footprints;
-  if (/metro|subway|תחתית|רכבת תחתית/.test(lower)) return TramFront;
-  if (/train|רכבת/.test(lower)) return TrainFront;
-  if (/bus|אוטובוס/.test(lower)) return Bus;
-  if (/taxi|מונית|uber/.test(lower)) return CarTaxiFront;
-  if (/car|רכב|נהיגה|drive/.test(lower)) return Car;
-  if (/bike|bicycle|אופני/.test(lower)) return Bike;
-  if (/ferry|מעבור|boat|סירה/.test(lower)) return Ship;
-  if (/flight|טיסה|plane/.test(lower)) return Plane;
-  return Route;
-}
 
 function dayMealHighlights(day: TripItineraryDay) {
   return day.items.filter(
@@ -274,15 +261,71 @@ function activityPrice(value: number | null | undefined) {
 
 const SUMMARY_TAB_VALUE = "__trip-summary__";
 
-type TripSectionValue = "route" | "map" | "journal" | "photos" | "trip_summary";
+type TripSectionValue =
+  | "today"
+  | "route"
+  | "actual"
+  | "packing"
+  | "map"
+  | "bookings"
+  | "wallet"
+  | "checklist"
+  | "journal"
+  | "photos"
+  | "trip_summary";
 
-const TRIP_SECTIONS: Array<{ value: TripSectionValue; label: string; icon: ComponentType<{ className?: string }> }> = [
+const BASE_TRIP_SECTIONS: Array<{ value: TripSectionValue; label: string; icon: ComponentType<{ className?: string }> }> = [
   { value: "route", label: "מסלול", icon: Route },
   { value: "map", label: "מפה", icon: MapPin },
+  { value: "bookings", label: "הזמנות", icon: Ticket },
+  { value: "wallet", label: "ארנק נסיעות", icon: Wallet },
+  { value: "checklist", label: "צ'קליסט", icon: CheckCircle2 },
+  { value: "packing", label: "אריזה", icon: LuggageIcon },
+  { value: "actual", label: "בפועל", icon: History },
   { value: "journal", label: "יומן", icon: NotebookPen },
   { value: "photos", label: "תמונות", icon: ImagePlus },
   { value: "trip_summary", label: "סיכום הטיול", icon: Star },
 ];
+
+// Each trip stage emphasizes what's actually relevant right now (spec §40):
+// upcoming = plan/prep first; active = today/route/map first, logistics
+// secondary; completed = memories/history first, prep stuff secondary.
+// Nothing is ever fully hidden — "secondary" means it moves into the "עוד"
+// menu, not that the data becomes unreachable.
+const UPCOMING_SECTION_ORDER: TripSectionValue[] = [
+  "route", "map", "bookings", "wallet", "checklist", "packing", "actual", "journal", "photos", "trip_summary",
+];
+const UPCOMING_PRIMARY_COUNT = 4;
+
+const ACTIVE_SECTION_ORDER: TripSectionValue[] = [
+  "route", "map", "bookings", "wallet", "journal", "photos", "actual", "checklist", "packing", "trip_summary",
+];
+const ACTIVE_PRIMARY_COUNT = 2; // "today" is prepended separately and always counts as primary too.
+
+const COMPLETED_SECTION_ORDER: TripSectionValue[] = [
+  "actual", "route", "journal", "photos", "trip_summary", "bookings", "wallet", "checklist", "packing",
+];
+const COMPLETED_PRIMARY_COUNT = 5;
+
+function orderSections(order: TripSectionValue[]) {
+  return order.map((value) => BASE_TRIP_SECTIONS.find((section) => section.value === value)!).filter(Boolean);
+}
+
+function sectionOrderForStatus(status: CountryItineraryStatus, isActive: boolean) {
+  if (status === "completed") return { order: COMPLETED_SECTION_ORDER, primaryCount: COMPLETED_PRIMARY_COUNT };
+  if (isActive) return { order: ACTIVE_SECTION_ORDER, primaryCount: ACTIVE_PRIMARY_COUNT };
+  return { order: UPCOMING_SECTION_ORDER, primaryCount: UPCOMING_PRIMARY_COUNT };
+}
+
+// "היום" only exists for a trip that's actually active right now (spec:
+// don't show Live Mode for upcoming/completed/historical trips) — prepended
+// so it reads as the prominent, first option when present.
+function buildTripSections(isActive: boolean, status: CountryItineraryStatus) {
+  const { order } = sectionOrderForStatus(status, isActive);
+  const base = orderSections(order);
+  if (!isActive) return base;
+  return [{ value: "today" as const, label: "היום", icon: Sparkles }, ...base];
+}
 
 function tabValueForDay(dayId: string) {
   return `day:${dayId}`;
@@ -331,7 +374,8 @@ interface CountryItineraryDetailsDialogProps {
     scope: RegenerateScope,
     targetDayId?: string | null,
     targetItemId?: string | null,
-    optimizeMode?: DayOptimizeMode | null
+    optimizeMode?: DayOptimizeMode | null,
+    liveInstruction?: string | null
   ) => Promise<void> | void;
   onRestore: (versionId: string) => Promise<void> | void;
   onDuplicate: (itineraryId: string) => Promise<void> | void;
@@ -369,6 +413,7 @@ export function CountryItineraryDetailsDialog({
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [activeMapItemIdsByDay, setActiveMapItemIdsByDay] = useState<Record<string, string[]>>({});
   const [timelineFocusItemId, setTimelineFocusItemId] = useState<string | null>(null);
+  const [bookingFocusItemId, setBookingFocusItemId] = useState<string | null>(null);
   const itemCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [shouldLoadSummaryMap, setShouldLoadSummaryMap] = useState(false);
   const bodyViewportRef = useRef<HTMLDivElement | null>(null);
@@ -399,6 +444,7 @@ export function CountryItineraryDetailsDialog({
     setEditingItemId(null);
     setActiveMapItemIdsByDay({});
     setTimelineFocusItemId(null);
+    setBookingFocusItemId(null);
   }, [draftDayIdSet, draftDayIdsKey, draftId, draftVersion, firstDayId]);
 
   useEffect(() => {
@@ -495,6 +541,17 @@ export function CountryItineraryDetailsDialog({
     ? selectedDay.items.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0)
     : 0;
   const selectedDayIntensity = selectedDay ? computeDayIntensity(selectedDay.items) : null;
+  const tripBookings = bookings(draft);
+  const readiness = isReadinessApplicable(draft.status) ? computeTripReadiness(draft) : null;
+  const isTripLiveActive = isTripActiveNow(draft.startDate, draft.endDate, draft.isoA2);
+  const tripSections = buildTripSections(isTripLiveActive, draft.status);
+  // Every trip stage emphasizes what's actually relevant right now (spec
+  // §40) — the rest stays reachable in a secondary "עוד" menu rather than
+  // disappearing. "today" (when present) always counts as primary.
+  const { primaryCount } = sectionOrderForStatus(draft.status, isTripLiveActive);
+  const effectivePrimaryCount = primaryCount + (isTripLiveActive ? 1 : 0);
+  const primaryTripSections = tripSections.slice(0, effectivePrimaryCount);
+  const moreTripSections = tripSections.slice(effectivePrimaryCount);
 
   function handleAddDay() {
     if (!draft) {
@@ -683,14 +740,42 @@ export function CountryItineraryDetailsDialog({
                 <Badge variant="outline">גרסה {draft.version}</Badge>
                 <Badge variant="outline">{draft.travelers} נוסעים</Badge>
                 <Badge variant="outline">{draft.daysCount} ימים</Badge>
+                {readiness ? (
+                  <Badge variant={readiness.overallPercent >= 80 ? "secondary" : "outline"}>
+                    טיול מוכן ב-{readiness.overallPercent}%
+                  </Badge>
+                ) : null}
               </div>
+
+              {readiness ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {readiness.categories
+                    .filter((category) => category.status !== "not_applicable")
+                    .map((category: ReadinessCategory) => (
+                      <button
+                        key={category.key}
+                        type="button"
+                        onClick={() => setActiveSection(category.section)}
+                        title={category.detail || undefined}
+                        className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2.5 py-1 text-xs text-foreground/80 transition-colors hover:bg-muted/50"
+                      >
+                        {category.status === "complete" ? (
+                          <CheckCircle2 className="size-3.5" />
+                        ) : (
+                          <TriangleAlert className="size-3.5" />
+                        )}
+                        {category.label}
+                      </button>
+                    ))}
+                </div>
+              ) : null}
 
               <div
                 role="tablist"
                 aria-label="חלקי הטיול"
                 className="flex flex-wrap gap-1.5 rounded-2xl border border-border/60 bg-background/60 p-1.5"
               >
-                {TRIP_SECTIONS.map((section) => {
+                {primaryTripSections.map((section) => {
                   const selected = activeSection === section.value;
                   return (
                     <button
@@ -703,7 +788,9 @@ export function CountryItineraryDetailsDialog({
                         "flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-medium transition-colors",
                         selected
                           ? "bg-primary/10 text-primary shadow-sm"
-                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                          : section.value === "today"
+                            ? "text-primary hover:bg-primary/10"
+                            : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
                       )}
                     >
                       <section.icon className="size-4" />
@@ -711,6 +798,34 @@ export function CountryItineraryDetailsDialog({
                     </button>
                   );
                 })}
+                {moreTripSections.length > 0 ? (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <button
+                          type="button"
+                          className={cn(
+                            "flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-medium transition-colors",
+                            moreTripSections.some((section) => section.value === activeSection)
+                              ? "bg-primary/10 text-primary shadow-sm"
+                              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                          )}
+                        />
+                      }
+                    >
+                      <Ellipsis className="size-4" />
+                      עוד
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start">
+                      {moreTripSections.map((section) => (
+                        <DropdownMenuItem key={section.value} onClick={() => setActiveSection(section.value)}>
+                          <section.icon className="size-4" />
+                          {section.label}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                ) : null}
               </div>
 
               {activeSection === "route" ? (
@@ -933,7 +1048,17 @@ export function CountryItineraryDetailsDialog({
 
           <div ref={bodyViewportRef} className="min-h-0 flex-1 overflow-y-auto">
             <div className="space-y-6 px-4 py-4 pb-28 sm:px-6 sm:py-6 sm:pb-32">
-              {activeSection === "map" ? (
+              {activeSection === "today" && isTripLiveActive ? (
+                <LiveTripTodaySection
+                  draft={draft}
+                  countryName={country.name}
+                  onPatchDraft={onPatchDraft}
+                  onPatchDay={onPatchDay}
+                  onPatchItem={onPatchItem}
+                  onRegenerate={onRegenerate}
+                  isRegenerating={isRegenerating}
+                />
+              ) : activeSection === "map" ? (
                 <ItineraryTripSummarySection
                   days={draft.itineraryDays}
                   countryName={country.name}
@@ -945,6 +1070,21 @@ export function CountryItineraryDetailsDialog({
                     handleSelectDay(dayId);
                   }}
                 />
+              ) : activeSection === "bookings" ? (
+                <BookingCenterSection draft={draft} onPatchDraft={onPatchDraft} focusItemId={bookingFocusItemId} />
+              ) : activeSection === "wallet" ? (
+                <TravelWalletSection
+                  draft={draft}
+                  onPatchDraft={onPatchDraft}
+                  isoA2={draft.isoA2}
+                  onDocumentUploaded={(document) => appendDocument(onPatchDraft, document)}
+                />
+              ) : activeSection === "checklist" ? (
+                <TripChecklistSection draft={draft} onPatchDraft={onPatchDraft} isoA2={draft.isoA2} />
+              ) : activeSection === "packing" ? (
+                <TripPackingSection draft={draft} onPatchDraft={onPatchDraft} />
+              ) : activeSection === "actual" ? (
+                <TripActualSection draft={draft} onPatchDay={onPatchDay} onPatchItem={onPatchItem} />
               ) : activeSection === "journal" ? (
                 <TripJournalSection draft={draft} onPatchDraft={onPatchDraft} />
               ) : activeSection === "photos" ? (
@@ -1543,6 +1683,7 @@ export function CountryItineraryDetailsDialog({
                               const badges = activityStateBadges(item);
                               const isMapActive = (activeMapItemIdsByDay[selectedDay.id] ?? []).includes(item.id);
                               const ConnectorIcon = transportModeIcon(item.transportation);
+                              const bookingStatus = bookingStatusForItem(item, tripBookings);
 
                               return (
                                 <div key={item.id} className="space-y-3">
@@ -1623,6 +1764,26 @@ export function CountryItineraryDetailsDialog({
                                           </div>
 
                                           <div className="flex flex-wrap items-center gap-2">
+                                            {bookingStatus ? (
+                                              <button
+                                                type="button"
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  if (!bookingStatus.bookingId) {
+                                                    upsertBooking(
+                                                      onPatchDraft,
+                                                      createBookingLinkedToItem(draft.id, selectedDay.id, item)
+                                                    );
+                                                  }
+                                                  setBookingFocusItemId(item.id);
+                                                  setActiveSection("bookings");
+                                                }}
+                                                className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-muted/50"
+                                              >
+                                                <span>{bookingStatus.glyph}</span>
+                                                {bookingStatus.label}
+                                              </button>
+                                            ) : null}
                                             {badges.map((badge) => (
                                               <Badge key={badge.key} variant="outline">
                                                 {badge.label}
@@ -1885,6 +2046,15 @@ export function CountryItineraryDetailsDialog({
                                                       ...current,
                                                       skipped: !current.skipped,
                                                       completed: current.skipped ? current.completed : false,
+                                                    })),
+                                                },
+                                                {
+                                                  label: item.favorite ? "מועדף ❤️" : "הוסף למועדפים",
+                                                  active: item.favorite,
+                                                  onToggle: () =>
+                                                    onPatchItem(selectedDay.id, item.id, (current) => ({
+                                                      ...current,
+                                                      favorite: !current.favorite,
                                                     })),
                                                 },
                                               ].map((toggle) => (

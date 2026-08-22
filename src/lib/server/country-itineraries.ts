@@ -11,11 +11,15 @@ import {
   type CountryItineraryRecord,
   type CountryItineraryVersionSource,
 } from "@/lib/itineraries";
-import { generateCountryItineraryPlan } from "@/lib/server/country-itinerary-generation";
+import { applyDeterministicReplacement, generateCountryItineraryPlan } from "@/lib/server/country-itinerary-generation";
+import { buildTripPreferenceProfile } from "@/lib/server/itinerary-generation-constraints";
+import { mergeLiveReplanResult } from "@/lib/live-trip-planner";
+import { buildPersonalizationSummary, computeBehaviorSignals, deriveInferredPreferences } from "@/lib/preference-learning";
 import type { Database, Tables } from "@/lib/supabase/types";
 import {
   applyAiPlanToWorkspace,
   createDefaultWorkspace,
+  createId,
   estimateTravelMinutes,
   normalizeWorkspace,
   optimizeDayItemOrder,
@@ -195,13 +199,51 @@ export async function listCountryItineraryVersions(supabase: DbClient, itinerary
   return (data ?? []).map(normalizeCountryItineraryVersionRow);
 }
 
+/**
+ * Global (all-countries) personalization summary for the generator prompt
+ * (Stage 7). Wrapped so any failure — missing tables, empty data, a slow
+ * query — degrades to `null` and generation proceeds exactly as before
+ * (spec §52: personalization must never block planning).
+ */
+async function loadPersonalizationSummary(supabase: DbClient): Promise<string | null> {
+  try {
+    const [{ data: profileRow }, { data: itineraryRows }, { data: feedbackRows }] = await Promise.all([
+      supabase.from("preference_profile").select("*").limit(1).maybeSingle(),
+      supabase.from("country_itineraries").select("*").is("deleted_at", null),
+      supabase
+        .from("recommendation_feedback")
+        .select("place_key,category,feedback,reason")
+        .order("created_at", { ascending: false })
+        .limit(200),
+    ]);
+
+    if (!profileRow || profileRow.learning_enabled === false) return null;
+
+    const itineraries = (itineraryRows ?? []).map(normalizeCountryItineraryRow);
+    const signals = computeBehaviorSignals(itineraries, feedbackRows ?? []);
+    const { inferred } = deriveInferredPreferences(signals, profileRow.explicit_preferences ?? {});
+    const recentNegative = (feedbackRows ?? [])
+      .filter((row) => row.feedback === "down")
+      .slice(0, 5)
+      .map((row) => ({ category: row.category, reason: row.reason }));
+
+    return buildPersonalizationSummary(profileRow.explicit_preferences ?? {}, inferred, recentNegative);
+  } catch {
+    return null;
+  }
+}
+
 export async function generateAndStoreCountryItinerary(
   supabase: DbClient,
   country: Tables<"countries">,
   payload: AiItineraryRequest,
   guide: CountryAiRecommendation | null
 ) {
-  const generated = await generateCountryItineraryPlan(payload, guide);
+  const personalizationSummary = await loadPersonalizationSummary(supabase);
+  const generated = await generateCountryItineraryPlan(
+    { ...payload, personalizationSummary },
+    guide
+  );
   const initialWorkspace = buildInitialWorkspace(country.name, payload);
   const generatedWorkspace = applyAiPlanToWorkspace(initialWorkspace, generated);
   const costSummary = computeItineraryCostSummary(generatedWorkspace);
@@ -211,7 +253,9 @@ export async function generateAndStoreCountryItinerary(
   const status = deriveItineraryStatus(
     payload.preferences.startDate,
     payload.preferences.endDate,
-    archived
+    archived,
+    "draft",
+    country.iso_a2
   );
 
   const { data, error } = await supabase
@@ -291,7 +335,8 @@ export async function updateCountryItinerary(
     preferencesSnapshot.startDate || existing.startDate,
     preferencesSnapshot.endDate || existing.endDate,
     archived,
-    existing.status
+    existing.status,
+    existing.isoA2
   );
 
   const { data, error } = await supabase
@@ -361,7 +406,7 @@ export async function duplicateCountryItinerary(
       workspace_snapshot: workspace,
       itinerary_days: existing.itineraryDays,
       cost_summary: costSummary,
-      status: deriveItineraryStatus(existing.startDate, existing.endDate, false, existing.status),
+      status: deriveItineraryStatus(existing.startDate, existing.endDate, false, existing.status, existing.isoA2),
       version: 1,
       parent_itinerary_id: existing.id,
       manually_edited: existing.manuallyEdited,
@@ -441,7 +486,8 @@ export async function regenerateCountryItinerary(
   scope: NonNullable<AiItineraryRequest["regenerationScope"]>,
   targetDayId?: string | null,
   targetItemId?: string | null,
-  optimizeMode?: DayOptimizeMode | null
+  optimizeMode?: DayOptimizeMode | null,
+  liveInstruction?: string | null
 ) {
   const existing = await getCountryItinerary(supabase, itineraryId);
   const workspace = createWorkspaceFromItineraryRecord(existing, countryName);
@@ -461,6 +507,7 @@ export async function regenerateCountryItinerary(
     regenerationScope: scope,
     targetDayId: targetDayId ?? null,
     targetItemId: targetItemId ?? null,
+    liveInstruction: liveInstruction ?? null,
   };
 
   if (scope === "recalculate_costs") {
@@ -493,8 +540,62 @@ export async function regenerateCountryItinerary(
     });
   }
 
-  const generated = await generateCountryItineraryPlan(payload, guide);
+  // Live Trip Mode "this place is closed / skip this" fast path — fully
+  // deterministic, no AI call (spec §17's example: replace with something
+  // nearby, open, in-budget, geographically compatible).
+  if (scope === "live_replace_item" && targetDayId && targetItemId) {
+    const dayIndex = workspace.itineraryDays.findIndex((day) => day.id === targetDayId);
+    if (dayIndex === -1) throw new Error("Target day not found");
+    const targetItem = workspace.itineraryDays[dayIndex].items.find((item) => item.id === targetItemId);
+    if (!targetItem) throw new Error("Target item not found");
+    if (targetItem.locked || targetItem.fixedTime) {
+      throw new Error("Locked or fixed-time items cannot be replaced automatically");
+    }
+
+    const profile = buildTripPreferenceProfile(workspace.preferences, countryName, workspace.itineraryDays.length);
+    const { day: nextDay, replacementName } = applyDeterministicReplacement(
+      workspace.itineraryDays[dayIndex],
+      targetItem,
+      payload,
+      profile
+    );
+    const nextDays = [...workspace.itineraryDays];
+    nextDays[dayIndex] = recomputeDayEstimates(nextDay, workspace.preferences);
+
+    return updateCountryItinerary(supabase, itineraryId, countryName, {
+      itineraryDays: nextDays,
+      preferencesSnapshot: workspace.preferences,
+      workspaceSnapshot: { ...workspace, itineraryDays: nextDays },
+      manuallyEdited: false,
+      changeReason: `live replace: ${targetItem.name} -> ${replacementName}`,
+      versionSource: "regenerate",
+    });
+  }
+
+  const personalizationSummary = await loadPersonalizationSummary(supabase);
+  const generated = await generateCountryItineraryPlan({ ...payload, personalizationSummary }, guide);
   const regeneratedWorkspace = applyAiPlanToWorkspace(workspace, generated);
+
+  if (scope === "live_replan" && targetDayId) {
+    const dayIndex = workspace.itineraryDays.findIndex((day) => day.id === targetDayId);
+    if (dayIndex === -1) throw new Error("Target day not found");
+
+    const originalDay = workspace.itineraryDays[dayIndex];
+    const regeneratedDay = regeneratedWorkspace.itineraryDays[dayIndex];
+
+    const { items: nextItems } = mergeLiveReplanResult(originalDay.items, regeneratedDay.items, () => createId("item"));
+    const nextDays = [...workspace.itineraryDays];
+    nextDays[dayIndex] = recomputeDayEstimates({ ...regeneratedDay, id: originalDay.id, items: nextItems }, workspace.preferences);
+
+    return updateCountryItinerary(supabase, itineraryId, countryName, {
+      itineraryDays: nextDays,
+      preferencesSnapshot: workspace.preferences,
+      workspaceSnapshot: { ...workspace, itineraryDays: nextDays },
+      manuallyEdited: false,
+      changeReason: `live re-plan: ${liveInstruction ?? ""}`.trim(),
+      versionSource: "regenerate",
+    });
+  }
 
   if (scope === "day" && targetDayId) {
     const existingDayIndex = workspace.itineraryDays.findIndex((day) => day.id === targetDayId);

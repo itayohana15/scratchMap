@@ -40,6 +40,7 @@ import {
   buildFallbackAiItinerary,
   buildMapLink,
   buildWarnings,
+  createEmptyItineraryItem,
   dateForDayNumber,
   estimateTravelMinutes,
   getTripDayCount,
@@ -53,6 +54,8 @@ import {
   type DayPart,
   type ItemPriority,
   type RecommendationCategory,
+  type TripItineraryDay,
+  type TripItineraryItem,
   type TripRecommendation,
 } from "@/lib/trip-workspace";
 
@@ -678,10 +681,9 @@ function buildPrompt(
   const bookings =
     payload.bookings.length > 0
       ? payload.bookings.map((booking) => ({
-          name: booking.name,
+          name: booking.title,
           type: booking.type,
-          date: booking.date,
-          time: booking.time,
+          date: booking.startDateTime,
           status: booking.status,
           notes: booking.notes,
         }))
@@ -699,6 +701,28 @@ function buildPrompt(
     payload.regenerationScope && payload.regenerationScope !== "full"
       ? `Regeneration scope: ${payload.regenerationScope}. Preserve the broader trip logic and only substantially change the requested scope when possible.`
       : "Regeneration scope: full trip.";
+
+  const liveReplanGuidance =
+    payload.regenerationScope === "live_replan" && payload.liveInstruction
+      ? (() => {
+          const targetDay = payload.existingDays.find((day) => day.id === payload.targetDayId);
+          const untouchableNames = (targetDay?.items ?? [])
+            .filter((item) => item.completed || item.skipped || item.locked || item.fixedTime)
+            .map((item) => item.name)
+            .filter(Boolean);
+          return [
+            `Live re-plan instruction from the traveler, said right now, mid-trip: "${payload.liveInstruction}"`,
+            "This is a live, in-the-moment adjustment, not a fresh plan. Only adjust the remaining, not-yet-happened items of the target day. Do not change any other day.",
+            untouchableNames.length > 0
+              ? `These items in the target day are already completed, skipped, locked, or fixed-time and must stay exactly as they are, unchanged, in the same slot: ${untouchableNames.join(", ")}.`
+              : "",
+            "Locked items, fixed-time items (reservations, trains, flights, tours), and must-do priority items must never move or be replaced, even if the traveler's instruction seems to ask for it — work around them instead of overriding them.",
+            "Stay within the remaining budget for the day and keep the same overall geographic area unless the instruction explicitly asks to leave it.",
+          ]
+            .filter(Boolean)
+            .join(" ");
+        })()
+      : "";
 
   const tripFrameGuidance = [
     `Locked trip frame (decided before this prompt, geography-first): ${describeTripFrame(tripFrame)}.`,
@@ -737,6 +761,7 @@ function buildPrompt(
     "If an exact restaurant is unavailable, use a real food district, market, or neighborhood instead of inventing a fake venue.",
     "Use transportation and accommodation changes as part of the trip rhythm, especially on long routes.",
     regenerationGuidance,
+    liveReplanGuidance,
     `Destination: ${payload.countryName} (${payload.isoA2}).`,
     `Country ID: ${payload.countryId}.`,
     `Travel dates: ${payload.preferences.startDate} to ${payload.preferences.endDate}.`,
@@ -761,6 +786,11 @@ function buildPrompt(
     `Hard constraints: ${profile.hardConstraints.join(" | ") || "none"}.`,
     `Strong preferences: ${profile.strongPreferences.join(" | ") || "none"}.`,
     `Soft preferences: ${profile.softPreferences.join(" | ") || "none"}.`,
+    ...(payload.personalizationSummary
+      ? [
+          `Learned personalization from the traveler's past trips (secondary to the trip-specific preferences already stated above — trip-specific input always wins on conflict): ${payload.personalizationSummary}.`,
+        ]
+      : []),
     `Daily capacity limit in minutes including travel and meals: ${profile.dailyCapacityMinutes}.`,
     `Budget allocation in percent: accommodation ${Math.round(profile.budgetAllocation.accommodation * 100)}%, food ${Math.round(profile.budgetAllocation.food * 100)}%, transportation ${Math.round(profile.budgetAllocation.transportation * 100)}%, attractions ${Math.round(profile.budgetAllocation.attractions * 100)}%, buffer ${Math.round(profile.budgetAllocation.buffer * 100)}%.`,
     `Budget caps in ILS: per day ${profile.perDayBudget ?? "unknown"}, lunch ${profile.mealBudgetLunch ?? "unknown"}, dinner ${profile.mealBudgetDinner ?? "unknown"}, activity stop ${profile.activityBudgetPerStop ?? "unknown"}, transport day ${profile.transportBudgetPerDay ?? "unknown"}, accommodation day ${profile.accommodationBudgetPerDay ?? "unknown"}.`,
@@ -1492,7 +1522,7 @@ function fillDerivedDayFields(
   };
 }
 
-function replaceItemInDay(
+export function replaceItemInDay(
   day: AiGeneratedDay,
   targetItem: AiGeneratedItem,
   nextItem: AiGeneratedItem
@@ -2006,7 +2036,7 @@ function buildCostsFromDays(days: AiGeneratedDay[], travelers: number) {
   return summarizeItemCosts(days, travelers);
 }
 
-function buildReplacementItem(
+export function buildReplacementItem(
   recommendation: AiItineraryRequest["recommendations"][number],
   existingItem: AiGeneratedItem,
   day: AiGeneratedDay,
@@ -2056,7 +2086,7 @@ function buildReplacementItem(
   };
 }
 
-function buildFreeExplorationReplacement(item: AiGeneratedItem, day: AiGeneratedDay): AiGeneratedItem {
+export function buildFreeExplorationReplacement(item: AiGeneratedItem, day: AiGeneratedDay): AiGeneratedItem {
   const area = normalizeAreaLabel(day.cityRegion || item.location || day.accommodation || "");
   return {
     ...item,
@@ -2167,7 +2197,7 @@ function buildInsertedRecommendationItem(
   };
 }
 
-function pickReplacementRecommendation(args: {
+export function pickReplacementRecommendation(args: {
   payload: AiItineraryRequest;
   day: AiGeneratedDay;
   item: AiGeneratedItem;
@@ -2259,6 +2289,56 @@ function pickReplacementRecommendation(args: {
     });
 
   return candidates[0] ?? null;
+}
+
+/**
+ * Live Trip Mode "this place is closed / skip this" fast path — no AI call.
+ * TripItineraryDay/TripItineraryItem are structural supersets of
+ * AiGeneratedDay/AiGeneratedItem (every field the generation types need is
+ * present with a compatible type), so they pass through directly; only the
+ * *result* needs converting back, since AiGeneratedItem lacks the
+ * Trip-only fields (completed, actualCost, etc).
+ */
+export function applyDeterministicReplacement(
+  day: TripItineraryDay,
+  targetItem: TripItineraryItem,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): { day: TripItineraryDay; replacementName: string } {
+  // Defense in depth: the API route already refuses this action for
+  // locked/fixed-time items before it ever gets here, but the function
+  // itself must never silently replace one regardless of caller discipline.
+  if (targetItem.locked || targetItem.fixedTime) {
+    return { day, replacementName: targetItem.name };
+  }
+
+  const usedPlaceKeys = new Set(day.items.map((item) => buildItemKey(item)));
+
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day,
+    item: targetItem,
+    profile,
+    usedPlaceKeys,
+  });
+
+  const nextGeneratedItem = replacement
+    ? buildReplacementItem(replacement, targetItem, day, payload)
+    : buildFreeExplorationReplacement(targetItem, day);
+
+  const nextItem: TripItineraryItem = {
+    ...createEmptyItineraryItem(nextGeneratedItem.slot),
+    ...nextGeneratedItem,
+    id: targetItem.id,
+    locked: targetItem.locked,
+    priority: targetItem.priority,
+    fixedTime: targetItem.fixedTime,
+  };
+
+  return {
+    day: { ...day, items: day.items.map((item) => (item.id === targetItem.id ? nextItem : item)) },
+    replacementName: nextItem.name,
+  };
 }
 
 function chooseTargetDayIndexForRecommendation(

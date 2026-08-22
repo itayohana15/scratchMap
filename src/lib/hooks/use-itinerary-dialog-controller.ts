@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
 import type { CountryItineraryRecord } from "@/lib/itineraries";
+import { usePreferenceProfile } from "@/lib/queries/preference-profile";
 import {
   useArchiveCountryItinerary,
   useCountryItineraryVersions,
@@ -13,6 +14,8 @@ import {
   useRestoreCountryItineraryVersion,
   useUpdateCountryItinerary,
 } from "@/lib/queries/country-itineraries";
+import { explainPersonalizationInGeneration } from "@/lib/preference-learning";
+import { computePlannedCategoryBreakdown } from "@/lib/trip-memories";
 import type { DayOptimizeMode, TripItineraryDay, TripItineraryItem } from "@/lib/trip-workspace";
 
 function cloneItinerary(itinerary: CountryItineraryRecord) {
@@ -30,6 +33,9 @@ function draftSignature(itinerary: CountryItineraryRecord | null) {
     generationMode: itinerary.generationMode,
     journalEntries: itinerary.workspaceSnapshot?.journalEntries,
     tripSummary: itinerary.workspaceSnapshot?.summary,
+    bookings: itinerary.workspaceSnapshot?.bookings,
+    documents: itinerary.workspaceSnapshot?.documents,
+    checklist: itinerary.workspaceSnapshot?.checklist,
   });
 }
 
@@ -45,6 +51,7 @@ export function useItineraryDialogController(iso: string) {
   const deleteItinerary = useDeleteCountryItinerary(iso);
   const regenerateItinerary = useRegenerateCountryItinerary(iso);
   const restoreVersion = useRestoreCountryItineraryVersion(iso);
+  const preferenceProfileQuery = usePreferenceProfile();
 
   const [activeItinerary, setActiveItinerary] = useState<CountryItineraryRecord | null>(null);
   const [draft, setDraft] = useState<CountryItineraryRecord | null>(null);
@@ -171,10 +178,11 @@ export function useItineraryDialogController(iso: string) {
 
   async function handleRegenerate(
     itineraryId: string,
-    scope: "full" | "day" | "activity" | "optimize_route" | "recalculate_costs",
+    scope: "full" | "day" | "activity" | "optimize_route" | "recalculate_costs" | "live_replan" | "live_replace_item",
     targetDayId?: string | null,
     targetItemId?: string | null,
-    optimizeMode?: DayOptimizeMode | null
+    optimizeMode?: DayOptimizeMode | null,
+    liveInstruction?: string | null
   ) {
     try {
       const itinerary = await regenerateItinerary.mutateAsync({
@@ -183,8 +191,18 @@ export function useItineraryDialogController(iso: string) {
         targetDayId,
         targetItemId,
         optimizeMode,
+        liveInstruction,
       });
       toast.success("המסלול עודכן מחדש");
+      if (scope === "full" && preferenceProfileQuery.data) {
+        const bullets = explainPersonalizationInGeneration(
+          computePlannedCategoryBreakdown(itinerary),
+          preferenceProfileQuery.data.explicit_preferences ?? {}
+        );
+        if (bullets.length > 0) {
+          toast.message("התאמתי את המסלול להעדפות שלך", { description: bullets.join(" · ") });
+        }
+      }
       if (activeItinerary?.id === itineraryId) {
         setActiveItinerary(itinerary);
         setDraft(cloneItinerary(itinerary));

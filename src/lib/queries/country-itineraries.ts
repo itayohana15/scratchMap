@@ -218,18 +218,20 @@ export function useRegenerateCountryItinerary(iso: string) {
       targetDayId,
       targetItemId,
       optimizeMode,
+      liveInstruction,
     }: {
       itineraryId: string;
       scope: NonNullable<AiItineraryRequest["regenerationScope"]>;
       targetDayId?: string | null;
       targetItemId?: string | null;
       optimizeMode?: DayOptimizeMode | null;
+      liveInstruction?: string | null;
     }) => {
       const data = await parseJson<{ itinerary: CountryItineraryRecord }>(
         await fetch(`/api/countries/${iso.toLowerCase()}/itineraries/${itineraryId}/regenerate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scope, targetDayId, targetItemId, optimizeMode }),
+          body: JSON.stringify({ scope, targetDayId, targetItemId, optimizeMode, liveInstruction }),
         })
       );
       return data.itinerary;

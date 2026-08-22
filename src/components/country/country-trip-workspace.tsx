@@ -21,6 +21,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { AttractionModal } from "@/components/country/attraction-modal";
+import { RecommendationFeedbackButtons } from "@/components/country/recommendation-feedback-buttons";
 import { CountryAboutSection } from "@/components/country/country-about-section";
 import { CountryItineraryHistorySection } from "@/components/country/country-itinerary-history-section";
 import { CountryItinerarySuccessDialog } from "@/components/country/country-itinerary-success-dialog";
@@ -63,10 +64,18 @@ import {
   type CountryItineraryRecord,
 } from "@/lib/itineraries";
 import {
+  useCountryItineraries,
   useGenerateCountryItinerary,
   type GenerateCountryItineraryResult,
 } from "@/lib/queries/country-itineraries";
 import { usePlacesForCountry } from "@/lib/queries/places";
+import { usePreferenceProfile } from "@/lib/queries/preference-profile";
+import { useAllRecommendationFeedback } from "@/lib/queries/recommendation-feedback";
+import {
+  aggregateFeedbackByPlace,
+  computeAlreadyVisited,
+  computeRecommendationScore,
+} from "@/lib/preference-learning";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureProperties } from "@/lib/map/geo";
 import type { Tables } from "@/lib/supabase/types";
@@ -1019,9 +1028,39 @@ export function CountryTripWorkspaceContent({
     workspace.preferences.startDate,
   ]);
 
-  const filteredRecommendations = liveRecommendations.filter(
-    (recommendation) => recommendation.category === activeRecommendationCategory
-  );
+  const [newToMeOnly, setNewToMeOnly] = useState(false);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const { data: preferenceProfile } = usePreferenceProfile();
+  const { data: recommendationFeedback = [] } = useAllRecommendationFeedback();
+  const { data: countryItineraries = [] } = useCountryItineraries(iso);
+
+  const alreadyVisited = useMemo(() => computeAlreadyVisited(countryItineraries), [countryItineraries]);
+  const feedbackByPlaceKey = useMemo(() => aggregateFeedbackByPlace(recommendationFeedback), [recommendationFeedback]);
+
+  const scoredRecommendations = useMemo(() => {
+    const scoreContext = {
+      explicitPreferences: preferenceProfile?.explicit_preferences ?? {},
+      inferredPreferences: {},
+      feedbackByPlaceKey,
+      alreadyVisited,
+    };
+    return liveRecommendations
+      .filter((recommendation) => recommendation.category === activeRecommendationCategory)
+      .map((recommendation) => ({ recommendation, score: computeRecommendationScore(recommendation, scoreContext) }))
+      .filter(({ recommendation }) => {
+        const visited = alreadyVisited.get(
+          recommendation.lat != null && recommendation.lon != null
+            ? `coords:${recommendation.lat.toFixed(4)}:${recommendation.lon.toFixed(4)}`
+            : `name:${recommendation.name.trim().toLowerCase()}::${recommendation.location.trim().toLowerCase()}`
+        );
+        if (newToMeOnly && visited) return false;
+        if (favoritesOnly && !visited?.favorite) return false;
+        return true;
+      })
+      .sort((a, b) => b.score.total - a.score.total);
+  }, [activeRecommendationCategory, alreadyVisited, favoritesOnly, feedbackByPlaceKey, liveRecommendations, newToMeOnly, preferenceProfile]);
+
+  const filteredRecommendations = scoredRecommendations.map(({ recommendation }) => recommendation);
   const activeRecommendationDetails = useMemo(() => {
     if (!selectedRecommendation) return null;
     return (
@@ -1231,9 +1270,9 @@ export function CountryTripWorkspaceContent({
                     {workspace.bookings.map((booking) => (
                       <div key={booking.id} className="grid gap-2 rounded-2xl border border-border/70 p-3 md:grid-cols-6">
                         <Input
-                          value={booking.name}
+                          value={booking.title}
                           onChange={(event) =>
-                            actions.upsertBooking({ ...booking, name: event.target.value })
+                            actions.upsertBooking({ ...booking, title: event.target.value })
                           }
                           placeholder="שם הזמנה"
                         />
@@ -1258,17 +1297,10 @@ export function CountryTripWorkspaceContent({
                           </SelectContent>
                         </Select>
                         <Input
-                          type="date"
-                          value={booking.date}
+                          type="datetime-local"
+                          value={booking.startDateTime}
                           onChange={(event) =>
-                            actions.upsertBooking({ ...booking, date: event.target.value })
-                          }
-                        />
-                        <Input
-                          type="time"
-                          value={booking.time}
-                          onChange={(event) =>
-                            actions.upsertBooking({ ...booking, time: event.target.value })
+                            actions.upsertBooking({ ...booking, startDateTime: event.target.value })
                           }
                         />
                         <Select
@@ -1293,11 +1325,11 @@ export function CountryTripWorkspaceContent({
                         </Select>
                         <div className="flex gap-2">
                           <Input
-                            value={booking.reference}
+                            value={booking.bookingReference}
                             onChange={(event) =>
                               actions.upsertBooking({
                                 ...booking,
-                                reference: event.target.value,
+                                bookingReference: event.target.value,
                               })
                             }
                             placeholder="מספר הזמנה"
@@ -1678,6 +1710,14 @@ export function CountryTripWorkspaceContent({
             </div>
 
             <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant={newToMeOnly ? "secondary" : "outline"} onClick={() => setNewToMeOnly((current) => !current)}>
+                  עוד לא הייתי
+                </Button>
+                <Button size="sm" variant={favoritesOnly ? "secondary" : "outline"} onClick={() => setFavoritesOnly((current) => !current)}>
+                  מקומות שאהבתי
+                </Button>
+              </div>
               <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
                 <span>
                   {RECOMMENDATION_CATEGORY_LABELS[activeRecommendationCategory]}:{" "}
@@ -1813,6 +1853,11 @@ export function CountryTripWorkspaceContent({
                               פתח מפה
                             </Button>
                           )}
+                          <RecommendationFeedbackButtons
+                            place={recommendation}
+                            category={recommendation.category}
+                            tripId={null}
+                          />
                         </div>
                       </div>
                     </article>

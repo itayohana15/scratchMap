@@ -202,18 +202,31 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
                     {formatVisitDate(effectiveSortDate(itinerary), hasExactDate(itinerary))}
                   </p>
                 </div>
-                {summary.ratingsByItinerary.get(itinerary.id)?.overall != null ? (
-                  <Badge variant="secondary">
-                    {summary.ratingsByItinerary.get(itinerary.id)?.overall}/10
-                  </Badge>
-                ) : null}
+                <div className="flex shrink-0 items-center gap-2">
+                  {(summary.newVsRepeatedPlaces.get(itinerary.id)?.repeatedPlaces.length ?? 0) > 0 ? (
+                    <Badge variant="outline" className="text-[11px]">
+                      {summary.newVsRepeatedPlaces.get(itinerary.id)?.newPlaces.length} חדשים ·{" "}
+                      {summary.newVsRepeatedPlaces.get(itinerary.id)?.repeatedPlaces.length} חוזרים
+                    </Badge>
+                  ) : null}
+                  {summary.ratingsByItinerary.get(itinerary.id)?.overall != null ? (
+                    <Badge variant="secondary">
+                      {summary.ratingsByItinerary.get(itinerary.id)?.overall}/10
+                    </Badge>
+                  ) : null}
+                </div>
               </button>
             ))}
         </div>
       </div>
 
       {summary.completed.length >= 2 ? (
-        <TripComparisonTable itineraries={summary.completed} country={country} ratingsByItinerary={summary.ratingsByItinerary} />
+        <TripComparisonTable
+          itineraries={summary.completed}
+          country={country}
+          ratingsByItinerary={summary.ratingsByItinerary}
+          newVsRepeatedPlaces={summary.newVsRepeatedPlaces}
+        />
       ) : null}
 
       <div className="section-card space-y-3 p-4">
@@ -252,9 +265,19 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
         )}
       </div>
 
-      {summary.favoritePhotos.length > 0 || summary.favoriteJournalEntries.length > 0 ? (
+      {summary.favoritePhotos.length > 0 || summary.favoriteJournalEntries.length > 0 || summary.favoritePlaces.length > 0 ? (
         <div className="section-card space-y-3 p-4">
           <h3 className="font-heading text-lg font-semibold">מועדפים</h3>
+          {summary.favoritePlaces.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {summary.favoritePlaces.map((place) => (
+                <Badge key={place.name} variant="outline" className="gap-1">
+                  ❤️ {place.name}
+                  {place.count > 1 ? <span className="text-muted-foreground">· ביקרתם {place.count} פעמים</span> : null}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
           {summary.favoritePhotos.length > 0 ? (
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
               {summary.favoritePhotos.slice(0, 12).map((photo) => (
@@ -331,10 +354,12 @@ function TripComparisonTable({
   itineraries,
   country,
   ratingsByItinerary,
+  newVsRepeatedPlaces,
 }: {
   itineraries: CountryItineraryRecord[];
   country: Tables<"countries">;
   ratingsByItinerary: Map<string, Tables<"trip_ratings">>;
+  newVsRepeatedPlaces: Map<string, { newPlaces: string[]; repeatedPlaces: string[] }>;
 }) {
   const sorted = itineraries.slice().sort((a, b) => effectiveSortDate(a).localeCompare(effectiveSortDate(b)));
   const rows: Array<{ label: string; values: (itinerary: CountryItineraryRecord) => string }> = [
@@ -363,6 +388,14 @@ function TripComparisonTable({
       values: (itinerary) => {
         const workspace = createWorkspaceFromItineraryRecord(itinerary, country.name);
         return `${buildTripStatistics(workspace).placesVisited}`;
+      },
+    },
+    {
+      label: "מקומות חדשים / חוזרים",
+      values: (itinerary) => {
+        const diff = newVsRepeatedPlaces.get(itinerary.id);
+        if (!diff) return "—";
+        return `${diff.newPlaces.length} / ${diff.repeatedPlaces.length}`;
       },
     },
   ];

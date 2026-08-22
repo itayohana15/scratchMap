@@ -16,14 +16,28 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useUploadPhoto } from "@/lib/queries/photos";
+import type { Tables } from "@/lib/supabase/types";
 
 interface PhotoUploadDialogProps {
   countryId?: string;
   cityId?: string;
   itineraryId?: string;
+  dayId?: string | null;
+  placeId?: string | null;
+  /** Fired once per successfully uploaded photo — lets a caller (e.g. a journal entry) link the new record without creating a second one. */
+  onUploaded?: (photo: Tables<"photos">) => void;
+  triggerLabel?: string;
 }
 
-export function PhotoUploadDialog({ countryId, cityId, itineraryId }: PhotoUploadDialogProps) {
+export function PhotoUploadDialog({
+  countryId,
+  cityId,
+  itineraryId,
+  dayId,
+  placeId,
+  onUploaded,
+  triggerLabel,
+}: PhotoUploadDialogProps) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<FileList | null>(null);
   const [caption, setCaption] = useState("");
@@ -39,15 +53,18 @@ export function PhotoUploadDialog({ countryId, cityId, itineraryId }: PhotoUploa
     let succeeded = 0;
     for (const file of Array.from(files)) {
       try {
-        await uploadPhoto.mutateAsync({
+        const photo = await uploadPhoto.mutateAsync({
           file,
           countryId,
           cityId,
           itineraryId,
+          dayId,
+          placeId,
           caption: caption || undefined,
           takenAt: takenAt || undefined,
         });
         succeeded += 1;
+        onUploaded?.(photo);
       } catch {
         toast.error(`העלאת ${file.name} נכשלה`);
       }
@@ -73,7 +90,7 @@ export function PhotoUploadDialog({ countryId, cityId, itineraryId }: PhotoUploa
         render={
           <Button variant="secondary" size="sm" className="gap-1.5">
             <ImagePlus className="size-4" />
-            הוספת תמונות
+            {triggerLabel ?? "הוספת תמונות"}
           </Button>
         }
       />

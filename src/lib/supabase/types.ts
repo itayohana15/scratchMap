@@ -412,6 +412,108 @@ export interface Database {
           },
         ];
       };
+      trip_documents: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          itinerary_id: string;
+          booking_id: string | null;
+          itinerary_item_id: string | null;
+          type: string;
+          title: string;
+          storage_path: string;
+          file_name: string;
+          mime_type: string;
+          notes: string;
+          is_sensitive: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["trip_documents"]["Row"],
+            | "id"
+            | "user_id"
+            | "booking_id"
+            | "itinerary_item_id"
+            | "type"
+            | "notes"
+            | "is_sensitive"
+            | "created_at"
+            | "updated_at"
+          >
+        > &
+          Pick<
+            Database["public"]["Tables"]["trip_documents"]["Row"],
+            "itinerary_id" | "title" | "storage_path" | "file_name" | "mime_type"
+          >;
+        Update: Partial<Database["public"]["Tables"]["trip_documents"]["Insert"]>;
+        Relationships: [
+          {
+            foreignKeyName: "trip_documents_itinerary_id_fkey";
+            columns: ["itinerary_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itineraries";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+      preference_profile: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          explicit_preferences: Record<string, number>;
+          inferred_preferences: Record<string, { level: number; confidence: number; direction: "up" | "down"; sampleSize: number; updatedAt: string }>;
+          dismissed_suggestions: string[];
+          learning_enabled: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["preference_profile"]["Row"],
+            | "id"
+            | "user_id"
+            | "explicit_preferences"
+            | "inferred_preferences"
+            | "dismissed_suggestions"
+            | "learning_enabled"
+            | "created_at"
+            | "updated_at"
+          >
+        >;
+        Update: Partial<Database["public"]["Tables"]["preference_profile"]["Insert"]>;
+        Relationships: [];
+      };
+      recommendation_feedback: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          place_key: string;
+          trip_id: string | null;
+          category: string;
+          feedback: "up" | "down";
+          reason: string | null;
+          created_at: string;
+        };
+        Insert: Partial<
+          Pick<
+            Database["public"]["Tables"]["recommendation_feedback"]["Row"],
+            "id" | "user_id" | "trip_id" | "reason" | "created_at"
+          >
+        > &
+          Pick<Database["public"]["Tables"]["recommendation_feedback"]["Row"], "place_key" | "category" | "feedback">;
+        Update: Partial<Database["public"]["Tables"]["recommendation_feedback"]["Insert"]>;
+        Relationships: [
+          {
+            foreignKeyName: "recommendation_feedback_trip_id_fkey";
+            columns: ["trip_id"];
+            isOneToOne: false;
+            referencedRelation: "country_itineraries";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
       country_ratings: {
         Row: {
           id: string;

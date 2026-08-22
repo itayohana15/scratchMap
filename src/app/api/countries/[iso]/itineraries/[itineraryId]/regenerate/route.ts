@@ -15,6 +15,7 @@ export async function POST(
     targetDayId?: string | null;
     targetItemId?: string | null;
     optimizeMode?: DayOptimizeMode | null;
+    liveInstruction?: string | null;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -46,7 +47,8 @@ export async function POST(
       scope,
       body.targetDayId,
       body.targetItemId,
-      body.optimizeMode
+      body.optimizeMode,
+      body.liveInstruction
     );
     return NextResponse.json({ itinerary });
   } catch (error) {

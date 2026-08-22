@@ -2,8 +2,10 @@ import { format, isValid, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
 import { formatDateRange } from "@/lib/format";
+import { getDestinationDateString } from "@/lib/live-trip-time";
 import { summarizeItemCosts } from "@/lib/server/itinerary-generation-constraints";
 import type { Tables } from "@/lib/supabase/types";
+import { applyBookingOverrides } from "@/lib/trip-bookings";
 import {
   createDefaultWorkspace,
   createEmptyDay,
@@ -20,8 +22,6 @@ import {
 export type CountryItineraryStatus = "draft" | "upcoming" | "active" | "completed" | "archived";
 export type CountryItinerarySource = "ai" | "manual" | "historical_manual";
 export type CountryItineraryVersionSource = "ai" | "manual" | "duplicate" | "restore" | "regenerate";
-
-const REFERENCE_TODAY = parseISO("2026-08-19");
 
 export interface ItineraryCostSummary {
   totalEstimatedCost: number | null;
@@ -171,6 +171,7 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
             location: toText(itemRecord.location),
             shortDescription: toText(itemRecord.shortDescription),
             plannedStartTime: toText(itemRecord.plannedStartTime),
+            liveScheduledStartTime: toText(itemRecord.liveScheduledStartTime) || null,
             actualStartTime: toText(itemRecord.actualStartTime),
             actualEndTime: toText(itemRecord.actualEndTime),
             estimatedDurationMinutes: toNumber(itemRecord.estimatedDurationMinutes),
@@ -198,7 +199,10 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
             optional: Boolean(itemRecord.optional),
             locked: Boolean(itemRecord.locked),
             completed: Boolean(itemRecord.completed),
+            completedAt: toText(itemRecord.completedAt) || null,
             skipped: Boolean(itemRecord.skipped),
+            skippedAt: toText(itemRecord.skippedAt) || null,
+            skipReason: toText(itemRecord.skipReason) || null,
             spontaneous: Boolean(itemRecord.spontaneous),
             personalRating: toNumber(itemRecord.personalRating),
             wouldVisitAgain:
@@ -234,6 +238,9 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
       safetyNotes: toStringArray(dayRecord.safetyNotes),
       restWindow: toText(dayRecord.restWindow),
       transportSegments: toStringArray(dayRecord.transportSegments),
+      favoriteMoment: toText(dayRecord.favoriteMoment),
+      dayEndNote: toText(dayRecord.dayEndNote),
+      dayCompletedAt: toText(dayRecord.dayCompletedAt) || null,
       items,
     };
   });
@@ -256,8 +263,12 @@ function normalizeExpenseList(value: unknown): TripExpense[] {
           : "other",
       label: toText(item.label),
       amount: toNumber(item.amount) ?? 0,
+      amountOriginalCurrency: toText(item.amountOriginalCurrency) || null,
+      exchangeRate: toNumber(item.exchangeRate),
+      rateTimestamp: toText(item.rateTimestamp) || null,
       date: toText(item.date),
       dayId: toText(item.dayId) || null,
+      itemId: toText(item.itemId) || null,
       notes: toText(item.notes),
     }));
 }
@@ -310,11 +321,15 @@ export function deriveItineraryStatus(
   endDate: string | null | undefined,
   archived: boolean,
   fallbackStatus: CountryItineraryStatus = "draft",
-  now = REFERENCE_TODAY
+  isoA2: string | null = null,
+  now: Date = new Date()
 ): CountryItineraryStatus {
   if (archived) return "archived";
   if (!startDate || !endDate) return fallbackStatus;
-  const today = format(now, "yyyy-MM-dd");
+  // Destination-local calendar date when we know the country (real trips
+  // always do); falls back to the runtime's own local date only when no
+  // country context is available at all.
+  const today = isoA2 ? getDestinationDateString(isoA2, now) : format(now, "yyyy-MM-dd");
   if (endDate < today) return "completed";
   if (startDate > today) return "upcoming";
   return "active";
@@ -335,10 +350,10 @@ export function normalizeItineraryStatus(value: string): CountryItineraryStatus 
 }
 
 export function computeItineraryCostSummary(
-  workspace: Pick<CountryTripWorkspaceState, "itineraryDays" | "estimatedExpenses" | "preferences">
+  workspace: Pick<CountryTripWorkspaceState, "itineraryDays" | "estimatedExpenses" | "preferences" | "bookings">
 ): ItineraryCostSummary {
   return summarizeItemCosts(
-    workspace.itineraryDays,
+    applyBookingOverrides(workspace.itineraryDays, workspace.bookings),
     workspace.preferences.travelers,
     normalizeExpenseList(workspace.estimatedExpenses)
   );
@@ -408,7 +423,8 @@ export function normalizeCountryItineraryRow(row: Tables<"country_itineraries">)
       row.start_date,
       row.end_date,
       row.archived,
-      normalizeItineraryStatus(row.status)
+      normalizeItineraryStatus(row.status),
+      row.iso_a2
     ),
     version: row.version,
     parentItineraryId: row.parent_itinerary_id,

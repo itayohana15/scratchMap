@@ -3,6 +3,7 @@
 import { Palette, Plus, Search, Settings as SettingsIcon } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
 
+import { PersonalizationSettingsSection } from "@/components/settings/personalization-settings-section";
 import { ThemeCard } from "@/components/settings/theme-card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -162,6 +163,8 @@ export function SettingsPageClient() {
           </div>
         ))}
       </section>
+
+      <PersonalizationSettingsSection />
     </div>
   );
 }
