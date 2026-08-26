@@ -13,6 +13,12 @@ import type {
   DayOptimizeMode,
 } from "@/lib/trip-workspace";
 
+// Matches `tripHubKeys.all` from "@/lib/queries/trip-hub" — inlined as a
+// literal (rather than imported) since that module already imports
+// `countryItineraryKeys` from this one; importing it back would create a
+// circular module dependency between the two query files.
+const TRIP_HUB_QUERY_KEY = ["trip-hub"] as const;
+
 export const countryItineraryKeys = {
   all: ["country-itineraries"] as const,
   byIso: (iso: string) => ["country-itineraries", iso.toUpperCase()] as const,
@@ -36,10 +42,34 @@ function upsertItineraryList(
   );
 }
 
+/** Carries the full parsed error body (status/code/message/any extra fields) so callers can log or branch on it, not just the human-readable message. */
+export class ApiRequestError extends Error {
+  status: number;
+  code?: string;
+  body: unknown;
+
+  constructor(message: string, status: number, code: string | undefined, body: unknown) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code;
+    this.body = body;
+  }
+}
+
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error ?? "Request failed");
+    const body = (await response.json().catch(() => null)) as
+      | { error?: string; message?: string }
+      | null;
+    // `message` is the human-readable text; `error` is a machine code
+    // (e.g. "PLAN_NOT_FEASIBLE") that would otherwise leak straight into the UI.
+    throw new ApiRequestError(
+      body?.message ?? body?.error ?? "Request failed",
+      response.status,
+      body?.error,
+      body
+    );
   }
   return (await response.json()) as T;
 }
@@ -90,15 +120,45 @@ export function useGenerateCountryItinerary(iso: string) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (payload: AiItineraryRequest) => {
+    mutationFn: async ({ signal, ...payload }: AiItineraryRequest & { signal?: AbortSignal }) => {
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Itinerary] request payload", {
+          isoA2: iso.toUpperCase(),
+          clientRequestId: payload.clientRequestId,
+          startDate: payload.preferences.startDate,
+          endDate: payload.preferences.endDate,
+          travelers: payload.preferences.travelers,
+          budget: payload.preferences.budget,
+          tripStyle: payload.preferences.tripStyle,
+          tripPace: payload.preferences.tripPace,
+          generationMode: payload.preferences.generationMode,
+          interests: payload.preferences.interests,
+          transportationPreferences: payload.preferences.transportationPreferences,
+          recommendationsCount: payload.recommendations.length,
+          selectedPlacesCount: payload.selectedPlaces.length,
+        });
+      }
       const data = await parseJson<GenerateCountryItineraryResult>(
         await fetch(`/api/countries/${iso.toLowerCase()}/itineraries`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
+          signal,
         })
       );
       return data;
+    },
+    // A 422 (or any 4xx) is a client/business-validation rejection, not a
+    // transient failure — retrying the identical payload would just fail
+    // identically again (and, per spec, must never fire automatically).
+    retry: false,
+    onError: (error) => {
+      if (process.env.NODE_ENV === "production") return;
+      if (error instanceof ApiRequestError) {
+        console.error(`[Itinerary ${error.status}]`, { code: error.code, body: error.body });
+      } else {
+        console.error("[Itinerary] request failed", error);
+      }
     },
     onSuccess: ({ itinerary }) => {
       queryClient.setQueryData<CountryItineraryRecord[]>(
@@ -107,6 +167,10 @@ export function useGenerateCountryItinerary(iso: string) {
       );
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
       queryClient.setQueryData(countryItineraryKeys.detail(iso, itinerary.id), itinerary);
+      // Trips/Dashboard/Passport all read from `useTripHubTrips()` — invalidate
+      // it too so a freshly generated itinerary shows up without a manual
+      // refresh (spec §B24).
+      queryClient.invalidateQueries({ queryKey: TRIP_HUB_QUERY_KEY });
     },
   });
 }

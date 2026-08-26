@@ -35,7 +35,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="he" dir="rtl" suppressHydrationWarning>
-      <body className="min-h-screen font-sans antialiased">
+      <body className="flex min-h-screen flex-col font-sans antialiased">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <ThemeProvider
           attribute="class"
@@ -47,7 +47,16 @@ export default function RootLayout({
             <QueryProvider>
               <TooltipProvider>
                 <Navbar />
-                {children}
+                {/*
+                  min-h-0 lets a page that wants to be exactly "the rest of
+                  the viewport" (e.g. /map) size itself correctly against
+                  this flex parent instead of guessing the navbar's real
+                  height. Pages with naturally tall content are unaffected —
+                  this doesn't clip anything, it just stops the default
+                  flexbox min-height:auto from fighting a page that opts
+                  into height:100%/overflow-hidden internally.
+                */}
+                <div className="min-h-0 flex-1">{children}</div>
                 <Toaster />
               </TooltipProvider>
             </QueryProvider>

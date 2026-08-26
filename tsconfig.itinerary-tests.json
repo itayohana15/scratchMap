@@ -33,6 +33,8 @@
     "src/lib/travel-passport.ts",
     "src/lib/trip-hub.ts",
     "src/lib/preference-learning.ts",
+    "src/lib/format.ts",
+    "src/lib/trip-preference-overrides.ts",
     "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
     "tests/itinerary-planning-principles.test.ts",
@@ -43,7 +45,9 @@
     "tests/trip-actual.test.ts",
     "tests/trip-memories.test.ts",
     "tests/travel-passport.test.ts",
-    "tests/preference-learning.test.ts"
+    "tests/preference-learning.test.ts",
+    "tests/format.test.ts",
+    "tests/trip-preference-overrides.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

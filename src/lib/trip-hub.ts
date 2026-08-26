@@ -271,6 +271,18 @@ export function getTripHubYear(trip: TripHubTrip) {
   return trip.year;
 }
 
+/**
+ * The destination name to display on a trip card/title — the real country
+ * name by default, but a region/city override (e.g. "סיני", "אמסטרדם")
+ * when one was actually captured (preferencesSnapshot.accommodationArea),
+ * same convention already used by the historical-trip seeds. Country
+ * identity in the database stays the real ISO country either way — this
+ * only affects what's displayed.
+ */
+export function tripDestinationName(trip: TripHubTrip): string {
+  return trip.itinerary.preferencesSnapshot.accommodationArea.trim() || trip.countryName;
+}
+
 export function buildTripHubTrip(
   itinerary: CountryItineraryRecord,
   country: TripHubCountry | null,

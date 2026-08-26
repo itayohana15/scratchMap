@@ -1,5 +1,7 @@
 import { differenceInCalendarDays, parseISO } from "date-fns";
 
+import { formatTripDateRange } from "@/lib/format";
+
 export type TripPhase = "planning" | "booked" | "currently_traveling" | "completed";
 export type ItineraryGenerationMode =
   | "balanced"
@@ -534,6 +536,10 @@ export interface AiItineraryRequest {
   // above it in the prompt. Optional and safe to omit on any failure —
   // generation must never depend on personalization succeeding.
   personalizationSummary?: string | null;
+  // A fresh client-generated id per generation attempt (not per retry of the
+  // same attempt) — logged server-side so repeated/duplicate POSTs are
+  // distinguishable from genuinely separate user-initiated attempts.
+  clientRequestId?: string;
 }
 
 export interface AiGeneratedItem {
@@ -2184,7 +2190,7 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       input.tripStatus === "currently_traveling"
         ? "נבנה מסלול פרקטי להמשך הימים הקרובים עם דגש על קצב, אזורים, אוכל קרוב ואפשרויות גיבוי."
         : "נבנה מסלול יום-אחר-יום שמרגיש כמו טיול עצמאי אמיתי: אזורים שונים, קצב משתנה, אוכל קרוב ולוגיסטיקה פרקטית.",
-    title: `${input.countryName} · ${input.preferences.startDate || "ללא תאריך"}${input.preferences.endDate ? ` עד ${input.preferences.endDate}` : ""}`,
+    title: `${input.countryName}: ${formatTripDateRange(input.preferences.startDate, input.preferences.endDate, input.preferences.partialDate)}`,
     totalEstimatedCost,
     estimatedTransportCost,
     averageDailyCost:

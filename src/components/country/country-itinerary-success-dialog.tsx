@@ -15,7 +15,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { getCountrySuccessIllustration } from "@/lib/country-success-illustrations";
-import { formatCurrency, formatDateRange, tripDurationDays } from "@/lib/format";
+import { formatCurrency, formatTripDateRange, tripDurationDays } from "@/lib/format";
 import type { CountryItineraryGenerationSuccessPayload } from "@/lib/itineraries";
 import { cn } from "@/lib/utils";
 
@@ -72,7 +72,7 @@ export function CountryItinerarySuccessDialog({
     return null;
   }
 
-  const dateRange = formatDateRange(success.startDate, success.endDate);
+  const dateRange = success.startDate && success.endDate ? formatTripDateRange(success.startDate, success.endDate) : null;
   const durationDays = tripDurationDays(success.startDate, success.endDate) ?? success.totalDays;
   const savedMessage = dateRange
     ? `המסלול ל${success.countryName} לתאריכים ${dateRange} נוצר ונשמר בהצלחה.`

@@ -1,5 +1,31 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
+/** Dev-only structured progress/failure logging for the generation pipeline (never runs in production, never logs secrets/full payloads). */
+function logGenerationStage(message: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  if (details) {
+    console.log(`[Itinerary] ${message}`, details);
+  } else {
+    console.log(`[Itinerary] ${message}`);
+  }
+}
+
+/**
+ * Thrown when the generator (both Gemini attempts, then the deterministic
+ * fallback) genuinely cannot produce a plan that satisfies validation —
+ * a real "this request can't be fulfilled as configured" outcome, distinct
+ * from an unexpected server error. The API route maps this to 422, not 500.
+ */
+export class ItineraryGenerationInfeasibleError extends Error {
+  code: "PLAN_NOT_FEASIBLE" | "BUDGET_NOT_FEASIBLE";
+
+  constructor(code: "PLAN_NOT_FEASIBLE" | "BUDGET_NOT_FEASIBLE", message: string) {
+    super(message);
+    this.name = "ItineraryGenerationInfeasibleError";
+    this.code = code;
+  }
+}
+
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import countryFactsData from "@/lib/facts/country-facts-data.json";
 import {
@@ -3195,6 +3221,38 @@ export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagn
   );
 }
 
+/** Dev-log-friendly summary of exactly which validation gates a plan failed (never all 18 — just the ones that are non-zero/true). */
+function describeFailingDiagnostics(diagnostics: PlanDiagnostics): Record<string, number | boolean> {
+  const failing: Record<string, number | boolean> = {};
+  const numericFields: Array<keyof PlanDiagnostics> = [
+    "missingMeals",
+    "duplicatePlaces",
+    "duplicateWarnings",
+    "overloadedDays",
+    "missingAccommodation",
+    "missingTransport",
+    "avoidConflicts",
+    "invalidCoordinates",
+    "crossCityDays",
+    "longTravelDays",
+    "foodDominantDays",
+    "missingAnchorDays",
+    "longMealDetours",
+    "baseMismatchDays",
+  ];
+  for (const field of numericFields) {
+    const value = diagnostics[field];
+    if (typeof value === "number" && value > 0) failing[field] = value;
+  }
+  if (diagnostics.missingMustVisitKeywords.length > 0) {
+    failing.missingMustVisitKeywords = diagnostics.missingMustVisitKeywords.length;
+  }
+  if (diagnostics.overSoftBudget) failing.overSoftBudget = true;
+  if (diagnostics.outOfBudget) failing.outOfBudget = true;
+  if (diagnostics.diversityRisk) failing.diversityRisk = true;
+  return failing;
+}
+
 function toRawGeneratedPlan(plan: AiItineraryResponse): RawGeneratedPlan {
   return {
     title: plan.title,
@@ -3265,6 +3323,13 @@ export async function generateCountryItineraryPlan(
   );
   const tripFrame = await buildTripFrame(normalizedPayload, dayCount, knowledge);
 
+  logGenerationStage("AI generation started", {
+    isoA2: normalizedPayload.isoA2,
+    dayCount,
+    candidateRecommendations: normalizedPayload.recommendations.length,
+    selectedPlaces: normalizedPayload.selectedPlaces.length,
+  });
+
   let attempts = 0;
   while (attempts < 2) {
     attempts += 1;
@@ -3279,15 +3344,24 @@ export async function generateCountryItineraryPlan(
       const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext);
       const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame);
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
+        logGenerationStage(`AI generation parsed and validated (attempt ${attempts})`);
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
           () => repaired
         );
         return { ...validated, model: ITINERARY_MODEL, usedFallback: false };
       }
-    } catch {
-      // Retry once before falling back.
+      logGenerationStage(`Gemini attempt ${attempts} produced an incomplete/invalid plan`, {
+        isPlanComplete: isPlanComplete(raw, normalizedPayload),
+        failingDiagnostics: describeFailingDiagnostics(diagnostics),
+      });
+    } catch (error) {
+      logGenerationStage(`Gemini attempt ${attempts} failed`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
+
+  logGenerationStage("both Gemini attempts failed validation — falling back to deterministic template");
 
   const fallback = repairPlan(
     toRawGeneratedPlan(buildFallbackAiItinerary(normalizedPayload)),
@@ -3302,12 +3376,18 @@ export async function generateCountryItineraryPlan(
     // should be unreachable in practice — but per spec, a severely broken
     // plan must never be saved silently. Fail loudly with a clear reason
     // instead of returning something invalid.
-    throw new Error(
+    logGenerationStage("failed at fallback-template stage", {
+      failingDiagnostics: describeFailingDiagnostics(fallbackDiagnostics),
+    });
+    throw new ItineraryGenerationInfeasibleError(
+      fallbackDiagnostics.outOfBudget ? "BUDGET_NOT_FEASIBLE" : "PLAN_NOT_FEASIBLE",
       fallbackDiagnostics.outOfBudget
         ? "לא הצלחנו לבנות מסלול בטווח התקציב שהוגדר, גם אחרי תיקון אוטומטי."
         : "לא הצלחנו להסיר כפילויות מהמסלול, גם אחרי תיקון אוטומטי."
     );
   }
+
+  logGenerationStage("fallback template accepted");
 
   return {
     ...fallback,

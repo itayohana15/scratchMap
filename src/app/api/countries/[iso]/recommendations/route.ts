@@ -148,7 +148,12 @@ const getFallbackSeeds = unstable_cache(
     endDate: string | null
   ): Promise<FallbackRecommendationSeed[]> => {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return [];
+    if (!apiKey) {
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Recommendations] GEMINI_API_KEY is not configured — skipping fallback seeds");
+      }
+      return [];
+    }
 
     const client = new GoogleGenAI({ apiKey });
     const priceGuidance = buildFallbackPriceGuidance(category);
@@ -196,7 +201,15 @@ Rules:
     });
 
     const raw = response.text;
-    if (!raw) return [];
+    if (!raw) {
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Recommendations] Gemini returned an empty response for seeds", {
+          category,
+          englishCountryName,
+        });
+      }
+      return [];
+    }
     const parsed = JSON.parse(raw) as Array<{
       name?: string;
       location?: string;
@@ -205,7 +218,7 @@ Rules:
       approximatePrice?: number;
     }>;
 
-    return parsed
+    const seeds = parsed
       .map((item) => ({
         name: item.name?.trim() ?? "",
         location: item.location?.trim() ?? "",
@@ -214,7 +227,22 @@ Rules:
         approximatePrice: normalizeOptionalNumber(item.approximatePrice) ?? undefined,
       }))
       .filter((item) => item.name.length > 0)
-      .slice(0, count * 2);
+      // Nominatim geocoding is now rate-limit-safe (throttled in
+      // nominatim.ts) rather than lossy, so this only needs a small margin
+      // for genuinely un-geocodable seeds — not the 2x buffer that used to
+      // compensate for 429s eating a chunk of every batch.
+      .slice(0, Math.ceil(count * 1.3));
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[Recommendations] Gemini seeds generated", {
+        category,
+        englishCountryName,
+        rawParsedCount: parsed.length,
+        keptSeedCount: seeds.length,
+      });
+    }
+
+    return seeds;
   },
   ["country-category-recommendation-seeds-v2"],
   { revalidate: 60 * 60 * 24 * 30 }
@@ -235,8 +263,17 @@ async function buildFallbackRecommendations(
     count,
     startDate,
     endDate
-  ).catch(() => []);
+  ).catch((error) => {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[Recommendations] getFallbackSeeds threw", {
+        category,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return [];
+  });
 
+  let geocodeFailures = 0;
   const results = (
     await Promise.all(
       seeds.map(async (seed, index): Promise<TripRecommendation | null> => {
@@ -253,7 +290,10 @@ async function buildFallbackRecommendations(
             (qualifiedQuery !== seed.name
               ? (await searchPlaces(seed.name, { countryCode: isoA2, limit: 1 }))[0]
               : undefined);
-          if (!match) return null;
+          if (!match) {
+            geocodeFailures += 1;
+            return null;
+          }
 
           return {
             id: `fallback-${category}-${index}-${seed.name}`,
@@ -277,12 +317,28 @@ async function buildFallbackRecommendations(
             wheelchairAccessible: null,
             isFree: null,
           };
-        } catch {
+        } catch (error) {
+          if (process.env.NODE_ENV !== "production") {
+            console.log("[Recommendations] Nominatim geocoding threw for a seed", {
+              category,
+              seedName: seed.name,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
           return null;
         }
       })
     )
   ).filter((item): item is TripRecommendation => item != null);
+
+  if (process.env.NODE_ENV !== "production" && seeds.length > 0) {
+    console.log("[Recommendations] fallback geocoding summary", {
+      category,
+      seedCount: seeds.length,
+      geocodeFailures,
+      matchedCount: results.length,
+    });
+  }
 
   return dedupeRecommendations(results).slice(0, count);
 }
@@ -297,8 +353,20 @@ export async function GET(request: Request, { params }: { params: Promise<{ iso:
   const endDate = searchParams.get("end");
   const retrievedAt = new Date().toISOString();
 
-  if (!category || !CATEGORY_VALUES.has(category)) {
-    return NextResponse.json({ error: "category is required" }, { status: 400 });
+  if (!category) {
+    return NextResponse.json(
+      { error: "MISSING_CATEGORY", message: "Query parameter 'category' is required." },
+      { status: 400 }
+    );
+  }
+  if (!CATEGORY_VALUES.has(category)) {
+    return NextResponse.json(
+      {
+        error: "UNSUPPORTED_CATEGORY",
+        message: `This endpoint does not serve AI-sourced recommendations for category "${category}". Supported categories: ${[...CATEGORY_VALUES].join(", ")}.`,
+      },
+      { status: 400 }
+    );
   }
 
   const englishCountryName = isoCountries.getName(isoA2, "en") ?? isoA2;

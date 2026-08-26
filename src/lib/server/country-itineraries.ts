@@ -233,6 +233,12 @@ async function loadPersonalizationSummary(supabase: DbClient): Promise<string | 
   }
 }
 
+function devLog(message: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  if (details) console.log(`[Itinerary] ${message}`, details);
+  else console.log(`[Itinerary] ${message}`);
+}
+
 export async function generateAndStoreCountryItinerary(
   supabase: DbClient,
   country: Tables<"countries">,
@@ -240,10 +246,12 @@ export async function generateAndStoreCountryItinerary(
   guide: CountryAiRecommendation | null
 ) {
   const personalizationSummary = await loadPersonalizationSummary(supabase);
+  devLog("profile loaded", { hasPersonalizationSummary: personalizationSummary != null });
   const generated = await generateCountryItineraryPlan(
     { ...payload, personalizationSummary },
     guide
   );
+  devLog("AI generation complete", { days: generated.days.length, usedFallback: generated.usedFallback });
   const initialWorkspace = buildInitialWorkspace(country.name, payload);
   const generatedWorkspace = applyAiPlanToWorkspace(initialWorkspace, generated);
   const costSummary = computeItineraryCostSummary(generatedWorkspace);
@@ -258,6 +266,7 @@ export async function generateAndStoreCountryItinerary(
     country.iso_a2
   );
 
+  devLog("database save started");
   const { data, error } = await supabase
     .from("country_itineraries")
     .insert({
@@ -284,7 +293,10 @@ export async function generateAndStoreCountryItinerary(
     })
     .select("*")
     .single();
-  if (error) throw toCountryItineraryStorageError(error);
+  if (error) {
+    devLog("failed at database insert", { message: error.message, code: error.code });
+    throw toCountryItineraryStorageError(error);
+  }
 
   const itinerary = normalizeCountryItineraryRow(data);
   await insertVersion(supabase, itinerary, "ai", "initial generation");

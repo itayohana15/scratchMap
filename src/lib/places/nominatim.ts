@@ -11,6 +11,25 @@ export interface GeocodedPlace {
 
 const USER_AGENT = "ScratchMap/1.0 (personal travel-tracking app, single user, low volume)";
 
+// Nominatim's usage policy caps clients at ~1 request/second, but callers
+// like the recommendations fallback geocode many seed places via
+// `Promise.all` — a guaranteed 429 storm without this. A process-wide queue
+// (rather than a per-call delay) serializes every `searchPlaces` call from
+// every route that uses it, so no caller needs to know about the limit.
+const MIN_REQUEST_INTERVAL_MS = 1100;
+let requestQueue: Promise<unknown> = Promise.resolve();
+
+function throttled<T>(task: () => Promise<T>): Promise<T> {
+  const result = requestQueue.then(async () => {
+    const value = await task();
+    await new Promise((resolve) => setTimeout(resolve, MIN_REQUEST_INTERVAL_MS));
+    return value;
+  });
+  // Keep the chain alive even when one queued call rejects.
+  requestQueue = result.catch(() => undefined);
+  return result;
+}
+
 interface NominatimResult {
   display_name: string;
   name?: string;
@@ -46,10 +65,12 @@ export async function searchPlaces(
     if (opts.bounded) params.set("bounded", "1");
   }
 
-  const res = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
-    headers: { "User-Agent": USER_AGENT, "Accept-Language": "he" },
-    next: { revalidate: 60 * 60 * 24 },
-  });
+  const res = await throttled(() =>
+    fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+      headers: { "User-Agent": USER_AGENT, "Accept-Language": "he" },
+      next: { revalidate: 60 * 60 * 24 },
+    })
+  );
   if (!res.ok) throw new Error(`Nominatim request failed (${res.status})`);
 
   const data = (await res.json()) as NominatimResult[];

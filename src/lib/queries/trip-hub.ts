@@ -123,3 +123,63 @@ export function useDuplicateTripHubItinerary() {
     },
   });
 }
+
+/** Trip-hub-scoped counterparts to the dialog's own rename/archive/delete mutations — same routes, but also invalidate tripHubKeys.all so the Trips page gallery updates immediately with no browser refresh. */
+export function useRenameTripHubItinerary() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ isoA2, itineraryId, title }: { isoA2: string; itineraryId: string; title: string }) => {
+      const data = await parseJson<{ itinerary: CountryItineraryRecord }>(
+        await fetch(`/api/countries/${isoA2.toLowerCase()}/itineraries/${itineraryId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title }),
+        })
+      );
+      return data.itinerary;
+    },
+    onSuccess: (_itinerary, variables) => {
+      queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
+    },
+  });
+}
+
+export function useArchiveTripHubItinerary() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ isoA2, itineraryId }: { isoA2: string; itineraryId: string }) => {
+      const data = await parseJson<{ itinerary: CountryItineraryRecord }>(
+        await fetch(`/api/countries/${isoA2.toLowerCase()}/itineraries/${itineraryId}/archive`, {
+          method: "POST",
+        })
+      );
+      return data.itinerary;
+    },
+    onSuccess: (_itinerary, variables) => {
+      queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
+    },
+  });
+}
+
+export function useDeleteTripHubItinerary() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ isoA2, itineraryId }: { isoA2: string; itineraryId: string }) => {
+      await parseJson<{ ok: true }>(
+        await fetch(`/api/countries/${isoA2.toLowerCase()}/itineraries/${itineraryId}`, {
+          method: "DELETE",
+        })
+      );
+      return { isoA2, itineraryId };
+    },
+    onSuccess: (variables) => {
+      queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
+    },
+  });
+}

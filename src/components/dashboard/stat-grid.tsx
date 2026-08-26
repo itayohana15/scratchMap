@@ -23,7 +23,7 @@ export function StatGrid({ stats, isLoading, countriesTotal }: StatGridProps) {
   if (isLoading || !stats) {
     return (
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-        {Array.from({ length: 8 }).map((_, i) => (
+        {Array.from({ length: 7 }).map((_, i) => (
           <Skeleton key={i} className="h-20 rounded-2xl" />
         ))}
       </div>
@@ -37,11 +37,18 @@ export function StatGrid({ stats, isLoading, countriesTotal }: StatGridProps) {
       icon: Globe2,
     },
     { label: "מדינות מתוכננות", value: stats.countriesPlanned, icon: Globe2 },
-    { label: "ערים שביקרתם בהן", value: stats.citiesVisited, icon: MapPinned },
-    { label: "ערים מתוכננות", value: stats.citiesPlanned, icon: MapPinned },
+    {
+      label: stats.citiesVisited.isPartial ? "ערים מתועדות" : "ערים שביקרתם בהן",
+      value: stats.citiesVisited.value > 0 ? `${stats.citiesVisited.value}${stats.citiesVisited.isPartial ? "+" : ""}` : "—",
+      icon: MapPinned,
+    },
     { label: "סה״כ טיולים", value: stats.totalTrips, icon: Plane },
-    { label: "ימי טיול", value: stats.totalDaysTraveled, icon: CalendarRange },
-    { label: "סה״כ הוצאות", value: formatCurrency(stats.totalExpenses), icon: Banknote },
+    {
+      label: "ימי טיול",
+      value: stats.totalDaysTraveled.value > 0 ? `${stats.totalDaysTraveled.value}${stats.totalDaysTraveled.isPartial ? "+" : ""}` : "—",
+      icon: CalendarRange,
+    },
+    { label: "סה״כ הוצאות", value: stats.totalExpenses.hasData ? formatCurrency(stats.totalExpenses.value) : "—", icon: Banknote },
     { label: "דירוג ממוצע", value: formatRating(stats.averageRating), icon: Star },
   ];
 
@@ -56,7 +63,7 @@ export function StatGrid({ stats, isLoading, countriesTotal }: StatGridProps) {
             <Heart className="size-5" />
           </div>
           <div>
-            <p className="text-lg font-semibold">{stats.favoriteCountry.name}</p>
+            <p className="text-lg font-semibold">{stats.favoriteCountry.countryName}</p>
             <p className="text-xs text-muted-foreground">מדינה מועדפת</p>
           </div>
         </div>

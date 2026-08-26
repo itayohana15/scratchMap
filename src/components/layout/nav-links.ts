@@ -8,7 +8,7 @@ export interface NavLink {
 }
 
 export const navLinks: NavLink[] = [
-  { href: "/dashboard", label: "לוח בקרה", icon: LayoutDashboard },
+  { href: "/dashboard", label: "דף הבית", icon: LayoutDashboard },
   { href: "/trips", label: "הטיולים שלי", icon: Luggage },
   { href: "/map", label: "מפה", icon: Map },
   { href: "/passport", label: "דרכון הטיולים שלי", icon: Stamp },

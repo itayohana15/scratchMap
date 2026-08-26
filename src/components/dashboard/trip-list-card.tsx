@@ -1,17 +1,18 @@
 import { Plane } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatCurrency, formatDateRange } from "@/lib/format";
-import type { Tables } from "@/lib/supabase/types";
+import { formatTripDateRange } from "@/lib/format";
+import type { TripHubTrip } from "@/lib/trip-hub";
 
 interface TripListCardProps {
   title: string;
-  trips: Tables<"trips">[] | undefined;
+  trips: TripHubTrip[] | undefined;
   isLoading: boolean;
   emptyLabel: string;
+  onOpen: (trip: TripHubTrip) => void;
 }
 
-export function TripListCard({ title, trips, isLoading, emptyLabel }: TripListCardProps) {
+export function TripListCard({ title, trips, isLoading, emptyLabel, onOpen }: TripListCardProps) {
   return (
     <section className="glass-card space-y-3 p-4">
       <h2 className="font-heading text-lg font-semibold">{title}</h2>
@@ -25,24 +26,27 @@ export function TripListCard({ title, trips, isLoading, emptyLabel }: TripListCa
       ) : trips && trips.length > 0 ? (
         <ul className="space-y-2">
           {trips.map((trip) => (
-            <li
-              key={trip.id}
-              className="flex items-center justify-between gap-3 rounded-xl border border-border/60 px-3 py-2.5"
-            >
-              <div className="flex items-center gap-2.5">
-                <Plane className="size-4 text-primary" />
-                <div>
-                  <p className="text-sm font-medium">{trip.name}</p>
-                  {formatDateRange(trip.start_date, trip.end_date) && (
+            <li key={trip.id}>
+              <button
+                type="button"
+                onClick={() => onOpen(trip)}
+                className="flex w-full items-center justify-between gap-3 rounded-xl border border-border/60 px-3 py-2.5 text-right transition-colors hover:border-primary/40 hover:bg-muted/40"
+              >
+                <div className="flex items-center gap-2.5">
+                  <Plane className="size-4 text-primary" />
+                  <div>
+                    <p className="text-sm font-medium">{trip.countryName}</p>
                     <p className="text-xs text-muted-foreground">
-                      {formatDateRange(trip.start_date, trip.end_date)}
+                      <bdi dir="ltr">
+                        {formatTripDateRange(trip.startDate, trip.endDate, trip.itinerary.preferencesSnapshot.partialDate)}
+                      </bdi>
                     </p>
-                  )}
+                  </div>
                 </div>
-              </div>
-              {trip.cost != null && (
-                <span className="text-sm text-muted-foreground">{formatCurrency(trip.cost)}</span>
-              )}
+                {trip.displayCost != null && (
+                  <span className="text-sm text-muted-foreground">₪{Math.round(trip.displayCost).toLocaleString("he-IL")}</span>
+                )}
+              </button>
             </li>
           ))}
         </ul>

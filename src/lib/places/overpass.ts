@@ -242,11 +242,25 @@ async function executeOverpassQuery(query: string, limit: number): Promise<Overp
       signal: controller.signal,
       next: { revalidate: 60 * 60 * 24 },
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      // Silently degrading to [] is intentional (categories with no data
+      // just come back as unavailable, spec-documented above) — but a
+      // non-OK status (rate limit, 5xx) is a real failure, not "no results",
+      // so it's worth surfacing in dev instead of looking identical to "empty".
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Recommendations] Overpass request returned non-OK status", { status: res.status });
+      }
+      return [];
+    }
 
     const data = (await res.json()) as OverpassResponse;
     return normalizeOverpassElements(data, limit);
-  } catch {
+  } catch (error) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[Recommendations] Overpass request failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     return [];
   } finally {
     clearTimeout(timeout);

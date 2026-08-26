@@ -1,7 +1,7 @@
 "use client";
 
 import { CountryBanner } from "@/components/shared/country-banner";
-import { formatDateRange } from "@/lib/format";
+import { formatTripDateRange } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 interface TripHeroProps {
@@ -10,6 +10,7 @@ interface TripHeroProps {
   tripTitle: string;
   startDate: string | null;
   endDate: string | null;
+  partialDate?: string | null;
   durationDays: number;
   citiesCount: number;
   placesCount: number;
@@ -23,13 +24,14 @@ function HeroContent({
   tripTitle,
   startDate,
   endDate,
+  partialDate,
   durationDays,
   citiesCount,
   placesCount,
   overallRating,
 }: Omit<TripHeroProps, "favoritePhotoUrl">) {
   const flagUrl = `/flags/${isoA2.toLowerCase()}.png`;
-  const dateLabel = formatDateRange(startDate, endDate);
+  const dateLabel = formatTripDateRange(startDate, endDate, partialDate);
 
   return (
     <div className="relative flex h-full w-full flex-col justify-end gap-2 p-4 text-white sm:p-6">
@@ -40,7 +42,9 @@ function HeroContent({
         </span>
         <div>
           <h2 className="font-heading text-xl font-bold drop-shadow-sm sm:text-2xl">{countryName}</h2>
-          {dateLabel ? <p className="text-sm text-white/85 drop-shadow-sm">{dateLabel}</p> : null}
+          <p className="text-sm text-white/85 drop-shadow-sm">
+            <bdi dir="ltr">{dateLabel}</bdi>
+          </p>
         </div>
         {overallRating != null ? (
           <span className="mr-auto flex items-center gap-1 rounded-full bg-white/15 px-3 py-1 text-sm font-semibold backdrop-blur-sm">

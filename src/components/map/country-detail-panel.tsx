@@ -1,8 +1,8 @@
 "use client";
 
-import { ArrowRight, Bot, Star } from "lucide-react";
+import { ArrowRight, Bot, CalendarClock, Star } from "lucide-react";
 import Link from "next/link";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { STATUS_LABELS } from "@/components/map/status-colors";
@@ -14,8 +14,10 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { formatTripDateRange } from "@/lib/format";
 import { useCitiesByCountry } from "@/lib/queries/cities";
 import { useCountryByIso, useUpsertCountry } from "@/lib/queries/countries";
+import { useTripHubTrips } from "@/lib/queries/trip-hub";
 import type { Status } from "@/lib/supabase/types";
 
 interface CountryDetailPanelProps {
@@ -35,8 +37,17 @@ export function CountryDetailPanel({
 }: CountryDetailPanelProps) {
   const { data: country, isLoading } = useCountryByIso(iso ?? undefined);
   const { data: cities } = useCitiesByCountry(country?.id);
+  const { data: allTrips = [] } = useTripHubTrips();
   const upsertCountry = useUpsertCountry();
   const [pendingStatus, setPendingStatus] = useState<Status>("planned");
+
+  const countryTrips = useMemo(
+    () => allTrips.filter((trip) => trip.isoA2.toUpperCase() === (iso ?? "").toUpperCase()),
+    [allTrips, iso]
+  );
+  const completedCountryTrips = countryTrips.filter((trip) => trip.status === "completed");
+  const upcomingCountryTrip = countryTrips.find((trip) => trip.status === "upcoming");
+  const visitYears = [...new Set(completedCountryTrips.map((trip) => trip.year))].sort();
 
   async function handleAddCountry(status: Status) {
     if (!iso) return;
@@ -82,6 +93,32 @@ export function CountryDetailPanel({
             </SheetHeader>
 
             <div className="flex-1 space-y-5 overflow-y-auto px-4 pb-4">
+              {countryTrips.length > 0 ? (
+                <section className="rounded-2xl border border-border/60 bg-card/60 p-3">
+                  <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+                    <CalendarClock className="size-3.5 text-primary" />
+                    הטיולים שלי למדינה זו
+                  </h3>
+                  {completedCountryTrips.length > 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      {completedCountryTrips.length} ביקורים · {visitYears.join(" · ")}
+                    </p>
+                  ) : null}
+                  {upcomingCountryTrip ? (
+                    <p className="mt-1 text-sm text-primary">
+                      טיול קרוב:{" "}
+                      <bdi dir="ltr">
+                        {formatTripDateRange(
+                          upcomingCountryTrip.startDate,
+                          upcomingCountryTrip.endDate,
+                          upcomingCountryTrip.itinerary.preferencesSnapshot.partialDate
+                        )}
+                      </bdi>
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
+
               {isLoading ? (
                 <Skeleton className="h-32 rounded-xl" />
               ) : !country ? (

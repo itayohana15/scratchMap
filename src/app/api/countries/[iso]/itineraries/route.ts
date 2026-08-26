@@ -2,9 +2,16 @@ import { NextResponse } from "next/server";
 
 import { normalizeCountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import { buildCountryItinerarySuccessPayload } from "@/lib/itineraries";
+import { ItineraryGenerationInfeasibleError } from "@/lib/server/country-itinerary-generation";
 import { listCountryItineraries, generateAndStoreCountryItinerary } from "@/lib/server/country-itineraries";
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { AiItineraryRequest } from "@/lib/trip-workspace";
+
+function devLog(message: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  if (details) console.log(`[Itinerary] ${message}`, details);
+  else console.log(`[Itinerary] ${message}`);
+}
 
 export async function GET(
   _request: Request,
@@ -33,8 +40,20 @@ export async function POST(
   try {
     payload = (await request.json()) as AiItineraryRequest;
   } catch {
-    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    return NextResponse.json(
+      { error: "INVALID_REQUEST_BODY", message: "Request body is not valid JSON." },
+      { status: 400 }
+    );
   }
+
+  devLog("request received", {
+    isoA2: iso.toUpperCase(),
+    clientRequestId: payload.clientRequestId,
+    startDate: payload.preferences?.startDate,
+    endDate: payload.preferences?.endDate,
+    travelers: payload.preferences?.travelers,
+    budget: payload.preferences?.budget,
+  });
 
   const supabase = createAdminClient();
 
@@ -44,11 +63,19 @@ export async function POST(
     .eq("iso_a2", iso.toUpperCase())
     .maybeSingle();
   if (countryError) {
-    return NextResponse.json({ error: countryError.message }, { status: 500 });
+    devLog("failed at country lookup", { message: countryError.message });
+    return NextResponse.json(
+      { error: "DATABASE_ERROR", message: countryError.message },
+      { status: 500 }
+    );
   }
   if (!country) {
-    return NextResponse.json({ error: "Country not found" }, { status: 404 });
+    return NextResponse.json(
+      { error: "COUNTRY_NOT_FOUND", message: `No country found for ISO "${iso}".` },
+      { status: 404 }
+    );
   }
+  devLog("validated");
 
   try {
     const { data: guideRow } = await supabase
@@ -72,13 +99,24 @@ export async function POST(
       guide
     );
 
+    devLog("database save complete", { itineraryId: itinerary.id });
+
     return NextResponse.json({
       itinerary,
       success: buildCountryItinerarySuccessPayload(itinerary, country.name),
     });
   } catch (error) {
+    if (error instanceof ItineraryGenerationInfeasibleError) {
+      devLog("failed — plan not feasible", { code: error.code, message: error.message });
+      return NextResponse.json({ error: error.code, message: error.message }, { status: 422 });
+    }
+    // Unexpected — always logged server-side, never silently swallowed.
+    console.error("[Itinerary] failed at generation/save stage:", error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to generate itinerary" },
+      {
+        error: "GENERATION_FAILED",
+        message: error instanceof Error ? error.message : "Failed to generate itinerary",
+      },
       { status: 500 }
     );
   }

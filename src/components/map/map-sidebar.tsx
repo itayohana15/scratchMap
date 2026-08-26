@@ -1,13 +1,13 @@
 "use client";
 
-import { Filter, Search } from "lucide-react";
+import type { ReactNode } from "react";
+import { Search } from "lucide-react";
 
 import { STATUS_LABELS } from "@/components/map/status-colors";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import type { Status } from "@/lib/supabase/types";
@@ -19,12 +19,110 @@ export interface SearchableCountry {
   status?: Status;
 }
 
+export interface CountrySidebarEntry {
+  iso: string;
+  name: string;
+  subtitle?: string;
+}
+
+export type MapStatusFilter = "all" | "visited" | "planned" | "not_visited";
+
+const STATUS_FILTERS: Array<{ value: MapStatusFilter; label: string }> = [
+  { value: "all", label: "הכל" },
+  { value: "visited", label: "ביקרתי" },
+  { value: "planned", label: "מתוכנן" },
+  { value: "not_visited", label: "לא ביקרתי" },
+];
+
+const MAX_LIST_RESULTS = 10;
+const MAX_GROUP_ROWS = 5;
+
 function countryFlag(iso: string) {
   const normalizedIso = iso.trim().toUpperCase();
   if (!/^[A-Z]{2}$/.test(normalizedIso)) return "🏳️";
 
   return String.fromCodePoint(
     ...Array.from(normalizedIso, (char) => 127397 + char.charCodeAt(0))
+  );
+}
+
+function CountryRow({
+  iso,
+  name,
+  subtitle,
+  right,
+  isSelected,
+  onSelect,
+}: {
+  iso: string;
+  name: string;
+  subtitle?: string;
+  right?: ReactNode;
+  isSelected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      title={iso}
+      className={cn(
+        "h-auto w-full justify-between rounded-xl border border-transparent px-3 py-2 text-right hover:border-border/80 hover:bg-background/80",
+        isSelected && "border-border bg-background shadow-sm"
+      )}
+      onClick={onSelect}
+    >
+      <span className="inline-flex min-w-0 max-w-full flex-row-reverse items-center gap-2 truncate">
+        <span className="shrink-0" aria-hidden="true">
+          {countryFlag(iso)}
+        </span>
+        <span className="flex min-w-0 flex-col items-start truncate">
+          <span className="truncate font-medium">{name}</span>
+          {subtitle ? (
+            <span className="truncate text-xs text-muted-foreground">
+              <bdi dir="ltr">{subtitle}</bdi>
+            </span>
+          ) : null}
+        </span>
+      </span>
+      {right}
+    </Button>
+  );
+}
+
+function GroupSection({
+  title,
+  entries,
+  selectedIso,
+  onCountrySelect,
+}: {
+  title: string;
+  entries: CountrySidebarEntry[];
+  selectedIso: string | null;
+  onCountrySelect: (iso: string) => void;
+}) {
+  if (entries.length === 0) return null;
+
+  const visible = entries.slice(0, MAX_GROUP_ROWS);
+  const hidden = entries.length - visible.length;
+
+  return (
+    <div className="space-y-1.5">
+      <p className="px-1 text-xs font-semibold text-muted-foreground">{title}</p>
+      <div className="space-y-1">
+        {visible.map((entry) => (
+          <CountryRow
+            key={entry.iso}
+            iso={entry.iso}
+            name={entry.name}
+            subtitle={entry.subtitle}
+            isSelected={selectedIso === entry.iso}
+            onSelect={() => onCountrySelect(entry.iso)}
+          />
+        ))}
+      </div>
+      {hidden > 0 ? <p className="px-1 text-xs text-muted-foreground">ועוד {hidden} מדינות</p> : null}
+    </div>
   );
 }
 
@@ -37,6 +135,11 @@ interface MapSidebarProps {
   selectedLabel: string | null;
   selectedIso: string | null;
   totalCountries: number;
+  statusFilter: MapStatusFilter;
+  onStatusFilterChange: (value: MapStatusFilter) => void;
+  upcomingEntries: CountrySidebarEntry[];
+  visitedEntries: CountrySidebarEntry[];
+  recentEntries: CountrySidebarEntry[];
 }
 
 export function MapSidebar({
@@ -48,26 +151,33 @@ export function MapSidebar({
   selectedLabel,
   selectedIso,
   totalCountries,
+  statusFilter,
+  onStatusFilterChange,
+  upcomingEntries,
+  visitedEntries,
+  recentEntries,
 }: MapSidebarProps) {
-  const resultLabel = query.trim()
-    ? `${countries.length} תוצאות`
-    : `${totalCountries} מדינות זמינות`;
+  const trimmedQuery = query.trim();
+  const isDefaultView = !trimmedQuery && statusFilter === "all";
+
+  const visibleList = countries.slice(0, MAX_LIST_RESULTS);
+  const hiddenListCount = Math.max(countries.length - MAX_LIST_RESULTS, 0);
+
+  const hasDefaultContent =
+    upcomingEntries.length > 0 || visitedEntries.length > 0 || recentEntries.length > 0;
 
   return (
     <aside className="flex min-h-[320px] flex-col gap-4 lg:h-full lg:min-h-0">
-      <Card className="flex-1 rounded-3xl border border-border/70 bg-card/95 shadow-sm backdrop-blur-sm">
-        <CardHeader className="border-b border-border/60">
-          <CardTitle className="flex items-center gap-2">
+      <Card className="flex min-h-0 flex-1 flex-col rounded-3xl border border-border/70 bg-card/95 shadow-sm backdrop-blur-sm">
+        <CardHeader className="shrink-0 border-b border-border/60 py-3">
+          <CardTitle className="flex items-center gap-2 text-base">
             <Search className="size-4 text-primary" />
             חיפוש מדינות
           </CardTitle>
-          <CardDescription>
-            חפשו מדינה לפי שם או קוד, ובהמשך תוכלו להוסיף כאן עוד פילטרים.
-          </CardDescription>
         </CardHeader>
 
-        <CardContent className="flex min-h-0 flex-1 flex-col gap-4 pt-4">
-          <div className="relative">
+        <CardContent className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden pt-3">
+          <div className="relative shrink-0">
             <Search className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               type="search"
@@ -78,86 +188,98 @@ export function MapSidebar({
             />
           </div>
 
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>{resultLabel}</span>
-            {selectedIso && (
-              <span className="truncate">
-                נבחרה: {selectedLabel ?? selectedIso}
-              </span>
-            )}
+          <div className="flex shrink-0 flex-wrap gap-1.5">
+            {STATUS_FILTERS.map((filter) => (
+              <button
+                key={filter.value}
+                type="button"
+                onClick={() => onStatusFilterChange(filter.value)}
+                className={cn(
+                  "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                  statusFilter === filter.value
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border bg-card text-muted-foreground hover:bg-hover hover:text-foreground"
+                )}
+              >
+                {filter.label}
+              </button>
+            ))}
           </div>
 
-          <div className="min-h-0 flex-1 rounded-2xl border border-border/60 bg-muted/20">
+          {!isDefaultView ? (
+            <div className="flex shrink-0 items-center justify-between text-xs text-muted-foreground">
+              <span>{trimmedQuery ? `${countries.length} תוצאות` : `מתוך ${totalCountries} מדינות`}</span>
+              {selectedIso && <span className="truncate">נבחרה: {selectedLabel ?? selectedIso}</span>}
+            </div>
+          ) : null}
+
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-border/60 bg-muted/20 p-2.5">
             {isLoading ? (
-              <div className="space-y-2 p-3">
-                <Skeleton className="h-12 rounded-xl" />
-                <Skeleton className="h-12 rounded-xl" />
-                <Skeleton className="h-12 rounded-xl" />
-                <Skeleton className="h-12 rounded-xl" />
+              <div className="space-y-2">
+                <Skeleton className="h-11 rounded-xl" />
+                <Skeleton className="h-11 rounded-xl" />
+                <Skeleton className="h-11 rounded-xl" />
               </div>
-            ) : (
-              <ScrollArea className="h-[260px] lg:h-full">
-                <div className="space-y-2 p-3">
-                  {countries.length > 0 ? (
-                    countries.map((country) => {
-                      const isSelected = selectedIso === country.iso;
-
-                      return (
-                        <Button
-                          key={country.iso}
-                          type="button"
-                          variant="ghost"
-                          className={cn(
-                            "h-auto w-full justify-between rounded-xl border border-transparent px-3 py-3 text-right hover:border-border/80 hover:bg-background/80",
-                            isSelected && "border-border bg-background shadow-sm"
-                          )}
-                          onClick={() => onCountrySelect(country.iso)}
-                        >
-                          <span className="min-w-0 text-right">
-                            <span className="inline-flex max-w-full flex-row-reverse items-center gap-2 truncate font-medium">
-                              <span className="shrink-0" aria-hidden="true">
-                                {countryFlag(country.iso)}
-                              </span>
-                              <span className="truncate">{country.name}</span>
-                            </span>
-                            <span
-                              dir="ltr"
-                              className="mt-1 block text-[0.72rem] text-muted-foreground"
-                            >
-                              {country.iso}
-                              {country.iso3 ? ` · ${country.iso3}` : ""}
-                            </span>
-                          </span>
-
-                          <Badge variant={country.status ? "secondary" : "outline"}>
-                            {country.status ? STATUS_LABELS[country.status] : "לא נשמרה"}
-                          </Badge>
-                        </Button>
-                      );
-                    })
-                  ) : (
-                    <div className="rounded-2xl border border-dashed border-border/70 bg-background/60 px-4 py-6 text-center text-sm text-muted-foreground">
-                      לא נמצאו מדינות שתואמות לחיפוש.
-                    </div>
-                  )}
+            ) : isDefaultView ? (
+              hasDefaultContent ? (
+                <div className="space-y-3 overflow-hidden">
+                  <GroupSection
+                    title="הטיולים הקרובים שלי"
+                    entries={upcomingEntries}
+                    selectedIso={selectedIso}
+                    onCountrySelect={onCountrySelect}
+                  />
+                  <GroupSection
+                    title="מדינות שביקרתי"
+                    entries={visitedEntries}
+                    selectedIso={selectedIso}
+                    onCountrySelect={onCountrySelect}
+                  />
+                  <GroupSection
+                    title="נצפו לאחרונה"
+                    entries={recentEntries}
+                    selectedIso={selectedIso}
+                    onCountrySelect={onCountrySelect}
+                  />
                 </div>
-              </ScrollArea>
+              ) : (
+                <div className="flex h-full items-center justify-center px-4 text-center text-sm text-muted-foreground">
+                  חפשו מדינה למעלה כדי להתחיל, או לחצו על מדינה במפה.
+                </div>
+              )
+            ) : (
+              <div className="space-y-1 overflow-hidden">
+                {visibleList.length > 0 ? (
+                  visibleList.map((country) => (
+                    <CountryRow
+                      key={country.iso}
+                      iso={country.iso}
+                      name={country.name}
+                      isSelected={selectedIso === country.iso}
+                      onSelect={() => onCountrySelect(country.iso)}
+                      right={
+                        <Badge variant={country.status ? "secondary" : "outline"}>
+                          {country.status ? STATUS_LABELS[country.status] : "לא נשמרה"}
+                        </Badge>
+                      }
+                    />
+                  ))
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-border/70 bg-background/60 px-4 py-6 text-center text-sm text-muted-foreground">
+                    לא נמצאו מדינות שתואמות לחיפוש.
+                  </div>
+                )}
+                {hiddenListCount > 0 ? (
+                  <p className="px-1 pt-1 text-xs text-muted-foreground">
+                    {trimmedQuery
+                      ? `ועוד ${hiddenListCount} תוצאות — המשיכו להקליד כדי לצמצם`
+                      : `ועוד ${hiddenListCount} מדינות — הקלידו כדי לחפש`}
+                  </p>
+                ) : null}
+              </div>
             )}
           </div>
         </CardContent>
-      </Card>
-
-      <Card className="rounded-3xl border border-dashed border-border/70 bg-card/80 shadow-sm">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Filter className="size-4 text-primary" />
-            אזור לפילטרים נוספים
-          </CardTitle>
-          <CardDescription>
-            השארתי כאן מקום מסודר כדי שתוכלו להוסיף בהמשך פילטרים נוספים בלי לשנות את מבנה
-            העמוד.
-          </CardDescription>
-        </CardHeader>
       </Card>
     </aside>
   );

@@ -8,7 +8,7 @@ export default function NotFound() {
       <h1 className="font-heading text-2xl font-semibold">הדף לא נמצא</h1>
       <p className="text-sm text-muted-foreground">הדף שחיפשתם לא קיים.</p>
       <Button nativeButton={false} render={<Link href="/dashboard" />}>
-        חזרה ללוח הבקרה
+        חזרה לדף הבית
       </Button>
     </div>
   );

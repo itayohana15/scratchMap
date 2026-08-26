@@ -21,6 +21,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { AttractionModal } from "@/components/country/attraction-modal";
+import {
+  AiGenerationProgressModal,
+  isMeaningfullyOverBudget,
+  type BudgetWarningAction,
+  type GenerationModalView,
+} from "@/components/country/ai-generation-progress-modal";
 import { RecommendationFeedbackButtons } from "@/components/country/recommendation-feedback-buttons";
 import { CountryAboutSection } from "@/components/country/country-about-section";
 import { CountryItineraryHistorySection } from "@/components/country/country-itinerary-history-section";
@@ -30,6 +36,12 @@ import { CountryCurrencyConverter } from "@/components/country/country-currency-
 import { CountrySafetyInfo } from "@/components/country/country-safety-info";
 import { CountryTripSummarySection } from "@/components/country/country-trip-summary-section";
 import { CountryWeatherSection } from "@/components/country/country-weather-section";
+import {
+  ProfilePreferencesSummary,
+  TripOverridesSection,
+  TripSpecialRequirementsSection,
+  useProfileDerivedTripDefaults,
+} from "@/components/country/trip-preferences-panel";
 import { useCountryMiniMap } from "@/components/country/use-country-mini-map";
 import type { useCountryTripWorkspace } from "@/components/country/use-country-trip-workspace";
 import { CountryAiRecommendations } from "@/components/shared/country-ai-recommendations";
@@ -64,6 +76,10 @@ import {
   type CountryItineraryRecord,
 } from "@/lib/itineraries";
 import {
+  buildGenerationStages,
+  useItineraryGenerationProgress,
+} from "@/lib/hooks/use-itinerary-generation-progress";
+import {
   useCountryItineraries,
   useGenerateCountryItinerary,
   type GenerateCountryItineraryResult,
@@ -84,7 +100,6 @@ import {
   BOOKING_TYPE_LABELS,
   DAY_PART_LABELS,
   EXPENSE_CATEGORY_LABELS,
-  ITINERARY_GENERATION_MODE_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
   TRIP_STATUS_LABELS,
   buildMapLink,
@@ -119,15 +134,16 @@ interface CountryTripWorkspaceContentProps {
 }
 
 const ALL_CATEGORIES = Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[];
+// "practical" (סידורים) is deliberately never served by
+// /api/countries/[iso]/recommendations — it's user- or template-generated,
+// never AI-sourced (see that route's CATEGORY_VALUES). Any code path that
+// actually calls the recommendations API must exclude it, or every request
+// for it 400s. UI-only lists (map-marker filter chips, the manual
+// "add recommendation" category picker) keep using ALL_CATEGORIES since
+// they never trigger a fetch for the selected category.
+const AI_SOURCED_CATEGORIES = ALL_CATEGORIES.filter((category) => category !== "practical");
 const API_RECOMMENDATION_COUNT = 10;
 const SLOT_OPTIONS: DayPart[] = ["morning", "lunch", "afternoon", "dinner", "evening", "night"];
-const AI_GENERATION_STAGES = [
-  "מנתחים העדפות ותאריכים",
-  "בוחרים ערים ואזורים מתאימים",
-  "מסדרים ימי נסיעה ומנוחה",
-  "מחשבים מסלול ועלויות משוערות",
-  "שומרים את המסלול למסד הנתונים",
-];
 
 function createEmptyRecommendationDraft(): TripRecommendation {
   return {
@@ -883,12 +899,15 @@ export function CountryTripWorkspaceContent({
   const { data: hotelPlaces } = usePlacesForCountry(country.id, "hotel");
   const generateSavedItinerary = useGenerateCountryItinerary(iso);
   const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
-  const [aiGenerationStageIndex, setAiGenerationStageIndex] = useState(0);
+  const generationStages = useMemo(() => buildGenerationStages(country.name), [country.name]);
+  const generationProgress = useItineraryGenerationProgress<GenerateCountryItineraryResult>(generationStages);
   const [autoOpenItineraryId, setAutoOpenItineraryId] = useState<string | null>(null);
   const [successDialogPayload, setSuccessDialogPayload] =
     useState<CountryItineraryGenerationSuccessPayload | null>(null);
   const latestGeneratedItineraryRef = useRef<CountryItineraryRecord | null>(null);
   const lastShownSuccessItineraryIdRef = useRef<string | null>(null);
+  const profileDefaults = useProfileDerivedTripDefaults();
+  const hasSyncedProfileDefaultsRef = useRef(false);
   const [activeRecommendationCategory, setActiveRecommendationCategory] =
     useState<RecommendationCategory>("attraction");
   const [apiRecommendationsByCategory, setApiRecommendationsByCategory] = useState<
@@ -930,20 +949,55 @@ export function CountryTripWorkspaceContent({
   const [recommendationDraft, setRecommendationDraft] =
     useState<TripRecommendation>(createEmptyRecommendationDraft);
 
+  // Runs once: brand-new/never-touched workspaces (still at factory defaults)
+  // start from the profile's derived pace/interests instead of a generic
+  // "balanced"/empty default (spec §A1/§A8 — never overwrites a trip that
+  // already has explicit or loaded values).
   useEffect(() => {
-    if (!generateSavedItinerary.isPending) {
-      setAiGenerationStageIndex(0);
+    if (hasSyncedProfileDefaultsRef.current || profileDefaults.isLoading) return;
+    hasSyncedProfileDefaultsRef.current = true;
+    if (workspace.preferences.tripPace === "balanced" && workspace.preferences.interests === "") {
+      actions.updatePreferences({
+        tripPace: profileDefaults.derivedPace,
+        interests: profileDefaults.derivedInterests,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileDefaults.isLoading]);
+
+  // Post-generation handoff (spec §B11/B12/B14): loads the result into the
+  // workspace immediately, then either holds on a brief "success" beat before
+  // handing off to the existing success dialog, or — if the real cost meaningfully
+  // exceeds the configured budget — stays on the modal's budget-warning view.
+  useEffect(() => {
+    if (generationProgress.status !== "success" || !generationProgress.result) return;
+    const result = generationProgress.result;
+    actions.loadWorkspace(createWorkspaceFromItineraryRecord(result.itinerary, country.name));
+    latestGeneratedItineraryRef.current = result.itinerary;
+    setSelectedDayId(result.itinerary.itineraryDays[0]?.id ?? "");
+
+    if (
+      isMeaningfullyOverBudget(result.itinerary.costSummary.totalEstimatedCost, workspace.preferences.budget)
+    ) {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      setAiGenerationStageIndex((current) =>
-        current < AI_GENERATION_STAGES.length - 1 ? current + 1 : current
-      );
-    }, 1200);
+    const timeoutId = window.setTimeout(() => {
+      generationProgress.reset();
+      if (
+        canOpenSuccessDialog(result) &&
+        lastShownSuccessItineraryIdRef.current !== result.success.itineraryId
+      ) {
+        lastShownSuccessItineraryIdRef.current = result.success.itineraryId;
+        setSuccessDialogPayload(result.success);
+      } else {
+        toast.success("המסלול נוצר ונשמר בהיסטוריה");
+      }
+    }, 800);
 
-    return () => window.clearInterval(intervalId);
-  }, [generateSavedItinerary.isPending]);
+    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generationProgress.status, generationProgress.result]);
 
   useEffect(() => {
     if (!workspace.itineraryDays.some((day) => day.id === selectedDayId)) {
@@ -977,7 +1031,7 @@ export function CountryTripWorkspaceContent({
   useEffect(() => {
     if (!shouldWarmAllRecommendationCategories || !iso) return;
 
-    const categoriesToWarm = ALL_CATEGORIES.filter(
+    const categoriesToWarm = AI_SOURCED_CATEGORIES.filter(
       (category) =>
         category !== activeRecommendationCategory && !apiRecommendationsByCategory[category]
     );
@@ -1074,14 +1128,28 @@ export function CountryTripWorkspaceContent({
   }, [liveRecommendations, selectedRecommendation]);
   const budgetComparison = buildTripComparison(workspace);
   const tripStatistics = buildTripStatistics(workspace);
-  const aiGenerationStage = generateSavedItinerary.isPending
-    ? AI_GENERATION_STAGES[aiGenerationStageIndex] ?? AI_GENERATION_STAGES[0]
+  const isGeneratingItinerary = generationProgress.status === "pending";
+  const generationModalView: GenerationModalView =
+    generationProgress.status === "pending"
+      ? "pending"
+      : generationProgress.status === "error"
+        ? "error"
+        : generationProgress.status === "success"
+          ? isMeaningfullyOverBudget(
+              generationProgress.result?.itinerary.costSummary.totalEstimatedCost ?? 0,
+              workspace.preferences.budget
+            )
+            ? "budgetWarning"
+            : "success"
+          : null;
+  const generationSuccessSummary = generationProgress.result
+    ? `נוצר מסלול של ${generationProgress.result.itinerary.daysCount} ימים`
     : null;
 
   async function buildRecommendationsForAiGeneration() {
     if (!iso) return liveRecommendations;
 
-    const categoriesToFetch = ALL_CATEGORIES.filter(
+    const categoriesToFetch = AI_SOURCED_CATEGORIES.filter(
       (category) => !apiRecommendationsByCategory[category]
     );
 
@@ -1129,11 +1197,11 @@ export function CountryTripWorkspaceContent({
       return;
     }
 
-    try {
-      setAiGenerationStageIndex(0);
-      setSuccessDialogPayload(null);
-      const recommendationsForGeneration = await buildRecommendationsForAiGeneration();
-      const result = await generateSavedItinerary.mutateAsync({
+    setSuccessDialogPayload(null);
+    const recommendationsForGeneration = await buildRecommendationsForAiGeneration();
+    const clientRequestId = crypto.randomUUID();
+    await generationProgress.start((signal) =>
+      generateSavedItinerary.mutateAsync({
         countryId: country.id,
         countryName: country.name,
         isoA2: iso.toUpperCase(),
@@ -1143,23 +1211,34 @@ export function CountryTripWorkspaceContent({
         recommendations: recommendationsForGeneration,
         bookings: workspace.bookings,
         existingDays: workspace.itineraryDays,
-      });
-      actions.loadWorkspace(createWorkspaceFromItineraryRecord(result.itinerary, country.name));
-      latestGeneratedItineraryRef.current = result.itinerary;
-      setSelectedDayId(result.itinerary.itineraryDays[0]?.id ?? "");
+        clientRequestId,
+        signal,
+      })
+    );
+  }
 
-      if (
-        canOpenSuccessDialog(result) &&
-        lastShownSuccessItineraryIdRef.current !== result.success.itineraryId
-      ) {
-        lastShownSuccessItineraryIdRef.current = result.success.itineraryId;
-        setSuccessDialogPayload(result.success);
-        return;
-      }
+  function handleCancelGeneration() {
+    generationProgress.cancel();
+  }
 
-      toast.success("המסלול נוצר ונשמר בהיסטוריה");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "בניית המסלול נכשלה");
+  function handleCloseGenerationModal() {
+    generationProgress.reset();
+  }
+
+  function handleBudgetWarningAction(action: BudgetWarningAction) {
+    generationProgress.reset();
+    switch (action) {
+      case "cheaper":
+        toast.info('אפשר לבחור Mode חסכוני יותר תחת "דרישות מיוחדות" וליצור מסלול מחדש.');
+        break;
+      case "increaseBudget":
+        toast.info("אפשר לעדכן את התקציב בהגדרות הטיול וליצור מסלול מחדש.");
+        break;
+      case "shorten":
+        toast.info("אפשר לקצר את תאריכי הטיול וליצור מסלול מחדש.");
+        break;
+      case "editAgain":
+        break;
     }
   }
 
@@ -1247,13 +1326,13 @@ export function CountryTripWorkspaceContent({
           title="תכנון חכם"
           description="העדפות הטיול, AI itinerary, הזמנות ותובנות route נבנים כאן יחד."
           action={
-            <Button className="gap-1.5" onClick={handleAiPlan} disabled={generateSavedItinerary.isPending}>
-              {generateSavedItinerary.isPending ? (
+            <Button className="gap-1.5" onClick={() => void handleAiPlan()} disabled={isGeneratingItinerary}>
+              {isGeneratingItinerary ? (
                 <LoaderCircle className="size-4 animate-spin" />
               ) : (
                 <Sparkles className="size-4" />
               )}
-              {generateSavedItinerary.isPending ? "Generating itinerary..." : "Create itinerary with AI"}
+              {isGeneratingItinerary ? "יוצרים מסלול..." : "Create itinerary with AI"}
             </Button>
           }
         >
@@ -1363,31 +1442,31 @@ export function CountryTripWorkspaceContent({
               </div>
             </div>
 
-            <div className="section-card space-y-4 p-4">
-              <div className="flex items-center gap-2">
-                <Save className="size-4 text-primary" />
-                <h3 className="font-medium">העדפות טיול</h3>
-              </div>
-              <div className="space-y-4">
-                <PreferenceField label="סטטוס טיול">
-                  <Select
-                    value={workspace.tripStatus}
-                    onValueChange={(value) => actions.setTripStatus(value as TripPhase)}
-                  >
-                    <SelectTrigger>
-                      <span>{TRIP_STATUS_LABELS[workspace.tripStatus]}</span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {Object.entries(TRIP_STATUS_LABELS).map(([value, label]) => (
-                        <SelectItem key={value} value={value}>
-                          {label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </PreferenceField>
+            <div className="space-y-4">
+              <div className="section-card space-y-4 p-4">
+                <div className="flex items-center gap-2">
+                  <Save className="size-4 text-primary" />
+                  <h3 className="font-medium">הגדרות טיול</h3>
+                </div>
+                <div className="space-y-4">
+                  <PreferenceField label="סטטוס טיול">
+                    <Select
+                      value={workspace.tripStatus}
+                      onValueChange={(value) => actions.setTripStatus(value as TripPhase)}
+                    >
+                      <SelectTrigger>
+                        <span>{TRIP_STATUS_LABELS[workspace.tripStatus]}</span>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {Object.entries(TRIP_STATUS_LABELS).map(([value, label]) => (
+                          <SelectItem key={value} value={value}>
+                            {label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </PreferenceField>
 
-                <div className="space-y-2">
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
                       <p className="text-xs font-medium text-muted-foreground">תאריך התחלה</p>
@@ -1410,201 +1489,54 @@ export function CountryTripWorkspaceContent({
                       />
                     </div>
                   </div>
+
+                  <PreferenceField label="מספר נוסעים">
+                    <Input
+                      type="number"
+                      value={workspace.preferences.travelers}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          travelers: Number(event.target.value) || 1,
+                        })
+                      }
+                    />
+                  </PreferenceField>
+
+                  <PreferenceField label="תקציב משוער">
+                    <Input
+                      type="number"
+                      value={workspace.preferences.budget ?? ""}
+                      onChange={(event) =>
+                        actions.updatePreferences({
+                          budget: event.target.value ? Number(event.target.value) : null,
+                        })
+                      }
+                      placeholder="למשל 8500"
+                    />
+                  </PreferenceField>
                 </div>
-
-                <PreferenceField label="מספר נוסעים">
-                  <Input
-                    type="number"
-                    value={workspace.preferences.travelers}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        travelers: Number(event.target.value) || 1,
-                      })
-                    }
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="תקציב משוער">
-                  <Input
-                    type="number"
-                    value={workspace.preferences.budget ?? ""}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        budget: event.target.value ? Number(event.target.value) : null,
-                      })
-                    }
-                    placeholder="למשל 8500"
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="סגנון טיול">
-                  <Input
-                    value={workspace.preferences.tripStyle}
-                    onChange={(event) =>
-                      actions.updatePreferences({ tripStyle: event.target.value })
-                    }
-                    placeholder="רומנטי, עירוני, קולינרי..."
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="קצב">
-                  <Select
-                    value={workspace.preferences.tripPace}
-                    onValueChange={(value) =>
-                      actions.updatePreferences({
-                        tripPace: value as CountryTripWorkspaceState["preferences"]["tripPace"],
-                      })
-                    }
-                  >
-                    <SelectTrigger>
-                      <span>
-                        {workspace.preferences.tripPace === "relaxed"
-                          ? "רגוע"
-                          : workspace.preferences.tripPace === "balanced"
-                            ? "מאוזן"
-                            : "אינטנסיבי"}
-                      </span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="relaxed">רגוע</SelectItem>
-                      <SelectItem value="balanced">מאוזן</SelectItem>
-                      <SelectItem value="fast">אינטנסיבי</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </PreferenceField>
-
-                <PreferenceField label="Mode ליצירת מסלול">
-                  <Select
-                    value={workspace.preferences.generationMode}
-                    onValueChange={(value) =>
-                      actions.updatePreferences({
-                        generationMode:
-                          value as CountryTripWorkspaceState["preferences"]["generationMode"],
-                      })
-                    }
-                  >
-                    <SelectTrigger>
-                      <span>{ITINERARY_GENERATION_MODE_LABELS[workspace.preferences.generationMode]}</span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {Object.entries(ITINERARY_GENERATION_MODE_LABELS).map(([value, label]) => (
-                        <SelectItem key={value} value={value}>
-                          {label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </PreferenceField>
-
-                <PreferenceField label="תחבורה מועדפת">
-                  <Input
-                    value={workspace.preferences.transportationPreferences}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        transportationPreferences: event.target.value,
-                      })
-                    }
-                    placeholder="רכב, רכבת, הליכה..."
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="תחומי עניין">
-                  <Input
-                    value={workspace.preferences.interests}
-                    onChange={(event) =>
-                      actions.updatePreferences({ interests: event.target.value })
-                    }
-                    placeholder="היסטוריה, שווקים, חופים..."
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="אזור לינה">
-                  <Input
-                    value={workspace.preferences.accommodationArea}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        accommodationArea: event.target.value,
-                      })
-                    }
-                    placeholder="מרכז, ליד חוף, ליד תחנה..."
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="אזורים / ערים מועדפים">
-                  <Input
-                    value={workspace.preferences.preferredRegions}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        preferredRegions: event.target.value,
-                      })
-                    }
-                    placeholder="טוקיו וקיוטו, צפון המדינה, חופים..."
-                  />
-                </PreferenceField>
-
-                <PreferenceField label="Must-visit ו-avoid">
-                  <div className="grid gap-3">
-                    <Input
-                      value={workspace.preferences.mustVisitPlaces}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          mustVisitPlaces: event.target.value,
-                        })
-                      }
-                      placeholder="מקומות שחייבים להיכנס למסלול"
-                    />
-                    <Input
-                      value={workspace.preferences.placesToAvoid}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          placesToAvoid: event.target.value,
-                        })
-                      }
-                      placeholder="אזורים או סוגי מקומות שכדאי להימנע מהם"
-                    />
-                  </div>
-                </PreferenceField>
-
-                <PreferenceField label="העדפות תזונה ונגישות">
-                  <div className="grid gap-3">
-                    <Input
-                      value={workspace.preferences.dietaryPreferences}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          dietaryPreferences: event.target.value,
-                        })
-                      }
-                      placeholder="צמחוני, ללא גלוטן..."
-                    />
-                    <Input
-                      value={workspace.preferences.accessibilityNeeds}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          accessibilityNeeds: event.target.value,
-                        })
-                      }
-                      placeholder="מעליות, הליכה קצרה..."
-                    />
-                  </div>
-                </PreferenceField>
-
-                <PreferenceField label="מגבלות בטיחות / הערות חשובות">
-                  <Textarea
-                    value={workspace.preferences.safetyConstraints}
-                    onChange={(event) =>
-                      actions.updatePreferences({
-                        safetyConstraints: event.target.value,
-                      })
-                    }
-                    rows={3}
-                    placeholder="למשל הימנעות מהעברות לילה, הליכה קצרה בלבד, אזורים בטוחים יותר..."
-                  />
-                </PreferenceField>
               </div>
-              <div className="rounded-2xl border border-border/70 p-3 text-sm">
-                {generateSavedItinerary.isPending
-                  ? `כרגע: ${aiGenerationStage}`
-                  : workspace.lastAiPlanSummary || "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
+
+              <ProfilePreferencesSummary
+                isLoading={profileDefaults.isLoading}
+                summaryLines={profileDefaults.summaryLines}
+              />
+
+              <TripOverridesSection
+                preferences={workspace.preferences}
+                updatePreferences={actions.updatePreferences}
+                derivedPace={profileDefaults.derivedPace}
+                derivedInterests={profileDefaults.derivedInterests}
+              />
+
+              <TripSpecialRequirementsSection
+                preferences={workspace.preferences}
+                updatePreferences={actions.updatePreferences}
+              />
+
+              <div className="rounded-2xl border border-border/70 p-3 text-sm text-muted-foreground">
+                {workspace.lastAiPlanSummary ||
+                  "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
               </div>
             </div>
           </div>
@@ -1616,8 +1548,8 @@ export function CountryTripWorkspaceContent({
           iso={iso}
           country={country}
           workspace={workspace}
-          isGenerating={generateSavedItinerary.isPending}
-          generationStage={aiGenerationStage}
+          isGenerating={isGeneratingItinerary}
+          generationStage={isGeneratingItinerary ? generationProgress.stageLabel : null}
           autoOpenItineraryId={autoOpenItineraryId}
           onAutoOpenHandled={() => setAutoOpenItineraryId(null)}
           onGenerate={handleAiPlan}
@@ -1696,7 +1628,7 @@ export function CountryTripWorkspaceContent({
             </div>
 
             <div className="flex flex-wrap gap-2">
-              {ALL_CATEGORIES.map((category) => (
+              {AI_SOURCED_CATEGORIES.map((category) => (
                 <Button
                   key={category}
                   size="sm"
@@ -2155,6 +2087,22 @@ export function CountryTripWorkspaceContent({
                 }}
                 onOpenItinerary={handleOpenGeneratedItinerary}
                 onContinueEditing={handleContinueEditingGeneratedItinerary}
+              />
+
+              <AiGenerationProgressModal
+                isoA2={iso}
+                countryName={country.name}
+                view={generationModalView}
+                progress={generationProgress.progress}
+                stageLabel={generationProgress.stageLabel}
+                stageChecklist={generationProgress.stageChecklist}
+                error={generationProgress.error}
+                successSummary={generationSuccessSummary}
+                budgetTarget={workspace.preferences.budget}
+                onCancel={handleCancelGeneration}
+                onRetry={() => void handleAiPlan()}
+                onClose={handleCloseGenerationModal}
+                onBudgetAction={handleBudgetWarningAction}
               />
             </div>
           </div>

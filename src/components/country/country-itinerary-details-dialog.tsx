@@ -51,7 +51,7 @@ import {
   type CountryItineraryVersionRecord,
   type CountryItineraryVersionSource,
 } from "@/lib/itineraries";
-import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
+import { formatCurrency, formatDate, formatTripDateRange } from "@/lib/format";
 import type { Tables } from "@/lib/supabase/types";
 import {
   computeDayIntensity,
@@ -105,7 +105,6 @@ import {
   SheetDescription,
   SheetHeader,
   SheetTitle,
-  SheetTrigger,
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -408,6 +407,7 @@ export function CountryItineraryDetailsDialog({
   onExport,
 }: CountryItineraryDetailsDialogProps) {
   const [isEditMode, setIsEditMode] = useState(false);
+  const [versionsOpen, setVersionsOpen] = useState(false);
   const [activeSection, setActiveSection] = useState<TripSectionValue>("route");
   const [selectedTab, setSelectedTab] = useState<string>("");
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
@@ -517,7 +517,7 @@ export function CountryItineraryDetailsDialog({
 
   const itineraryMeta = [
     country.name,
-    formatDateRange(draft.startDate, draft.endDate) ?? "ללא תאריכים",
+    formatTripDateRange(draft.startDate, draft.endDate, draft.preferencesSnapshot.partialDate),
     `${draft.daysCount} ימים`,
     `${draft.travelers} נוסעים`,
     formatCurrency(draft.costSummary.totalEstimatedCost),
@@ -543,6 +543,8 @@ export function CountryItineraryDetailsDialog({
   const selectedDayIntensity = selectedDay ? computeDayIntensity(selectedDay.items) : null;
   const tripBookings = bookings(draft);
   const readiness = isReadinessApplicable(draft.status) ? computeTripReadiness(draft) : null;
+  const readinessIssues: ReadinessCategory[] =
+    readiness?.categories.filter((category) => category.status === "missing" || category.status === "partial") ?? [];
   const isTripLiveActive = isTripActiveNow(draft.startDate, draft.endDate, draft.isoA2);
   const tripSections = buildTripSections(isTripLiveActive, draft.status);
   // Every trip stage emphasizes what's actually relevant right now (spec
@@ -747,27 +749,32 @@ export function CountryItineraryDetailsDialog({
                 ) : null}
               </div>
 
-              {readiness ? (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {readiness.categories
-                    .filter((category) => category.status !== "not_applicable")
-                    .map((category: ReadinessCategory) => (
+              {readiness && readinessIssues.length > 0 ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={
                       <button
-                        key={category.key}
                         type="button"
+                        className="inline-flex w-fit items-center gap-1.5 rounded-full border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning transition-colors hover:bg-warning/15"
+                      />
+                    }
+                  >
+                    <TriangleAlert className="size-3.5" />
+                    {readinessIssues.length} דברים דורשים טיפול
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-64">
+                    {readinessIssues.map((category) => (
+                      <DropdownMenuItem
+                        key={category.key}
                         onClick={() => setActiveSection(category.section)}
                         title={category.detail || undefined}
-                        className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2.5 py-1 text-xs text-foreground/80 transition-colors hover:bg-muted/50"
                       >
-                        {category.status === "complete" ? (
-                          <CheckCircle2 className="size-3.5" />
-                        ) : (
-                          <TriangleAlert className="size-3.5" />
-                        )}
+                        <TriangleAlert className="size-3.5" />
                         {category.label}
-                      </button>
+                      </DropdownMenuItem>
                     ))}
-                </div>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               ) : null}
 
               <div
@@ -853,46 +860,45 @@ export function CountryItineraryDetailsDialog({
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => onLoadWorkspace(createWorkspaceFromItineraryRecord(draft, country.name))}
-                  disabled={isSaving}
-                >
-                  פתח ב-workspace
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void onRegenerate(draft.id, "recalculate_costs")}
-                  disabled={isRegenerating || isSaving}
-                >
-                  <Wallet className="size-4" />
-                  חשב עלויות מחדש
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void onRegenerate(draft.id, "full")}
-                  disabled={isRegenerating || isSaving}
-                >
-                  <RefreshCcw className="size-4" />
-                  Regenerate
-                </Button>
                 {isEditMode ? (
                   <Button variant="outline" size="sm" onClick={handleAddDay} disabled={isSaving}>
                     <Plus className="size-4" />
                     הוסף יום
                   </Button>
                 ) : null}
-                <Sheet>
-                  <SheetTrigger render={<Button variant="outline" size="sm" />}>
-                    <History className="size-4" />
-                    גרסאות
-                    <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px]">
-                      {versions.length}
-                    </Badge>
-                  </SheetTrigger>
+                <DropdownMenu>
+                  <DropdownMenuTrigger render={<Button variant="ghost" size="sm" />}>
+                    <Ellipsis className="size-4" />
+                    עוד פעולות
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start">
+                    <DropdownMenuItem
+                      onClick={() => onLoadWorkspace(createWorkspaceFromItineraryRecord(draft, country.name))}
+                      disabled={isSaving}
+                    >
+                      פתח ב-workspace
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => void onRegenerate(draft.id, "recalculate_costs")}
+                      disabled={isRegenerating || isSaving}
+                    >
+                      <Wallet className="size-4" />
+                      חשב עלויות מחדש
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => void onRegenerate(draft.id, "full")}
+                      disabled={isRegenerating || isSaving}
+                    >
+                      <RefreshCcw className="size-4" />
+                      Regenerate
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setVersionsOpen(true)}>
+                      <History className="size-4" />
+                      גרסאות ({versions.length})
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <Sheet open={versionsOpen} onOpenChange={setVersionsOpen}>
                   <SheetContent side="left" className="w-full sm:max-w-md">
                     <SheetHeader>
                       <SheetTitle>היסטוריית גרסאות</SheetTitle>

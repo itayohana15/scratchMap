@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 
 export default function ProfilePage() {
   return (
-    <main className="mx-auto max-w-4xl px-4 py-6 sm:px-6">
+    <main className="mx-auto max-w-[1250px] px-4 py-6 sm:px-6 lg:px-8">
       <TravelProfileSection />
     </main>
   );

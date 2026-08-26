@@ -32,18 +32,50 @@ const CATEGORY_GROUPS: Array<{ title: string; categories: PreferenceCategory[] }
   { title: "חיי לילה וקניות", categories: ["nightlife", "events", "shopping", "markets"] },
 ];
 
-function ScoreBar({ label, value }: { label: string; value: number | null }) {
+// One consistent control everywhere on the page (spec §15) — a full-width
+// select whose own trigger IS the "no value" state ("לא הוגדר"), so there's
+// never a separate redundant label + a separate "הגדר" button for the same
+// fact (spec §5).
+function PreferenceCard({
+  category,
+  explicitLevel,
+  inferredEntry,
+  onChange,
+}: {
+  category: PreferenceCategory;
+  explicitLevel: PreferenceLevel | null;
+  inferredEntry: { level: number; confidence: number; direction: "up" | "down" } | undefined;
+  onChange: (level: PreferenceLevel | null) => void;
+}) {
   return (
-    <div className="flex items-center gap-3">
-      <span className="w-32 shrink-0 truncate text-sm text-muted-foreground">{label}</span>
-      <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
-        {value != null ? (
-          <div className="h-full rounded-full bg-primary" style={{ width: `${(value / 5) * 100}%` }} />
-        ) : null}
-      </div>
-      <span className="w-16 shrink-0 text-right text-xs text-muted-foreground">
-        {value != null ? PREFERENCE_LEVEL_LABELS[value as PreferenceLevel] : "לא הוגדר"}
-      </span>
+    <div className="section-card flex min-h-[100px] flex-col justify-center gap-2.5 p-4 sm:p-5">
+      <p className="text-base font-semibold text-foreground sm:text-lg">{PREFERENCE_CATEGORY_LABELS[category]}</p>
+      <Select
+        value={explicitLevel?.toString() ?? ""}
+        onValueChange={(value) => onChange(value ? (Number(value) as PreferenceLevel) : null)}
+      >
+        <SelectTrigger className="h-12 w-full rounded-xl border-border/70 px-4 text-base">
+          <span>{explicitLevel ? PREFERENCE_LEVEL_LABELS[explicitLevel] : "לא הוגדר"}</span>
+        </SelectTrigger>
+        <SelectContent>
+          {([1, 2, 3, 4, 5] as PreferenceLevel[]).map((level) => (
+            <SelectItem key={level} value={level.toString()} className="text-base">
+              {PREFERENCE_LEVEL_LABELS[level]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {inferredEntry ? (
+        <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span className={cn("text-base", inferredEntry.direction === "up" ? "text-primary" : "text-destructive")}>
+            {inferredEntry.direction === "up" ? "↑" : "↓"}
+          </span>
+          נלמד: {PREFERENCE_LEVEL_LABELS[inferredEntry.level as PreferenceLevel]}
+          <Badge variant="outline" className="text-[11px]">
+            ביטחון {Math.round(inferredEntry.confidence * 100)}%
+          </Badge>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -79,21 +111,23 @@ export function TravelProfileSection() {
           <User className="size-6" />
         </div>
         <div>
-          <h1 className="font-heading text-2xl font-semibold text-foreground">פרופיל הטיולים שלי</h1>
-          <p className="text-sm text-muted-foreground">ההעדפות שהגדרת, והדפוסים שהמערכת זיהתה בפועל.</p>
+          <h1 className="font-heading text-2xl font-bold text-foreground sm:text-3xl">פרופיל הטיולים שלי</h1>
+          <p className="mt-0.5 text-sm text-muted-foreground sm:text-base">
+            העדפות אלה משפיעות על תכנון המסלולים וההמלצות שלך.
+          </p>
         </div>
       </div>
 
       {visibleSuggestions.length > 0 ? (
-        <div className="section-card space-y-3 p-4">
+        <div className="section-card space-y-3 p-4 sm:p-5">
           <div className="flex items-center gap-2">
-            <Sparkles className="size-4 text-primary" />
-            <h3 className="font-heading text-lg font-semibold">הצעות לעדכון העדפות</h3>
+            <Sparkles className="size-5 text-primary" />
+            <h3 className="font-heading text-xl font-bold">הצעות לעדכון העדפות</h3>
           </div>
           <div className="space-y-2">
             {visibleSuggestions.map((suggestion) => (
               <div key={suggestion.category} className="space-y-2 rounded-xl border border-border/60 bg-background/60 p-3">
-                <p className="text-sm text-foreground/90">{suggestion.suggestionText}</p>
+                <p className="text-sm text-foreground/90 sm:text-base">{suggestion.suggestionText}</p>
                 <div className="flex flex-wrap gap-2">
                   <Button
                     size="sm"
@@ -119,48 +153,18 @@ export function TravelProfileSection() {
       ) : null}
 
       {CATEGORY_GROUPS.map((group) => (
-        <div key={group.title} className="section-card space-y-3 p-4">
-          <h3 className="font-heading text-lg font-semibold">{group.title}</h3>
-          <div className="space-y-3">
-            {group.categories.map((category) => {
-              const explicitLevel = (profile.explicit_preferences ?? {})[category] ?? null;
-              const inferredEntry = inferred[category];
-              return (
-                <div key={category} className="space-y-1">
-                  <div className="flex items-center gap-3">
-                    <ScoreBar label={PREFERENCE_CATEGORY_LABELS[category]} value={explicitLevel} />
-                    <Select
-                      value={explicitLevel?.toString() ?? ""}
-                      onValueChange={(value) =>
-                        patchExplicit.mutate({ category, level: value ? Number(value) : null })
-                      }
-                    >
-                      <SelectTrigger size="sm" className="w-28 shrink-0">
-                        <span className="text-xs">{explicitLevel ? PREFERENCE_LEVEL_LABELS[explicitLevel as PreferenceLevel] : "הגדר"}</span>
-                      </SelectTrigger>
-                      <SelectContent>
-                        {([1, 2, 3, 4, 5] as PreferenceLevel[]).map((level) => (
-                          <SelectItem key={level} value={level.toString()}>
-                            {PREFERENCE_LEVEL_LABELS[level]}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  {inferredEntry ? (
-                    <div className="mr-[8.75rem] flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <span className={cn(inferredEntry.direction === "up" ? "text-primary" : "text-destructive")}>
-                        {inferredEntry.direction === "up" ? "↑" : "↓"}
-                      </span>
-                      נלמד: {PREFERENCE_LEVEL_LABELS[inferredEntry.level as PreferenceLevel]}
-                      <Badge variant="outline" className="text-[10px]">
-                        ביטחון {Math.round(inferredEntry.confidence * 100)}%
-                      </Badge>
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
+        <div key={group.title} className="section-card space-y-4 p-5 sm:p-6">
+          <h3 className="font-heading text-xl font-bold text-foreground sm:text-2xl">{group.title}</h3>
+          <div className="grid grid-cols-1 gap-4 min-[700px]:grid-cols-2 min-[1100px]:grid-cols-3">
+            {group.categories.map((category) => (
+              <PreferenceCard
+                key={category}
+                category={category}
+                explicitLevel={((profile.explicit_preferences ?? {})[category] as PreferenceLevel | undefined) ?? null}
+                inferredEntry={inferred[category]}
+                onChange={(level) => patchExplicit.mutate({ category, level })}
+              />
+            ))}
           </div>
         </div>
       ))}

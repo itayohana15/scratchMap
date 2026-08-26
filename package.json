@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "generate:theme-backgrounds": "node scripts/generate-theme-backgrounds.mjs",
-    "test:itinerary-generation": "tsc -p tsconfig.itinerary-tests.json && node --require ./tests/register-path-alias.cjs --test .test-dist/tests/itinerary-generation-constraints.test.js .test-dist/tests/itinerary-planning-principles.test.js .test-dist/tests/country-itinerary-generation.test.js .test-dist/tests/itinerary-timeline.test.js .test-dist/tests/trip-bookings-readiness.test.js .test-dist/tests/live-trip.test.js .test-dist/tests/trip-actual.test.js .test-dist/tests/trip-memories.test.js .test-dist/tests/travel-passport.test.js .test-dist/tests/preference-learning.test.js",
+    "test:itinerary-generation": "tsc -p tsconfig.itinerary-tests.json && node --require ./tests/register-path-alias.cjs --test .test-dist/tests/itinerary-generation-constraints.test.js .test-dist/tests/itinerary-planning-principles.test.js .test-dist/tests/country-itinerary-generation.test.js .test-dist/tests/itinerary-timeline.test.js .test-dist/tests/trip-bookings-readiness.test.js .test-dist/tests/live-trip.test.js .test-dist/tests/trip-actual.test.js .test-dist/tests/trip-memories.test.js .test-dist/tests/travel-passport.test.js .test-dist/tests/preference-learning.test.js .test-dist/tests/format.test.js .test-dist/tests/trip-preference-overrides.test.js",
     "postinstall": "node scripts/copy-maplibre-assets.mjs && node scripts/copy-flags.mjs"
   },
   "dependencies": {

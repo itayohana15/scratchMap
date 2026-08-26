@@ -7,11 +7,13 @@ import {
   buildGlobalTimeline,
   computePassportStats,
   deriveCountryMapStatuses,
+  getCompletedTrips,
+  getUpcomingTrips,
   groupTripsByCountry,
   longestKnownTrip,
   mostVisitedCountry,
 } from "../src/lib/travel-passport";
-import { createDefaultWorkspace } from "../src/lib/trip-workspace";
+import { createDefaultWorkspace, createEmptyDay } from "../src/lib/trip-workspace";
 
 const BASE_PREFERENCES = createDefaultWorkspace("Egypt").preferences;
 
@@ -152,4 +154,27 @@ test("mostVisitedCountry counts trips per ISO, correctly bucketing repeat Sinai/
   const best = mostVisitedCountry([tripA, tripB]);
   assert.equal(best?.isoA2, "EG");
   assert.equal(best?.tripCount, 2);
+});
+
+// citiesVisited: unknown != 0 — a historical trip with no day data never
+// counts as "0 cities visited", it flags isPartial instead.
+test("computePassportStats.citiesVisited ignores untracked (itineraryDays: []) trips but flags isPartial", () => {
+  const untracked = trip({ id: "untracked", startDate: null, endDate: null, daysCount: 0, source: "historical_manual", itineraryDays: [] });
+  const untrackedOnlyStats = computePassportStats([untracked]);
+  assert.equal(untrackedOnlyStats.citiesVisited.value, 0);
+  assert.equal(untrackedOnlyStats.citiesVisited.isPartial, true);
+
+  const trackedDay = { ...createEmptyDay(1, "2026-10-06"), cityRegion: "Cairo", items: [] };
+  const tracked = trip({ id: "tracked", itineraryDays: [trackedDay] });
+  const trackedOnlyStats = computePassportStats([tracked]);
+  assert.equal(trackedOnlyStats.citiesVisited.isPartial, false);
+});
+
+test("getCompletedTrips and getUpcomingTrips filter by status only, matching status everywhere else", () => {
+  const completed = trip({ id: "done", status: "completed" });
+  const upcoming = trip({ id: "soon", status: "upcoming", startDate: "2027-01-01", endDate: "2027-01-05" });
+  const planning = trip({ id: "draft", status: "draft" });
+
+  assert.deepEqual(getCompletedTrips([completed, upcoming, planning]).map((t) => t.id), ["done"]);
+  assert.deepEqual(getUpcomingTrips([completed, upcoming, planning]).map((t) => t.id), ["soon"]);
 });

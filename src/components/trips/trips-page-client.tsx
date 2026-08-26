@@ -1,24 +1,50 @@
 "use client";
 
 import {
+  Archive,
   CalendarRange,
   Clock3,
+  Copy,
+  Ellipsis,
+  ExternalLink,
   type LucideIcon,
   Luggage,
   MapPinned,
+  Pencil,
   Route,
   Search,
   Sparkles,
+  Trash2,
+  TriangleAlert,
   Wallet,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
+import { toast } from "sonner";
 
 import { CountryItineraryDetailsDialog } from "@/components/country/country-itinerary-details-dialog";
 import { CountryBanner } from "@/components/shared/country-banner";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -27,19 +53,27 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
+import { formatCurrency, formatDate, formatTripDateRange, tripDurationDays } from "@/lib/format";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { photoPublicUrl, usePhotosForItineraries } from "@/lib/queries/photos";
-import { useTripHubTrips } from "@/lib/queries/trip-hub";
+import {
+  useArchiveTripHubItinerary,
+  useDeleteTripHubItinerary,
+  useDuplicateTripHubItinerary,
+  useRenameTripHubItinerary,
+  useTripHubTrips,
+} from "@/lib/queries/trip-hub";
 import {
   getTripDurationBucket,
   getTripHubYear,
   TRIP_DURATION_LABELS,
   TRIP_HUB_STATUS_LABELS,
+  tripDestinationName,
   type TripDurationFilter,
   type TripHubStatus,
   type TripHubTrip,
 } from "@/lib/trip-hub";
+import { computeTripReadiness, isReadinessApplicable } from "@/lib/trip-readiness";
 import { cn } from "@/lib/utils";
 
 type TripFilter = "all" | TripHubStatus;
@@ -102,7 +136,13 @@ function tripAccent(status: TripHubStatus) {
   }
 }
 
-function headlineForTrip(trip: TripHubTrip) {
+/**
+ * Supplementary text shown ALONGSIDE the single status badge — never a
+ * restatement of the status itself (that's already the badge's job). Only
+ * upcoming (countdown) and active (day-of-trip) have anything new to add;
+ * every other status returns null so no second badge/pill gets rendered.
+ */
+function headlineForTrip(trip: TripHubTrip): string | null {
   if (trip.status === "upcoming" && trip.countdownDays != null) {
     return trip.countdownDays === 0 ? "מתחילים היום" : `עוד ${trip.countdownDays} ימים`;
   }
@@ -111,9 +151,7 @@ function headlineForTrip(trip: TripHubTrip) {
     return `היום: יום ${trip.currentDayNumber} מתוך ${trip.daysCount}`;
   }
 
-  if (trip.status === "completed") return "הושלם";
-  if (trip.status === "archived") return "נשמר בארכיון";
-  return "טיוטה בתכנון";
+  return null;
 }
 
 function costLine(trip: TripHubTrip) {
@@ -190,7 +228,254 @@ function SummaryCard({
   );
 }
 
-function UpcomingTripCard({
+const UPCOMING_STATUS_LABEL: Partial<Record<TripHubStatus, string>> = {
+  planning: "בשלבי תכנון",
+  upcoming: "מתקרב",
+};
+
+function countdownLabel(trip: TripHubTrip): string | null {
+  if (trip.countdownDays == null) return null;
+  return trip.countdownDays === 0 ? "מתחילים היום" : `עוד ${trip.countdownDays} ימים`;
+}
+
+function ReadinessMiniBar({ trip, onOpenIssues }: { trip: TripHubTrip; onOpenIssues: () => void }) {
+  if (!isReadinessApplicable(trip.itinerary.status)) return null;
+  const readiness = computeTripReadiness(trip.itinerary);
+  const issueCount = readiness.categories.filter(
+    (category) => category.status === "missing" || category.status === "partial"
+  ).length;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="text-muted-foreground">מוכנות לטיול</span>
+        <span className="font-medium text-foreground">{readiness.overallPercent}%</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-primary transition-all"
+          style={{ width: `${readiness.overallPercent}%` }}
+        />
+      </div>
+      {issueCount > 0 ? (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenIssues();
+          }}
+          className="flex items-center gap-1 text-xs text-warning underline-offset-2 hover:underline"
+        >
+          <TriangleAlert className="size-3.5" />
+          {issueCount} דברים דורשים טיפול
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function useUpcomingTripCardActions(trip: TripHubTrip) {
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState(trip.title);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const renameTrip = useRenameTripHubItinerary();
+  const duplicateTrip = useDuplicateTripHubItinerary();
+  const archiveTrip = useArchiveTripHubItinerary();
+  const deleteTrip = useDeleteTripHubItinerary();
+
+  async function handleRename() {
+    const title = renameValue.trim();
+    if (!title || title === trip.title) {
+      setRenameOpen(false);
+      return;
+    }
+    try {
+      await renameTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id, title });
+      toast.success("שם הטיול עודכן");
+      setRenameOpen(false);
+    } catch {
+      toast.error("עדכון השם נכשל");
+    }
+  }
+
+  async function handleDuplicate() {
+    try {
+      await duplicateTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
+      toast.success("הטיול שוכפל");
+    } catch {
+      toast.error("השכפול נכשל");
+    }
+  }
+
+  async function handleArchive() {
+    try {
+      await archiveTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
+      toast.success("הטיול הועבר לארכיון");
+    } catch {
+      toast.error("ההעברה לארכיון נכשלה");
+    }
+  }
+
+  async function handleDelete() {
+    try {
+      await deleteTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
+      toast.success("הטיול נמחק");
+      setDeleteOpen(false);
+    } catch {
+      toast.error("מחיקת הטיול נכשלה");
+    }
+  }
+
+  return {
+    renameOpen,
+    setRenameOpen,
+    renameValue,
+    setRenameValue,
+    deleteOpen,
+    setDeleteOpen,
+    renameTrip,
+    handleRename,
+    handleDuplicate,
+    handleArchive,
+    handleDelete,
+  };
+}
+
+type UpcomingTripCardActions = ReturnType<typeof useUpcomingTripCardActions>;
+
+function UpcomingCardMenuAndDialogs({
+  trip,
+  actions,
+  onOpen,
+  onOpenCountryPage,
+}: {
+  trip: TripHubTrip;
+  actions: UpcomingTripCardActions;
+  onOpen: (trip: TripHubTrip) => void;
+  onOpenCountryPage: (trip: TripHubTrip) => void;
+}) {
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon" aria-label="פעולות נוספות" />}>
+          <Ellipsis className="size-4" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onClick={() => onOpen(trip)}>
+            <ExternalLink className="size-4" />
+            פתח טיול
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={() => onOpenCountryPage(trip)}>
+            <Route className="size-4" />
+            המשך תכנון
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={() => {
+              actions.setRenameValue(trip.title);
+              actions.setRenameOpen(true);
+            }}
+          >
+            <Pencil className="size-4" />
+            שנה שם
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={actions.handleDuplicate}>
+            <Copy className="size-4" />
+            שכפל
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={actions.handleArchive}>
+            <Archive className="size-4" />
+            העבר לארכיון
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" onClick={() => actions.setDeleteOpen(true)}>
+            <Trash2 className="size-4" />
+            מחק טיול
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <Dialog open={actions.renameOpen} onOpenChange={actions.setRenameOpen}>
+        <DialogContent onClick={(event) => event.stopPropagation()} className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>שינוי שם הטיול</DialogTitle>
+          </DialogHeader>
+          <Input value={actions.renameValue} onChange={(event) => actions.setRenameValue(event.target.value)} placeholder="שם הטיול" />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => actions.setRenameOpen(false)}>
+              ביטול
+            </Button>
+            <Button onClick={actions.handleRename} disabled={actions.renameTrip.isPending}>
+              שמירה
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={actions.deleteOpen} onOpenChange={actions.setDeleteOpen}>
+        <AlertDialogContent onClick={(event) => event.stopPropagation()}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>למחוק את הטיול?</AlertDialogTitle>
+            <AlertDialogDescription>
+              פעולה זו תמחק את הטיול &quot;{trip.title}&quot; לצמיתות, כולל המסלול, ההזמנות והיומן שלו.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>ביטול</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={actions.handleDelete}
+            >
+              מחיקה
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+function UpcomingStatsRow({ trip }: { trip: TripHubTrip }) {
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:flex sm:flex-wrap sm:gap-x-8">
+      {trip.daysCount > 0 ? (
+        <div>
+          <p className="text-lg font-semibold text-foreground">{trip.daysCount}</p>
+          <p className="text-xs text-muted-foreground">ימים</p>
+        </div>
+      ) : null}
+      {trip.travelers > 0 ? (
+        <div>
+          <p className="text-lg font-semibold text-foreground">{trip.travelers}</p>
+          <p className="text-xs text-muted-foreground">נוסעים</p>
+        </div>
+      ) : null}
+      {trip.displayCost != null ? (
+        <div>
+          <p className="text-lg font-semibold text-foreground">{formatCurrency(trip.displayCost)}</p>
+          <p className="text-xs text-muted-foreground">תקציב</p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The single source of the card title everywhere in this section — never the raw stored `trip.title` (which may carry a stale machine-formatted date from an older generation path). */
+function UpcomingTripHeading({ trip, className }: { trip: TripHubTrip; className?: string }) {
+  return (
+    <h3 className={className}>
+      {tripDestinationName(trip)}:{" "}
+      <bdi dir="ltr">{formatTripDateRange(trip.startDate, trip.endDate, trip.itinerary.preferencesSnapshot.partialDate)}</bdi>
+    </h3>
+  );
+}
+
+/**
+ * Exactly one upcoming trip: a wide, horizontal featured layout that uses
+ * the full content width instead of a small centered card (spec: no empty
+ * side margins for a single trip). RTL-native — the info block is first in
+ * DOM so it lands on the right, the image second so it lands on the left.
+ */
+function FeaturedUpcomingTripCard({
   trip,
   onOpen,
   onOpenCountryPage,
@@ -199,65 +484,114 @@ function UpcomingTripCard({
   onOpen: (trip: TripHubTrip) => void;
   onOpenCountryPage: (trip: TripHubTrip) => void;
 }) {
+  const actions = useUpcomingTripCardActions(trip);
+  const countdown = countdownLabel(trip);
+  const statusLabel = UPCOMING_STATUS_LABEL[trip.status] ?? TRIP_HUB_STATUS_LABELS[trip.status];
+
   return (
     <article
       onClick={() => onOpen(trip)}
-      className="section-card group cursor-pointer overflow-hidden transition-transform duration-200 hover:-translate-y-1 hover:border-primary/35"
+      className="section-card group flex w-full cursor-pointer flex-col overflow-hidden ring-1 ring-primary/25 transition-transform duration-200 hover:-translate-y-1 hover:border-primary/35 lg:flex-row"
+    >
+      <div className="flex flex-col justify-center gap-4 p-6 lg:w-[42%] lg:p-8">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge className="w-fit border border-primary/30 bg-primary/10 text-primary">הטיול הבא</Badge>
+          <Badge className={cn("w-fit border", statusBadgeClass(trip.status))}>{statusLabel}</Badge>
+        </div>
+
+        <div className="space-y-1.5">
+          <UpcomingTripHeading trip={trip} className="font-heading text-2xl font-semibold text-foreground sm:text-3xl" />
+          {countdown ? <p className="text-sm font-medium text-primary">{countdown}</p> : null}
+        </div>
+
+        <UpcomingStatsRow trip={trip} />
+
+        <ReadinessMiniBar trip={trip} onOpenIssues={() => onOpenCountryPage(trip)} />
+
+        <div className="flex flex-wrap items-center gap-2" onClick={(event) => event.stopPropagation()}>
+          <Button onClick={() => onOpenCountryPage(trip)}>המשך תכנון</Button>
+          <Button variant="outline" onClick={() => onOpen(trip)}>
+            פתח טיול
+          </Button>
+          <UpcomingCardMenuAndDialogs trip={trip} actions={actions} onOpen={onOpen} onOpenCountryPage={onOpenCountryPage} />
+        </div>
+      </div>
+
+      <div className="lg:w-[58%]">
+        <CountryBanner
+          isoA2={trip.isoA2}
+          countryName={trip.countryName}
+          className="h-56 rounded-none sm:h-72 lg:h-full lg:min-h-[300px] lg:max-h-[360px]"
+          showCaption={false}
+          showFlagOverlay={false}
+        />
+      </div>
+    </article>
+  );
+}
+
+function UpcomingTripCard({
+  trip,
+  isNearest,
+  onOpen,
+  onOpenCountryPage,
+}: {
+  trip: TripHubTrip;
+  isNearest: boolean;
+  onOpen: (trip: TripHubTrip) => void;
+  onOpenCountryPage: (trip: TripHubTrip) => void;
+}) {
+  const actions = useUpcomingTripCardActions(trip);
+  const countdown = countdownLabel(trip);
+  const statusLabel = UPCOMING_STATUS_LABEL[trip.status] ?? TRIP_HUB_STATUS_LABELS[trip.status];
+
+  return (
+    <article
+      onClick={() => onOpen(trip)}
+      className={cn(
+        "section-card group w-full cursor-pointer overflow-hidden transition-transform duration-200 hover:-translate-y-1 hover:border-primary/35",
+        isNearest && "ring-1 ring-primary/25"
+      )}
     >
       <CountryBanner
         isoA2={trip.isoA2}
         countryName={trip.countryName}
-        className="h-52 rounded-none"
+        className="h-64 rounded-none sm:h-72"
         showCaption={false}
         overlay={
-          <div className="flex h-full flex-col justify-end bg-gradient-to-t from-black/75 via-black/15 to-transparent p-5 text-white">
-            <div className="space-y-2">
-              <Badge className={cn("w-fit border", statusBadgeClass(trip.status))}>
-                {headlineForTrip(trip)}
-              </Badge>
-              <div>
-                <p className="text-sm text-white/80">{trip.countryName}</p>
-                <h3 className="font-heading text-2xl font-semibold">{trip.title}</h3>
-              </div>
-              <p className="text-sm text-white/90">
-                {formatDateRange(trip.startDate, trip.endDate) ?? "ללא תאריכים"}
-              </p>
+          <div className="flex h-full flex-col justify-between p-5 text-white">
+            <div className="flex flex-wrap items-center gap-2">
+              {isNearest ? (
+                <Badge className="w-fit border border-white/30 bg-white/15 text-white backdrop-blur-sm">
+                  הטיול הבא
+                </Badge>
+              ) : null}
+              <Badge className={cn("w-fit border", statusBadgeClass(trip.status))}>{statusLabel}</Badge>
+            </div>
+            <div className="space-y-1.5">
+              {countdown ? (
+                <span className="inline-flex w-fit items-center rounded-full bg-primary/25 px-3 py-1 text-sm font-medium text-white backdrop-blur-sm">
+                  {countdown}
+                </span>
+              ) : null}
+              <p className="text-sm text-white/80">{trip.countryName}</p>
+              <UpcomingTripHeading trip={trip} className="font-heading text-2xl font-semibold sm:text-3xl" />
             </div>
           </div>
         }
       />
 
-      <div className="grid gap-4 p-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">ימים</p>
-            <p className="mt-1 text-sm font-medium">{trip.daysCount}</p>
-          </div>
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">נוסעים</p>
-            <p className="mt-1 text-sm font-medium">{trip.travelers}</p>
-          </div>
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">תקציב משוער</p>
-            <p className="mt-1 text-sm font-medium">{costLine(trip)}</p>
-          </div>
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">השלמת תכנון</p>
-            <p className="mt-1 text-sm font-medium">
-              {trip.planningCompletionPercentage != null ? `${trip.planningCompletionPercentage}%` : "—"}
-            </p>
-          </div>
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">ימי מסלול שנוצרו</p>
-            <p className="mt-1 text-sm font-medium">{trip.itineraryDaysGenerated}</p>
-          </div>
-        </div>
+      <div className="space-y-4 p-5">
+        <UpcomingStatsRow trip={trip} />
 
-        <div className="flex flex-wrap gap-2" onClick={(event) => event.stopPropagation()}>
+        <ReadinessMiniBar trip={trip} onOpenIssues={() => onOpenCountryPage(trip)} />
+
+        <div className="flex flex-wrap items-center gap-2" onClick={(event) => event.stopPropagation()}>
+          <Button onClick={() => onOpenCountryPage(trip)}>המשך תכנון</Button>
           <Button variant="outline" onClick={() => onOpen(trip)}>
             פתח טיול
           </Button>
-          <Button onClick={() => onOpenCountryPage(trip)}>המשך תכנון</Button>
+          <UpcomingCardMenuAndDialogs trip={trip} actions={actions} onOpen={onOpen} onOpenCountryPage={onOpenCountryPage} />
         </div>
       </div>
     </article>
@@ -275,16 +609,19 @@ function HistoryTripCard({
   onOpen: (trip: TripHubTrip) => void;
   onOpenCountryPage: (trip: TripHubTrip) => void;
 }) {
+  const supplementaryText = headlineForTrip(trip);
   const bannerOverlay = (
     <div className="flex h-full items-start justify-between gap-3 p-4 text-white">
       <Badge className={cn("border", statusBadgeClass(trip.status))}>
         {trip.status === "active" ? "בטיול עכשיו" : TRIP_HUB_STATUS_LABELS[trip.status]}
       </Badge>
-      <div className="rounded-full bg-black/25 px-3 py-1 text-xs backdrop-blur-sm">
-        {headlineForTrip(trip)}
-      </div>
+      {supplementaryText ? (
+        <div className="rounded-full bg-black/25 px-3 py-1 text-xs backdrop-blur-sm">{supplementaryText}</div>
+      ) : null}
     </div>
   );
+  const destinationName = tripDestinationName(trip);
+  const durationDays = tripDurationDays(trip.startDate, trip.endDate);
 
   return (
     <article
@@ -316,18 +653,16 @@ function HistoryTripCard({
 
       <div className="space-y-4 p-5">
         <div>
-          <p className="text-sm text-muted-foreground">{trip.countryName}</p>
-          <h3 className="font-heading text-xl font-semibold">{trip.title}</h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {formatDateRange(trip.startDate, trip.endDate) ?? "ללא תאריכים"}
-          </p>
+          <h3 className="font-heading text-xl font-semibold">
+            {destinationName}:{" "}
+            <bdi dir="ltr">{formatTripDateRange(trip.startDate, trip.endDate, trip.itinerary.preferencesSnapshot.partialDate)}</bdi>
+          </h3>
+          {durationDays != null ? (
+            <p className="mt-1 text-sm text-muted-foreground">{durationDays} ימים</p>
+          ) : null}
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
-            <p className="text-xs text-muted-foreground">משך</p>
-            <p className="mt-1 text-sm font-medium">{trip.daysCount} ימים</p>
-          </div>
           <div className="rounded-2xl border border-border/60 bg-card/60 p-3">
             <p className="text-xs text-muted-foreground">ערים</p>
             <p className="mt-1 text-sm font-medium">{trip.cityCount}</p>
@@ -467,7 +802,10 @@ function TimelineTripRow({
         </div>
         <p className="mt-1 text-sm text-muted-foreground">{trip.title}</p>
         <p className="mt-2 text-sm text-muted-foreground">
-          {formatDateRange(trip.startDate, trip.endDate) ?? "ללא תאריכים"} · {headlineForTrip(trip)}
+          <bdi dir="ltr">
+            {formatTripDateRange(trip.startDate, trip.endDate, trip.itinerary.preferencesSnapshot.partialDate)}
+          </bdi>
+          {headlineForTrip(trip) ? ` · ${headlineForTrip(trip)}` : ""}
         </p>
         <div className="mt-3 flex flex-wrap gap-2">
           {trip.routePreviewCities.map((city) => (
@@ -807,24 +1145,34 @@ export function TripsPageClient() {
         </section>
 
         {showUpcomingSection ? (
-          <section className="space-y-4">
-            <div className="flex items-center justify-between gap-3">
+          <section className="space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="font-heading text-2xl font-semibold">הטיולים הבאים שלי</h2>
-                <p className="text-sm text-muted-foreground">1–3 הטיולים הקרובים שדורשים את רוב תשומת הלב.</p>
+                <p className="text-sm text-muted-foreground">
+                  {featuredUpcomingTrips.length} טיולים מתוכננים
+                  {featuredUpcomingTrips[0]?.countdownDays != null
+                    ? ` · הקרוב ביותר בעוד ${featuredUpcomingTrips[0].countdownDays} ימים`
+                    : ""}
+                </p>
               </div>
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-3">
-              {featuredUpcomingTrips.map((trip) => (
-                <UpcomingTripCard
-                  key={trip.id}
-                  trip={trip}
-                  onOpen={openTrip}
-                  onOpenCountryPage={openCountryPage}
-                />
-              ))}
-            </div>
+            {featuredUpcomingTrips.length === 1 ? (
+              <FeaturedUpcomingTripCard trip={featuredUpcomingTrips[0]} onOpen={openTrip} onOpenCountryPage={openCountryPage} />
+            ) : (
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(340px,1fr))] gap-6">
+                {featuredUpcomingTrips.map((trip, index) => (
+                  <UpcomingTripCard
+                    key={trip.id}
+                    trip={trip}
+                    isNearest={index === 0}
+                    onOpen={openTrip}
+                    onOpenCountryPage={openCountryPage}
+                  />
+                ))}
+              </div>
+            )}
           </section>
         ) : null}
 

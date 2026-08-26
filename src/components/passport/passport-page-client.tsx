@@ -15,7 +15,7 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatDate } from "@/lib/format";
+import { formatTripDateRange } from "@/lib/format";
 import { useTripHubTrips } from "@/lib/queries/trip-hub";
 import { useTripRatingsForItineraries } from "@/lib/queries/trip-ratings";
 import {
@@ -34,11 +34,20 @@ import {
 } from "@/lib/travel-passport";
 
 type PassportFilter = "all" | "visited" | "upcoming" | "favorites";
+type PassportSort = "most_recent" | "most_visited" | "alphabetical" | "highest_rated";
+
+const SORT_LABELS: Record<PassportSort, string> = {
+  most_recent: "ביקור אחרון",
+  most_visited: "הכי מבוקרות",
+  alphabetical: "אלפביתי",
+  highest_rated: "דירוג גבוה",
+};
 
 export function PassportPageClient() {
   const { data: trips = [], isLoading } = useTripHubTrips();
   const [filter, setFilter] = useState<PassportFilter>("all");
   const [continentFilter, setContinentFilter] = useState("all");
+  const [sortBy, setSortBy] = useState<PassportSort>("most_recent");
   const [selectedIso, setSelectedIso] = useState<string | null>(null);
 
   const completedIds = useMemo(() => trips.filter((trip) => trip.status === "completed").map((trip) => trip.id), [trips]);
@@ -79,15 +88,35 @@ export function PassportPageClient() {
     return [...set].sort();
   }, [groups]);
 
+  const ratingByIso = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const entry of favorites) map.set(entry.isoA2, entry.averageRating);
+    return map;
+  }, [favorites]);
+
   const visibleGroups = useMemo(() => {
-    return [...groups.values()].filter((group) => {
+    const filtered = [...groups.values()].filter((group) => {
       if (filter === "visited" && group.completedTrips.length === 0) return false;
       if (filter === "upcoming" && !group.isUpcoming) return false;
       if (filter === "favorites" && !favoriteIsoSet.has(group.isoA2)) return false;
       if (continentFilter !== "all" && continentForIso(group.isoA2) !== continentFilter) return false;
       return true;
     });
-  }, [groups, filter, favoriteIsoSet, continentFilter]);
+
+    return filtered.sort((a, b) => {
+      switch (sortBy) {
+        case "most_visited":
+          return b.completedTrips.length - a.completedTrips.length;
+        case "alphabetical":
+          return a.countryName.localeCompare(b.countryName, "he");
+        case "highest_rated":
+          return (ratingByIso.get(b.isoA2) ?? -1) - (ratingByIso.get(a.isoA2) ?? -1);
+        case "most_recent":
+        default:
+          return (b.visitYears.at(-1) ?? "").localeCompare(a.visitYears.at(-1) ?? "");
+      }
+    });
+  }, [groups, filter, favoriteIsoSet, continentFilter, sortBy, ratingByIso]);
 
   const selectedGroup = selectedIso ? groups.get(selectedIso) : null;
 
@@ -140,7 +169,11 @@ export function PassportPageClient() {
         <StatTile label="מדינות" value={`${stats.countriesVisited}`} icon={MapPinned} />
         <StatTile label="טיולים" value={`${stats.tripsCompleted}`} icon={Stamp} />
         <StatTile label="יבשות" value={`${stats.continents}`} icon={Globe2} />
-        <StatTile label="ערים" value={`${stats.citiesVisited}`} icon={MapPinned} />
+        <StatTile
+          label={stats.citiesVisited.isPartial ? "ערים מתועדות" : "ערים"}
+          value={stats.citiesVisited.value > 0 ? `${stats.citiesVisited.value}${stats.citiesVisited.isPartial ? "+" : ""}` : "—"}
+          icon={MapPinned}
+        />
         <StatTile
           label="ימי טיול ידועים"
           value={`${stats.knownTravelDays.value}${stats.knownTravelDays.isPartial ? "+" : ""}`}
@@ -177,6 +210,18 @@ export function PassportPageClient() {
             ))}
           </SelectContent>
         </Select>
+        <Select value={sortBy} onValueChange={(value) => setSortBy((value as PassportSort) ?? "most_recent")}>
+          <SelectTrigger size="sm" className="w-40">
+            <span>{SORT_LABELS[sortBy]}</span>
+          </SelectTrigger>
+          <SelectContent>
+            {(Object.entries(SORT_LABELS) as Array<[PassportSort, string]>).map(([value, label]) => (
+              <SelectItem key={value} value={value}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
       <PassportWorldMap statuses={mapStatuses} onCountryClick={setSelectedIso} />
@@ -198,7 +243,12 @@ export function PassportPageClient() {
 
       <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-4">
         {visibleGroups.map((group) => (
-          <CountryStampCard key={group.isoA2} group={group} />
+          <CountryStampCard
+            key={group.isoA2}
+            group={group}
+            highlighted={selectedIso === group.isoA2}
+            onSelect={() => setSelectedIso(group.isoA2)}
+          />
         ))}
       </div>
 
@@ -212,9 +262,25 @@ export function PassportPageClient() {
                 href={`/countries/${entry.trip.isoA2.toLowerCase()}?itinerary=${entry.trip.id}`}
                 className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/60 p-3 text-sm transition-colors hover:border-primary/40"
               >
-                <span className="font-medium text-foreground">{entry.year} — {entry.trip.countryName}</span>
+                <span className="flex items-center gap-2 font-medium text-foreground">
+                  <span className="overflow-hidden rounded border border-border/60">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={`/flags/${entry.trip.isoA2.toLowerCase()}.png`}
+                      alt=""
+                      className="h-3.5 w-5 object-cover"
+                    />
+                  </span>
+                  {entry.year} — {entry.trip.countryName}
+                </span>
                 <span className="text-xs text-muted-foreground">
-                  {formatDate(entry.trip.startDate, "d בMMM yyyy") ?? entry.trip.title}
+                  <bdi dir="ltr">
+                    {formatTripDateRange(
+                      entry.trip.startDate,
+                      entry.trip.endDate,
+                      entry.trip.itinerary.preferencesSnapshot.partialDate
+                    )}
+                  </bdi>
                 </span>
               </Link>
             ))}

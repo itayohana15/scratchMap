@@ -69,13 +69,23 @@ export interface PassportStats {
   countriesVisited: number;
   tripsCompleted: number;
   continents: number;
-  citiesVisited: number;
+  citiesVisited: { value: number; isPartial: boolean };
   knownTravelDays: { value: number; isPartial: boolean };
+}
+
+/** Completed trips only — the one definition of "trip history" reused everywhere (Dashboard/Trips/Passport). */
+export function getCompletedTrips(trips: TripHubTrip[]): TripHubTrip[] {
+  return trips.filter((trip) => trip.status === "completed");
+}
+
+/** Upcoming trips only, nearest first. */
+export function getUpcomingTrips(trips: TripHubTrip[]): TripHubTrip[] {
+  return trips.filter((trip) => trip.status === "upcoming").sort((a, b) => a.sortDate.localeCompare(b.sortDate));
 }
 
 /** Deterministic only (spec §33/§45) — no AI involved in any of these counts. */
 export function computePassportStats(trips: TripHubTrip[]): PassportStats {
-  const completed = trips.filter((trip) => trip.status === "completed");
+  const completed = getCompletedTrips(trips);
   const visitedIsoCodes = new Set(completed.map((trip) => trip.isoA2.toUpperCase()));
 
   const continents = new Set<string>();
@@ -84,8 +94,18 @@ export function computePassportStats(trips: TripHubTrip[]): PassportStats {
     if (continent) continents.add(continent);
   }
 
+  // A historical trip with itineraryDays: [] genuinely has no recorded
+  // cities (not "0 cities visited" — it was just never tracked). Only trips
+  // with real day data contribute to the count; isPartial flags when some
+  // completed trips were excluded, so the UI can show "—"/"not tracked"
+  // instead of a misleading 0.
   const cities = new Set<string>();
+  let hasUntrackedTrip = false;
   for (const trip of completed) {
+    if (trip.itinerary.itineraryDays.length === 0) {
+      hasUntrackedTrip = true;
+      continue;
+    }
     for (const city of trip.visitedCityNames) {
       const trimmed = city.trim();
       if (trimmed) cities.add(trimmed.toLowerCase());
@@ -100,7 +120,7 @@ export function computePassportStats(trips: TripHubTrip[]): PassportStats {
     countriesVisited: visitedIsoCodes.size,
     tripsCompleted: completed.length,
     continents: continents.size,
-    citiesVisited: cities.size,
+    citiesVisited: { value: cities.size, isPartial: hasUntrackedTrip },
     knownTravelDays: { value: knownTravelDays, isPartial },
   };
 }

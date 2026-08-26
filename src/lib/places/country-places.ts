@@ -79,7 +79,10 @@ export async function fetchCategoryRecommendations(
   if (endDate) params.set("end", endDate);
 
   const res = await fetch(`/api/countries/${iso.toLowerCase()}/recommendations?${params.toString()}`);
-  if (!res.ok) throw new Error("Failed to load category recommendations");
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
+    throw new Error(body?.message ?? body?.error ?? "Failed to load category recommendations");
+  }
   return res.json();
 }
 

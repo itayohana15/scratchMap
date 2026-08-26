@@ -85,6 +85,7 @@ export function TripSummarySection({ draft, country, onPatchDraft }: TripSummary
           tripTitle={draft.title}
           startDate={draft.startDate}
           endDate={draft.endDate}
+          partialDate={draft.preferencesSnapshot.partialDate}
           durationDays={memoryStats.durationDays}
           citiesCount={memoryStats.cities.length}
           placesCount={memoryStats.placesVisited}

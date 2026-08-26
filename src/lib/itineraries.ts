@@ -1,7 +1,7 @@
 import { format, isValid, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
-import { formatDateRange } from "@/lib/format";
+import { formatTripDateRange } from "@/lib/format";
 import { getDestinationDateString } from "@/lib/live-trip-time";
 import { summarizeItemCosts } from "@/lib/server/itinerary-generation-constraints";
 import type { Tables } from "@/lib/supabase/types";
@@ -307,7 +307,7 @@ export function buildSuggestedItineraryTitle(
   startDate: string | null | undefined,
   endDate: string | null | undefined
 ) {
-  return `${countryName} – ${formatDateRange(startDate, endDate) ?? "ללא תאריכים"}`;
+  return `${countryName}: ${formatTripDateRange(startDate, endDate)}`;
 }
 
 /**

@@ -1,6 +1,6 @@
 "use client";
 
-import { Ellipsis, History, LoaderCircle, Route } from "lucide-react";
+import { Ellipsis, History, LoaderCircle, Route, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
@@ -19,7 +19,7 @@ import {
   type CountryItineraryRecord,
   type CountryItineraryStatus,
 } from "@/lib/itineraries";
-import { formatCurrency, formatDate, formatDateRange } from "@/lib/format";
+import { formatCurrency, formatDate, formatTripDateRange } from "@/lib/format";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { useCountryItineraries, useUpdateCountryItinerary } from "@/lib/queries/country-itineraries";
 import type { Tables } from "@/lib/supabase/types";
@@ -158,9 +158,10 @@ export function CountryItineraryHistorySection({
 
   const emptySummary = [
     workspace.preferences.startDate && workspace.preferences.endDate
-      ? `תאריכים: ${formatDateRange(
+      ? `תאריכים: ${formatTripDateRange(
           workspace.preferences.startDate,
-          workspace.preferences.endDate
+          workspace.preferences.endDate,
+          workspace.preferences.partialDate
         )}`
       : "תאריכים: עדיין לא הוגדרו",
     `נוסעים: ${workspace.preferences.travelers}`,
@@ -289,24 +290,40 @@ export function CountryItineraryHistorySection({
                       )}
                   </h4>
                   <p className="mt-2 text-sm text-muted-foreground">
-                    {formatDateRange(itinerary.startDate, itinerary.endDate) ?? "ללא תאריכים"}
+                    <bdi dir="ltr">
+                      {formatTripDateRange(itinerary.startDate, itinerary.endDate, itinerary.preferencesSnapshot.partialDate)}
+                    </bdi>
                   </p>
                 </div>
 
-                <DropdownMenu>
-                  <DropdownMenuTrigger
-                    render={
-                      <Button
-                        variant="outline"
-                        size="icon-sm"
-                        onClick={(event) => event.stopPropagation()}
-                      />
-                    }
-                    aria-label="פעולות"
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="icon-sm"
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    aria-label="מחיקת מסלול"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleDelete(itinerary.id);
+                    }}
                   >
-                    <Ellipsis className="size-4" />
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-52">
+                    <Trash2 className="size-4" />
+                  </Button>
+
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <Button
+                          variant="outline"
+                          size="icon-sm"
+                          onClick={(event) => event.stopPropagation()}
+                        />
+                      }
+                      aria-label="פעולות"
+                    >
+                      <Ellipsis className="size-4" />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-52">
                     <DropdownMenuItem
                       onClick={(event) => {
                         event.stopPropagation();
@@ -357,7 +374,8 @@ export function CountryItineraryHistorySection({
                       מחק
                     </DropdownMenuItem>
                   </DropdownMenuContent>
-                </DropdownMenu>
+                  </DropdownMenu>
+                </div>
               </div>
 
               <div className="mt-4 flex flex-wrap gap-2">
