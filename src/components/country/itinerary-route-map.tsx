@@ -478,7 +478,21 @@ function useResolvedCoordinates(args: {
   const [resolvedCoords, setResolvedCoords] = useState<Record<string, GeocodedResult>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loadingKeys, setLoadingKeys] = useState<string[]>([]);
-  const retryTokenRef = useRef(0);
+  const [retryToken, setRetryToken] = useState(0);
+
+  // Latest-value refs so the effect below can read current resolved/failed
+  // state and callbacks without needing them as reactive dependencies — this
+  // is what was causing "Maximum update depth exceeded": `resolvedCoords`
+  // (a state this same effect writes) was in its own dependency array, and
+  // the raw `pendingTargets` array (recreated upstream whenever anything
+  // downstream of it changed) was a dependency alongside the already-stable
+  // `pendingKey` string that should have been the sole identity.
+  const resolvedCoordsRef = useRef(resolvedCoords);
+  resolvedCoordsRef.current = resolvedCoords;
+  const errorsRef = useRef(errors);
+  errorsRef.current = errors;
+  const callbacksRef = useRef({ onResolveDayAccommodation, onResolveItem });
+  callbacksRef.current = { onResolveDayAccommodation, onResolveItem };
 
   const pendingKey = pendingTargets
     .map((target) => `${target.key}:${target.query}`)
@@ -487,10 +501,19 @@ function useResolvedCoordinates(args: {
 
   useEffect(() => {
     let cancelled = false;
-    const nextTargets = pendingTargets.filter((target) => !resolvedCoords[target.key]);
+    // Never re-resolve a target that's already resolved, and never retry a
+    // target that already failed unless the user explicitly asked to retry
+    // (retryToken changed) — otherwise a single failed geocode re-fires on
+    // every render forever.
+    const nextTargets = pendingTargets.filter(
+      (target) => !resolvedCoordsRef.current[target.key] && !errorsRef.current[target.key]
+    );
     if (nextTargets.length === 0) return;
 
-    setLoadingKeys((current) => Array.from(new Set([...current, ...nextTargets.map((target) => target.key)])));
+    setLoadingKeys((current) => {
+      const additions = nextTargets.map((target) => target.key).filter((key) => !current.includes(key));
+      return additions.length === 0 ? current : [...current, ...additions];
+    });
 
     Promise.allSettled(
       nextTargets.map(async (target) => {
@@ -521,26 +544,32 @@ function useResolvedCoordinates(args: {
         resolvedPatch[target.key] = coords;
 
         if (target.itemId) {
-          onResolveItem?.(target.dayId, target.itemId, coords, target.query);
+          callbacksRef.current.onResolveItem?.(target.dayId, target.itemId, coords, target.query);
         } else {
-          onResolveDayAccommodation?.(target.dayId, coords, target.query);
+          callbacksRef.current.onResolveDayAccommodation?.(target.dayId, coords, target.query);
         }
       }
 
-      setResolvedCoords((current) => ({ ...current, ...resolvedPatch }));
-      setErrors((current) => ({ ...current, ...errorPatch }));
-      setLoadingKeys((current) =>
-        current.filter((key) => !nextTargets.some((target) => target.key === key))
-      );
+      if (Object.keys(resolvedPatch).length > 0) {
+        setResolvedCoords((current) => ({ ...current, ...resolvedPatch }));
+      }
+      if (Object.keys(errorPatch).length > 0) {
+        setErrors((current) => ({ ...current, ...errorPatch }));
+      }
+      setLoadingKeys((current) => {
+        const next = current.filter((key) => !nextTargets.some((target) => target.key === key));
+        return next.length === current.length ? current : next;
+      });
     });
 
     return () => {
       cancelled = true;
     };
-  }, [isoA2, onResolveDayAccommodation, onResolveItem, pendingKey, pendingTargets, resolvedCoords]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isoA2, pendingKey, retryToken]);
 
   function retry() {
-    retryTokenRef.current += 1;
+    setRetryToken((token) => token + 1);
     for (const target of pendingTargets) {
       geocodeCache.delete(buildGeocodeKey(target.query, isoA2));
     }
@@ -564,6 +593,15 @@ function useRouteGeometry(segments: MapSegment[]) {
   const [routeResults, setRouteResults] = useState<Record<string, Awaited<ReturnType<typeof fetchDrivingRouteGeometry>>>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loadingKeys, setLoadingKeys] = useState<string[]>([]);
+  const [retryToken, setRetryToken] = useState(0);
+
+  // Same "latest ref" pattern as useResolvedCoordinates, and for the same
+  // reason: routeResults must not be a dependency of the effect that writes
+  // it, and a failed segment must not be retried on every render.
+  const routeResultsRef = useRef(routeResults);
+  routeResultsRef.current = routeResults;
+  const errorsRef = useRef(errors);
+  errorsRef.current = errors;
 
   const supportedSegments = useMemo(
     () => segments.filter((segment) => isRoutableWithProvider(segment.mode)),
@@ -573,10 +611,15 @@ function useRouteGeometry(segments: MapSegment[]) {
 
   useEffect(() => {
     let cancelled = false;
-    const nextSegments = supportedSegments.filter((segment) => routeResults[segment.key] === undefined);
+    const nextSegments = supportedSegments.filter(
+      (segment) => routeResultsRef.current[segment.key] === undefined && !errorsRef.current[segment.key]
+    );
     if (nextSegments.length === 0) return;
 
-    setLoadingKeys((current) => Array.from(new Set([...current, ...nextSegments.map((segment) => segment.key)])));
+    setLoadingKeys((current) => {
+      const additions = nextSegments.map((segment) => segment.key).filter((key) => !current.includes(key));
+      return additions.length === 0 ? current : [...current, ...additions];
+    });
 
     Promise.allSettled(
       nextSegments.map(async (segment) => {
@@ -602,19 +645,26 @@ function useRouteGeometry(segments: MapSegment[]) {
         resolvedPatch[outcome.value.key] = outcome.value.result;
       }
 
-      setRouteResults((current) => ({ ...current, ...resolvedPatch }));
-      setErrors((current) => ({ ...current, ...errorPatch }));
-      setLoadingKeys((current) =>
-        current.filter((key) => !nextSegments.some((segment) => segment.key === key))
-      );
+      if (Object.keys(resolvedPatch).length > 0) {
+        setRouteResults((current) => ({ ...current, ...resolvedPatch }));
+      }
+      if (Object.keys(errorPatch).length > 0) {
+        setErrors((current) => ({ ...current, ...errorPatch }));
+      }
+      setLoadingKeys((current) => {
+        const next = current.filter((key) => !nextSegments.some((segment) => segment.key === key));
+        return next.length === current.length ? current : next;
+      });
     });
 
     return () => {
       cancelled = true;
     };
-  }, [routeResults, supportedKey, supportedSegments]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supportedKey, retryToken]);
 
   function retry() {
+    setRetryToken((token) => token + 1);
     for (const segment of supportedSegments) {
       routeCache.delete(buildRouteKey(segment));
     }

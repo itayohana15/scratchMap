@@ -35,6 +35,10 @@
     "src/lib/preference-learning.ts",
     "src/lib/format.ts",
     "src/lib/trip-preference-overrides.ts",
+    "src/lib/city-normalization.ts",
+    "src/lib/places/nominatim.ts",
+    "src/lib/trip-budget.ts",
+    "src/lib/flight-planning.ts",
     "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
     "tests/itinerary-planning-principles.test.ts",
@@ -47,7 +51,10 @@
     "tests/travel-passport.test.ts",
     "tests/preference-learning.test.ts",
     "tests/format.test.ts",
-    "tests/trip-preference-overrides.test.ts"
+    "tests/trip-preference-overrides.test.ts",
+    "tests/city-normalization.test.ts",
+    "tests/trip-budget.test.ts",
+    "tests/flight-planning.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

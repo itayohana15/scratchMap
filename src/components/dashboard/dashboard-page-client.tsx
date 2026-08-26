@@ -14,7 +14,7 @@ export function DashboardPageClient() {
   const { data: worldCountries } = useWorldCountriesGeoJson();
 
   function openTrip(trip: TripHubTrip) {
-    router.push(`/countries/${trip.isoA2.toLowerCase()}?itinerary=${trip.id}`);
+    router.push(`/trips/${trip.id}`);
   }
 
   return (

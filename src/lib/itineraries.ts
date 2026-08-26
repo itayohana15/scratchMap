@@ -2,6 +2,7 @@ import { format, isValid, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
 import { formatTripDateRange } from "@/lib/format";
+import { flightCostExpenses } from "@/lib/flight-planning";
 import { getDestinationDateString } from "@/lib/live-trip-time";
 import { summarizeItemCosts } from "@/lib/server/itinerary-generation-constraints";
 import type { Tables } from "@/lib/supabase/types";
@@ -13,8 +14,11 @@ import {
   getTripDayCount,
   normalizeWorkspace,
   type CountryTripWorkspaceState,
+  type FlightBookingStatus,
   type ItineraryGenerationMode,
   type TripExpense,
+  type TripFlightLeg,
+  type TripFlights,
   type TripItineraryDay,
   type TripPreferences,
 } from "@/lib/trip-workspace";
@@ -104,6 +108,36 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(toText).filter(Boolean) : [];
 }
 
+function normalizeFlightLeg(value: unknown): TripFlightLeg | null {
+  if (!isRecord(value)) return null;
+  const bookingStatus =
+    value.bookingStatus === "not_booked" || value.bookingStatus === "booked" || value.bookingStatus === "paid"
+      ? (value.bookingStatus as FlightBookingStatus)
+      : "not_booked";
+  const leg: TripFlightLeg = {
+    departureAirport: toText(value.departureAirport),
+    arrivalAirport: toText(value.arrivalAirport),
+    departureDate: toText(value.departureDate),
+    departureTime: toText(value.departureTime),
+    arrivalDate: toText(value.arrivalDate),
+    arrivalTime: toText(value.arrivalTime),
+    airline: toText(value.airline),
+    flightNumber: toText(value.flightNumber),
+    cost: toNumber(value.cost),
+    bookingStatus,
+  };
+  const hasAnyData = Object.values(leg).some((field) => typeof field === "string" && field.trim() !== "");
+  return hasAnyData ? leg : null;
+}
+
+function normalizeFlights(value: unknown): TripFlights | undefined {
+  if (!isRecord(value)) return undefined;
+  const outbound = normalizeFlightLeg(value.outbound);
+  const returnLeg = normalizeFlightLeg(value.return);
+  if (!outbound && !returnLeg) return undefined;
+  return { outbound, return: returnLeg };
+}
+
 function normalizeTripPreferences(value: unknown): TripPreferences {
   const base = createDefaultWorkspace("Trip").preferences;
   const record = isRecord(value) ? value : {};
@@ -142,6 +176,7 @@ function normalizeTripPreferences(value: unknown): TripPreferences {
     mustVisitPlaces: toText(record.mustVisitPlaces),
     placesToAvoid: toText(record.placesToAvoid),
     safetyConstraints: toText(record.safetyConstraints),
+    flights: normalizeFlights(record.flights),
   };
 }
 
@@ -355,7 +390,7 @@ export function computeItineraryCostSummary(
   return summarizeItemCosts(
     applyBookingOverrides(workspace.itineraryDays, workspace.bookings),
     workspace.preferences.travelers,
-    normalizeExpenseList(workspace.estimatedExpenses)
+    [...normalizeExpenseList(workspace.estimatedExpenses), ...flightCostExpenses(workspace.preferences.flights)]
   );
 }
 

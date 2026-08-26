@@ -23,7 +23,6 @@ import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
-import { CountryItineraryDetailsDialog } from "@/components/country/country-itinerary-details-dialog";
 import { CountryBanner } from "@/components/shared/country-banner";
 import {
   AlertDialog,
@@ -54,7 +53,6 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatCurrency, formatDate, formatTripDateRange, tripDurationDays } from "@/lib/format";
-import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { photoPublicUrl, usePhotosForItineraries } from "@/lib/queries/photos";
 import {
   useArchiveTripHubItinerary,
@@ -849,25 +847,10 @@ export function TripsPageClient() {
   const [ratingFilter, setRatingFilter] = useState("all");
   const [sortBy, setSortBy] = useState<SortOption>("nearest_upcoming");
   const [viewMode, setViewMode] = useState<ViewMode>("cards");
-  const [selectedTripMeta, setSelectedTripMeta] = useState<{ isoA2: string; countryName: string } | null>(
-    null
-  );
-
-  const dialog = useItineraryDialogController(selectedTripMeta?.isoA2 ?? "");
-
   const normalizedSearch = normalizeQuery(search);
 
   function openTrip(trip: TripHubTrip) {
-    setSelectedTripMeta({ isoA2: trip.isoA2, countryName: trip.countryName });
-    dialog.openItinerary(trip.itinerary);
-  }
-
-  function handleDialogOpenChange(nextOpen: boolean) {
-    if (nextOpen) return;
-    if (dialog.isDirty && !window.confirm("יש שינויים שלא נשמרו. לסגור בכל זאת?")) {
-      return;
-    }
-    dialog.closeItinerary();
+    router.push(`/trips/${trip.id}`);
   }
 
   const years = useMemo(
@@ -946,7 +929,7 @@ export function TripsPageClient() {
   );
 
   function openCountryPage(trip: TripHubTrip) {
-    router.push(`/countries/${trip.isoA2.toLowerCase()}?itinerary=${trip.id}`);
+    router.push(`/trips/${trip.id}?tab=itinerary`);
   }
 
   if (isLoading) {
@@ -1242,35 +1225,6 @@ export function TripsPageClient() {
           )}
         </section>
       </div>
-
-      <CountryItineraryDetailsDialog
-        open={Boolean(dialog.activeItinerary && dialog.draft)}
-        draft={dialog.draft}
-        activeItinerary={dialog.activeItinerary}
-        country={{ name: selectedTripMeta?.countryName ?? "" }}
-        versions={dialog.versions}
-        isDirty={dialog.isDirty}
-        isSaving={dialog.isSaving}
-        isRegenerating={dialog.isRegenerating}
-        onOpenChange={handleDialogOpenChange}
-        onSave={dialog.saveDraft}
-        onReset={dialog.resetDraft}
-        onLoadWorkspace={() => {
-          if (!dialog.activeItinerary) return;
-          router.push(
-            `/countries/${dialog.activeItinerary.isoA2.toLowerCase()}?itinerary=${dialog.activeItinerary.id}`
-          );
-        }}
-        onPatchDraft={dialog.patchDraft}
-        onPatchDay={dialog.patchDay}
-        onPatchItem={dialog.patchItem}
-        onRegenerate={dialog.handleRegenerate}
-        onRestore={dialog.handleRestore}
-        onDuplicate={dialog.handleDuplicate}
-        onArchive={dialog.handleArchive}
-        onDelete={dialog.handleDelete}
-        onExport={dialog.exportItinerary}
-      />
     </>
   );
 }

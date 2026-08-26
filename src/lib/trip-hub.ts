@@ -93,8 +93,32 @@ export const TRIP_DURATION_LABELS: Record<Exclude<TripDurationFilter, "all">, st
   extended: "21+ ימים",
 };
 
-function uniqueStrings(values: Array<string | null | undefined>) {
-  return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
+/**
+ * Same dedup as uniqueStrings, but groups by `cityCanonicalId` first when
+ * present — so "Tbilisi"/"טביליסי" (same real city, different script)
+ * count once instead of twice. Days without a canonical id (generated
+ * before city-normalization.ts existed) fall back to raw string comparison.
+ */
+export function uniqueCityNames(days: TripItineraryDay[]): string[] {
+  const seenIds = new Set<string>();
+  const seenNames = new Set<string>();
+  const result: string[] = [];
+
+  for (const day of days) {
+    const name = day.cityRegion?.trim();
+    if (!name) continue;
+    if (day.cityCanonicalId) {
+      if (seenIds.has(day.cityCanonicalId)) continue;
+      seenIds.add(day.cityCanonicalId);
+      result.push(name);
+      continue;
+    }
+    if (seenNames.has(name)) continue;
+    seenNames.add(name);
+    result.push(name);
+  }
+
+  return result;
 }
 
 function isMeaningfulText(value: string | null | undefined) {
@@ -209,14 +233,10 @@ function determineVisitedCities(status: TripHubStatus, days: TripItineraryDay[],
   if (status === "planning" || status === "upcoming") return [];
 
   if (status === "active") {
-    return uniqueStrings(
-      days
-        .filter((day) => !day.date || day.date <= today)
-        .map((day) => day.cityRegion)
-    );
+    return uniqueCityNames(days.filter((day) => !day.date || day.date <= today));
   }
 
-  return uniqueStrings(days.map((day) => day.cityRegion));
+  return uniqueCityNames(days);
 }
 
 function determineCountdownDays(status: TripHubStatus, startDate: string | null, today: string) {
@@ -235,7 +255,7 @@ function determineAccommodationConfiguredDays(days: TripItineraryDay[]) {
 }
 
 function determineRouteCities(days: TripItineraryDay[], fallbackCountryName: string) {
-  const routeCities = uniqueStrings(days.map((day) => day.cityRegion));
+  const routeCities = uniqueCityNames(days);
   return routeCities.length > 0 ? routeCities : [fallbackCountryName];
 }
 

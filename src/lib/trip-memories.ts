@@ -1,5 +1,6 @@
 import type { CountryItineraryRecord } from "@/lib/itineraries";
 import { actualDayItems } from "@/lib/trip-actual";
+import { uniqueCityNames } from "@/lib/trip-hub";
 import type { Tables } from "@/lib/supabase/types";
 import {
   haversineKm,
@@ -58,7 +59,7 @@ export function computeTripMemoryStats(
   const skippedItems = allItems.filter((item) => item.skipped);
   const spontaneousItems = allItems.filter((item) => item.spontaneous);
 
-  const cities = uniqueNonEmpty(days.map((day) => day.cityRegion));
+  const cities = uniqueCityNames(days);
   const accommodationBases = uniqueNonEmpty(
     days.flatMap((day) => [day.actualAccommodation, day.accommodation])
   );
@@ -221,7 +222,7 @@ export function buildAiStoryContext(
     countryName,
     startDate: itinerary.startDate,
     endDate: itinerary.endDate,
-    cities: uniqueNonEmpty(itinerary.itineraryDays.map((day) => day.cityRegion)),
+    cities: uniqueCityNames(itinerary.itineraryDays),
     days: itinerary.itineraryDays.map((day: TripItineraryDay) => ({
       dayNumber: day.dayNumber,
       date: day.date,

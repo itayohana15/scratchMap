@@ -17,6 +17,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { useTheme } from "next-themes";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -38,6 +39,7 @@ import { CountryTripSummarySection } from "@/components/country/country-trip-sum
 import { CountryWeatherSection } from "@/components/country/country-weather-section";
 import {
   ProfilePreferencesSummary,
+  TripFlightsSection,
   TripOverridesSection,
   TripSpecialRequirementsSection,
   useProfileDerivedTripDefaults,
@@ -130,7 +132,6 @@ interface CountryTripWorkspaceContentProps {
   centerLat: number | undefined;
   centerLon: number | undefined;
   workspaceController: WorkspaceController;
-  initialAutoOpenItineraryId?: string | null;
 }
 
 const ALL_CATEGORIES = Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[];
@@ -890,8 +891,8 @@ export function CountryTripWorkspaceContent({
   centerLat,
   centerLon,
   workspaceController,
-  initialAutoOpenItineraryId = null,
 }: CountryTripWorkspaceContentProps) {
+  const router = useRouter();
   const { workspace, actions, hydrated } = workspaceController;
   const accentColor = STATUS_COLORS[country.status].light;
   const { data: attractionPlaces } = usePlacesForCountry(country.id, "attraction");
@@ -901,7 +902,6 @@ export function CountryTripWorkspaceContent({
   const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
   const generationStages = useMemo(() => buildGenerationStages(country.name), [country.name]);
   const generationProgress = useItineraryGenerationProgress<GenerateCountryItineraryResult>(generationStages);
-  const [autoOpenItineraryId, setAutoOpenItineraryId] = useState<string | null>(null);
   const [successDialogPayload, setSuccessDialogPayload] =
     useState<CountryItineraryGenerationSuccessPayload | null>(null);
   const latestGeneratedItineraryRef = useRef<CountryItineraryRecord | null>(null);
@@ -1004,11 +1004,6 @@ export function CountryTripWorkspaceContent({
       setSelectedDayId(workspace.itineraryDays[0]?.id ?? "");
     }
   }, [selectedDayId, workspace.itineraryDays]);
-
-  useEffect(() => {
-    if (!initialAutoOpenItineraryId) return;
-    setAutoOpenItineraryId(initialAutoOpenItineraryId);
-  }, [initialAutoOpenItineraryId]);
 
   useEffect(() => {
     if (activeTab === "map" || activeTab === "recommendations") {
@@ -1244,7 +1239,7 @@ export function CountryTripWorkspaceContent({
 
   function handleOpenGeneratedItinerary(itineraryId: string) {
     setSuccessDialogPayload(null);
-    setAutoOpenItineraryId(itineraryId);
+    router.push(`/trips/${itineraryId}`);
   }
 
   function handleContinueEditingGeneratedItinerary() {
@@ -1534,6 +1529,11 @@ export function CountryTripWorkspaceContent({
                 updatePreferences={actions.updatePreferences}
               />
 
+              <TripFlightsSection
+                preferences={workspace.preferences}
+                updatePreferences={actions.updatePreferences}
+              />
+
               <div className="rounded-2xl border border-border/70 p-3 text-sm text-muted-foreground">
                 {workspace.lastAiPlanSummary ||
                   "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
@@ -1550,10 +1550,7 @@ export function CountryTripWorkspaceContent({
           workspace={workspace}
           isGenerating={isGeneratingItinerary}
           generationStage={isGeneratingItinerary ? generationProgress.stageLabel : null}
-          autoOpenItineraryId={autoOpenItineraryId}
-          onAutoOpenHandled={() => setAutoOpenItineraryId(null)}
           onGenerate={handleAiPlan}
-          onLoadWorkspace={actions.loadWorkspace}
         />
       </TabsContent>
 

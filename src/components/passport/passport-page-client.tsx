@@ -159,7 +159,7 @@ export function PassportPageClient() {
             </Badge>
             <span className="text-sm font-medium text-foreground">{activeTrip.countryName}</span>
           </div>
-          <Button size="sm" render={<Link href={`/countries/${activeTrip.isoA2.toLowerCase()}?itinerary=${activeTrip.id}`} />}>
+          <Button size="sm" render={<Link href={`/trips/${activeTrip.id}`} />}>
             פתח את מצב הטיול
           </Button>
         </div>
@@ -259,7 +259,7 @@ export function PassportPageClient() {
             {timeline.map((entry) => (
               <Link
                 key={entry.trip.id}
-                href={`/countries/${entry.trip.isoA2.toLowerCase()}?itinerary=${entry.trip.id}`}
+                href={`/trips/${entry.trip.id}`}
                 className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/60 p-3 text-sm transition-colors hover:border-primary/40"
               >
                 <span className="flex items-center gap-2 font-medium text-foreground">

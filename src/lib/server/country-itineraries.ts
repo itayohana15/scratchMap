@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
+import { canonicalizeItineraryCities } from "@/lib/city-normalization";
 import {
   buildSuggestedItineraryTitle,
   computeItineraryCostSummary,
@@ -253,7 +254,15 @@ export async function generateAndStoreCountryItinerary(
   );
   devLog("AI generation complete", { days: generated.days.length, usedFallback: generated.usedFallback });
   const initialWorkspace = buildInitialWorkspace(country.name, payload);
-  const generatedWorkspace = applyAiPlanToWorkspace(initialWorkspace, generated);
+  const generatedWorkspaceRaw = applyAiPlanToWorkspace(initialWorkspace, generated);
+  // Normalize before aggregation (spec §A2): merge "Tbilisi"/"טביליסי"-style
+  // duplicates into one canonical city BEFORE cost summary / city counts /
+  // route grouping ever see the days, not just in the UI.
+  const canonicalizedDays = await canonicalizeItineraryCities(
+    generatedWorkspaceRaw.itineraryDays,
+    country.iso_a2
+  ).catch(() => generatedWorkspaceRaw.itineraryDays);
+  const generatedWorkspace = { ...generatedWorkspaceRaw, itineraryDays: canonicalizedDays };
   const costSummary = computeItineraryCostSummary(generatedWorkspace);
   const title =
     generated.title || buildSuggestedItineraryTitle(country.name, payload.preferences.startDate, payload.preferences.endDate);
@@ -596,8 +605,12 @@ export async function regenerateCountryItinerary(
     const regeneratedDay = regeneratedWorkspace.itineraryDays[dayIndex];
 
     const { items: nextItems } = mergeLiveReplanResult(originalDay.items, regeneratedDay.items, () => createId("item"));
-    const nextDays = [...workspace.itineraryDays];
-    nextDays[dayIndex] = recomputeDayEstimates({ ...regeneratedDay, id: originalDay.id, items: nextItems }, workspace.preferences);
+    const mergedDays = [...workspace.itineraryDays];
+    mergedDays[dayIndex] = recomputeDayEstimates({ ...regeneratedDay, id: originalDay.id, items: nextItems }, workspace.preferences);
+    // Re-canonicalize the whole trip, not just the changed day — a single
+    // regenerated day can otherwise cluster its city under a different
+    // canonical id than the rest of the (already-canonicalized) trip.
+    const nextDays = await canonicalizeItineraryCities(mergedDays, existing.isoA2).catch(() => mergedDays);
 
     return updateCountryItinerary(supabase, itineraryId, countryName, {
       itineraryDays: nextDays,
@@ -612,11 +625,12 @@ export async function regenerateCountryItinerary(
   if (scope === "day" && targetDayId) {
     const existingDayIndex = workspace.itineraryDays.findIndex((day) => day.id === targetDayId);
     if (existingDayIndex === -1) throw new Error("Target day not found");
-    const nextDays = [...workspace.itineraryDays];
-    nextDays[existingDayIndex] = {
+    const mergedDays = [...workspace.itineraryDays];
+    mergedDays[existingDayIndex] = {
       ...regeneratedWorkspace.itineraryDays[existingDayIndex],
       id: workspace.itineraryDays[existingDayIndex].id,
     };
+    const nextDays = await canonicalizeItineraryCities(mergedDays, existing.isoA2).catch(() => mergedDays);
     return updateCountryItinerary(supabase, itineraryId, countryName, {
       itineraryDays: nextDays,
       preferencesSnapshot: workspace.preferences,
@@ -660,12 +674,17 @@ export async function regenerateCountryItinerary(
     });
   }
 
+  const fullyRegeneratedDays = await canonicalizeItineraryCities(
+    regeneratedWorkspace.itineraryDays,
+    existing.isoA2
+  ).catch(() => regeneratedWorkspace.itineraryDays);
+
   return updateCountryItinerary(supabase, itineraryId, countryName, {
     title: generated.title,
     summary: generated.summary,
-    itineraryDays: regeneratedWorkspace.itineraryDays,
+    itineraryDays: fullyRegeneratedDays,
     preferencesSnapshot: workspace.preferences,
-    workspaceSnapshot: regeneratedWorkspace,
+    workspaceSnapshot: { ...regeneratedWorkspace, itineraryDays: fullyRegeneratedDays },
     budget: workspace.preferences.budget,
     generationMode: workspace.preferences.generationMode,
     manuallyEdited: false,

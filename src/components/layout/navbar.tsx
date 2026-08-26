@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
 
 export function Navbar() {
   const pathname = usePathname() ?? "";
-  const hideNavbar = /^\/countries\/[^/]+$/.test(pathname);
+  const hideNavbar = /^\/countries\/[^/]+$/.test(pathname) || /^\/trips\/[^/]+$/.test(pathname);
 
   if (hideNavbar) {
     return null;

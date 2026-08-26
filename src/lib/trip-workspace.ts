@@ -68,6 +68,52 @@ export type BookingType =
 export type BookingStatus = "not_required" | "not_booked" | "booking_needed" | "reserved" | "booked" | "cancelled";
 export type PaymentStatus = "unpaid" | "partially_paid" | "paid" | "refunded";
 
+/**
+ * Simplified 3-state toggle for the flight input card only — deliberately
+ * not the general BookingStatus/PaymentStatus pair used by TripBooking,
+ * which stays reserved for the full Bookings tab.
+ */
+export type FlightBookingStatus = "not_booked" | "booked" | "paid";
+
+/**
+ * All datetimes are local wall-clock time at their own airport (never
+ * normalized to a shared zone) — departure fields are local to
+ * departureAirport's zone, arrival fields to arrivalAirport's zone. See
+ * flight-planning.ts for the timezone-aware arithmetic this enables.
+ */
+export interface TripFlightLeg {
+  departureAirport: string;
+  arrivalAirport: string;
+  departureDate: string;
+  departureTime: string;
+  arrivalDate: string;
+  arrivalTime: string;
+  airline: string;
+  flightNumber: string;
+  cost: number | null;
+  bookingStatus: FlightBookingStatus;
+}
+
+export interface TripFlights {
+  outbound: TripFlightLeg | null;
+  return: TripFlightLeg | null;
+}
+
+export function createEmptyFlightLeg(): TripFlightLeg {
+  return {
+    departureAirport: "",
+    arrivalAirport: "",
+    departureDate: "",
+    departureTime: "",
+    arrivalDate: "",
+    arrivalTime: "",
+    airline: "",
+    flightNumber: "",
+    cost: null,
+    bookingStatus: "not_booked",
+  };
+}
+
 export interface TripPreferences {
   startDate: string;
   endDate: string;
@@ -92,6 +138,13 @@ export interface TripPreferences {
   mustVisitPlaces: string;
   placesToAvoid: string;
   safetyConstraints: string;
+  /**
+   * Optional — most trips don't set this yet. Home country/origin timezone
+   * are not stored here: Israel / Asia/Jerusalem is the fixed default for
+   * every trip (see HOME_COUNTRY_ISO_A2/HOME_TIMEZONE in flight-planning.ts),
+   * never inferred from the destination.
+   */
+  flights?: TripFlights;
 }
 
 /**
@@ -208,6 +261,11 @@ export interface TripItineraryDay {
   title: string;
   date: string;
   cityRegion: string;
+  // Coordinate-based canonical identity for cityRegion (e.g. "ge:41.69:44.80"),
+  // stamped post-generation by canonicalizeItineraryCities (city-normalization.ts)
+  // so "Tbilisi"/"טביליסי" merge into one place instead of counting as two
+  // cities. Optional — absent on itineraries generated before this existed.
+  cityCanonicalId?: string;
   accommodation: string;
   accommodationMapLink: string;
   accommodationLat: number | null;

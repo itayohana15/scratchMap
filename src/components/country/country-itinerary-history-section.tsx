@@ -1,10 +1,10 @@
 "use client";
 
 import { Ellipsis, History, LoaderCircle, Route, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
-import { CountryItineraryDetailsDialog } from "@/components/country/country-itinerary-details-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -80,10 +80,7 @@ interface CountryItineraryHistorySectionProps {
   workspace: CountryTripWorkspaceState;
   isGenerating: boolean;
   generationStage: string | null;
-  autoOpenItineraryId: string | null;
-  onAutoOpenHandled: () => void;
   onGenerate: () => Promise<void>;
-  onLoadWorkspace: (workspace: CountryTripWorkspaceState) => void;
 }
 
 export function CountryItineraryHistorySection({
@@ -92,46 +89,20 @@ export function CountryItineraryHistorySection({
   workspace,
   isGenerating,
   generationStage,
-  autoOpenItineraryId,
-  onAutoOpenHandled,
   onGenerate,
-  onLoadWorkspace,
 }: CountryItineraryHistorySectionProps) {
+  const router = useRouter();
   const { data: itineraries = [], isLoading } = useCountryItineraries(iso);
   const updateItinerary = useUpdateCountryItinerary(iso);
 
   const [activeFilter, setActiveFilter] = useState<HistoryFilter | "all">("all");
 
-  const {
-    activeItinerary,
-    draft,
-    versions,
-    isDirty,
-    isSaving,
-    isRegenerating,
-    openItinerary,
-    closeModal,
-    resetDraft,
-    patchDraft,
-    patchDay,
-    patchItem,
-    saveDraft,
-    handleArchive,
-    handleDelete,
-    handleDuplicate,
-    handleRegenerate,
-    handleRestore,
-    exportItinerary,
-  } = useItineraryDialogController(iso);
+  const { handleArchive, handleDelete, handleDuplicate, handleRegenerate } =
+    useItineraryDialogController(iso);
 
-  useEffect(() => {
-    if (!autoOpenItineraryId || itineraries.length === 0) return;
-    const match = itineraries.find((item) => item.id === autoOpenItineraryId) ?? null;
-    if (!match) return;
-    openItinerary(match);
-    onAutoOpenHandled();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoOpenItineraryId, itineraries, onAutoOpenHandled]);
+  function openTrip(itinerary: CountryItineraryRecord) {
+    router.push(`/trips/${itinerary.id}`);
+  }
 
   const filteredItineraries = useMemo(
     () => itineraries.filter((itinerary) => itineraryMatchesFilter(itinerary, activeFilter)),
@@ -271,11 +242,11 @@ export function CountryItineraryHistorySection({
               role="button"
               tabIndex={0}
               className="section-card rounded-[26px] p-5 text-right transition-colors hover:border-primary/40"
-              onClick={() => openItinerary(itinerary)}
+              onClick={() => openTrip(itinerary)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
-                  openItinerary(itinerary);
+                  openTrip(itinerary);
                 }
               }}
             >
@@ -327,7 +298,7 @@ export function CountryItineraryHistorySection({
                     <DropdownMenuItem
                       onClick={(event) => {
                         event.stopPropagation();
-                        openItinerary(itinerary);
+                        openTrip(itinerary);
                       }}
                     >
                       פתח
@@ -423,7 +394,7 @@ export function CountryItineraryHistorySection({
                   size="sm"
                   onClick={(event) => {
                     event.stopPropagation();
-                    openItinerary(itinerary);
+                    openTrip(itinerary);
                   }}
                 >
                   פתח את המסלול
@@ -459,30 +430,6 @@ export function CountryItineraryHistorySection({
           ))}
         </div>
       )}
-
-      <CountryItineraryDetailsDialog
-        open={Boolean(activeItinerary && draft)}
-        draft={draft}
-        activeItinerary={activeItinerary}
-        country={country}
-        versions={versions}
-        isDirty={isDirty}
-        isSaving={isSaving}
-        isRegenerating={isRegenerating}
-        onOpenChange={closeModal}
-        onSave={saveDraft}
-        onReset={resetDraft}
-        onLoadWorkspace={onLoadWorkspace}
-        onPatchDraft={patchDraft}
-        onPatchDay={patchDay}
-        onPatchItem={patchItem}
-        onRegenerate={handleRegenerate}
-        onRestore={handleRestore}
-        onDuplicate={handleDuplicate}
-        onArchive={handleArchive}
-        onDelete={handleDelete}
-        onExport={exportItinerary}
-      />
     </div>
   );
 }

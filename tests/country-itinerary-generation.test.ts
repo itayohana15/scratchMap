@@ -175,6 +175,7 @@ function cleanDiagnostics(overrides: Partial<PlanDiagnostics> = {}): PlanDiagnos
     highEnergyRhythmViolation: false,
     baseMismatchDays: 0,
     activityMixSkew: [],
+    arrivalDepartureWindowViolations: 0,
     ...overrides,
   };
 }
@@ -548,4 +549,117 @@ test("passesValidation gate reacts to each individual diagnostic flag", () => {
   assert.equal(passesValidation(cleanDiagnostics({ crossCityDays: 1 })), false);
   assert.equal(passesValidation(cleanDiagnostics({ outOfBudget: true })), false);
   assert.equal(passesValidation(cleanDiagnostics({ duplicatePlaces: 1 })), false);
+});
+
+test("passesValidation fails a plan with arrival/departure window violations", () => {
+  assert.equal(passesValidation(cleanDiagnostics({ arrivalDepartureWindowViolations: 1 })), false);
+});
+
+// Flight-aware planning (spec Part D/E): day 1 must not schedule real
+// activities before the traveler could realistically have landed and
+// checked in, and the last day must not schedule anything after the
+// traveler needs to leave for the airport.
+test("collectPlanDiagnostics flags an activity scheduled before the flight-derived arrival window", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Georgia", 3);
+  const day1 = buildDay({
+    dayNumber: 1,
+    date: "2026-10-06",
+    items: [buildItem({ name: "Old Town Walk", category: "attraction", plannedStartTime: "09:00" })],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Georgia trip",
+    summary: "",
+    totalEstimatedCost: 1000,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [day1],
+  };
+  const window = {
+    earliestUsableTimeOnArrivalDay: { date: "2026-10-06", time: "17:15" },
+    latestUsableTimeOnDepartureDay: null,
+  };
+  const diagnostics = collectPlanDiagnostics(plan, profile, null, window);
+  assert.equal(diagnostics.arrivalDepartureWindowViolations, 1);
+});
+
+test("collectPlanDiagnostics does not flag logistics items (transportation/hotel/practical) on the arrival day", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Georgia", 3);
+  const day1 = buildDay({
+    dayNumber: 1,
+    date: "2026-10-06",
+    items: [
+      buildItem({ name: "Transfer to hotel", category: "transportation", plannedStartTime: "09:00" }),
+      buildItem({ name: "Check-in", category: "hotel", plannedStartTime: "09:30" }),
+    ],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Georgia trip",
+    summary: "",
+    totalEstimatedCost: 1000,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [day1],
+  };
+  const window = {
+    earliestUsableTimeOnArrivalDay: { date: "2026-10-06", time: "17:15" },
+    latestUsableTimeOnDepartureDay: null,
+  };
+  const diagnostics = collectPlanDiagnostics(plan, profile, null, window);
+  assert.equal(diagnostics.arrivalDepartureWindowViolations, 0);
+});
+
+test("collectPlanDiagnostics flags an activity scheduled after the flight-derived departure window on the last day", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Georgia", 3);
+  const lastDay = buildDay({
+    dayNumber: 3,
+    date: "2026-10-08",
+    items: [buildItem({ name: "Museum visit", category: "attraction", plannedStartTime: "14:00" })],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Georgia trip",
+    summary: "",
+    totalEstimatedCost: 1000,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    // dayCount is derived from plan.days.length, so a realistic full array
+    // is required for dayNumber === dayCount to identify the last day.
+    days: [buildDay({ dayNumber: 1, date: "2026-10-06" }), buildDay({ dayNumber: 2, date: "2026-10-07" }), lastDay],
+  };
+  const window = {
+    earliestUsableTimeOnArrivalDay: null,
+    latestUsableTimeOnDepartureDay: { date: "2026-10-08", time: "12:15" },
+  };
+  const diagnostics = collectPlanDiagnostics(plan, profile, null, window);
+  assert.equal(diagnostics.arrivalDepartureWindowViolations, 1);
+});
+
+test("collectPlanDiagnostics ignores arrival/departure windows on middle days", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Georgia", 3);
+  const middleDay = buildDay({
+    dayNumber: 2,
+    date: "2026-10-07",
+    items: [buildItem({ name: "Early breakfast tour", category: "attraction", plannedStartTime: "07:00" })],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Georgia trip",
+    summary: "",
+    totalEstimatedCost: 1000,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [buildDay({ dayNumber: 1, date: "2026-10-06" }), middleDay, buildDay({ dayNumber: 3, date: "2026-10-08" })],
+  };
+  const window = {
+    earliestUsableTimeOnArrivalDay: { date: "2026-10-06", time: "17:15" },
+    latestUsableTimeOnDepartureDay: { date: "2026-10-08", time: "12:15" },
+  };
+  const diagnostics = collectPlanDiagnostics(plan, profile, null, window);
+  assert.equal(diagnostics.arrivalDepartureWindowViolations, 0);
 });

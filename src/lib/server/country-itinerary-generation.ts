@@ -29,6 +29,13 @@ export class ItineraryGenerationInfeasibleError extends Error {
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import countryFactsData from "@/lib/facts/country-facts-data.json";
 import {
+  computeArrivalDepartureWindow,
+  describeArrivalDepartureWindow,
+  flightCostExpenses,
+  violatesArrivalDepartureWindow,
+  type ArrivalDepartureWindow,
+} from "@/lib/flight-planning";
+import {
   analyzeDayGeography,
   buildGenerationSummary,
   buildTripPreferenceProfile,
@@ -41,6 +48,7 @@ import {
   MAX_LOCAL_TRAVEL_MINUTES,
   MAX_NORMAL_DAY_TRAVEL_MINUTES,
   isPremiumVenue,
+  NON_ACTIVITY_CATEGORIES,
   normalizeCoordinatePair,
   normalizeActionableMessages,
   scoreRouteProximity,
@@ -81,6 +89,7 @@ import {
   type ItemPriority,
   type RecommendationCategory,
   type TripItineraryDay,
+  type TripFlights,
   type TripItineraryItem,
   type TripRecommendation,
 } from "@/lib/trip-workspace";
@@ -670,6 +679,7 @@ function buildPrompt(
   profile: TripPreferenceProfile,
   exchangeRateContext: ExchangeRateContext | null,
   tripFrame: TripFrame,
+  arrivalDepartureWindow: ArrivalDepartureWindow,
   knowledge?: CountryAiRecommendation | null
 ) {
   const exactDayCount = getTripDayCount(payload.preferences.startDate, payload.preferences.endDate, 0);
@@ -750,6 +760,13 @@ function buildPrompt(
         })()
       : "";
 
+  const flightWindowDescription = describeArrivalDepartureWindow(arrivalDepartureWindow);
+  const flightWindowGuidance = flightWindowDescription
+    ? [
+        `Treat the arrival/departure window as a hard constraint, with higher priority than any other preference below: ${flightWindowDescription}`,
+      ]
+    : [];
+
   const tripFrameGuidance = [
     `Locked trip frame (decided before this prompt, geography-first): ${describeTripFrame(tripFrame)}.`,
     "Treat this trip frame as a hard constraint: every day's cityRegion and accommodation must match its assigned base/phase above, except for the specific day(s) where the frame itself transitions between phases (those become transfer days).",
@@ -760,6 +777,7 @@ function buildPrompt(
   return [
     "You are a practical itinerary planner, not a travel writer.",
     "Behavioral reference: plan like a strong independent traveler's multi-week trip, not like a generic sightseeing brochure.",
+    ...flightWindowGuidance,
     "Plan geography first: the trip frame below already fixed base cities/regions and nights per base. Build each day's content to fit inside its assigned base, not the other way around.",
     ...tripFrameGuidance,
     "Return JSON only, matching the schema exactly.",
@@ -2017,6 +2035,7 @@ async function generateWithGemini(
   profile: TripPreferenceProfile,
   exchangeRateContext: ExchangeRateContext | null,
   tripFrame: TripFrame,
+  arrivalDepartureWindow: ArrivalDepartureWindow,
   knowledge?: CountryAiRecommendation | null
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -2027,7 +2046,7 @@ async function generateWithGemini(
   const client = new GoogleGenAI({ apiKey });
   const response = await client.models.generateContent({
     model: ITINERARY_MODEL,
-    contents: buildPrompt(payload, profile, exchangeRateContext, tripFrame, knowledge),
+    contents: buildPrompt(payload, profile, exchangeRateContext, tripFrame, arrivalDepartureWindow, knowledge),
     config: {
       responseMimeType: "application/json",
       responseSchema: ITINERARY_SCHEMA,
@@ -2058,8 +2077,8 @@ function isAvoidedItem(item: Pick<AiGeneratedItem, "name" | "location" | "shortD
   );
 }
 
-function buildCostsFromDays(days: AiGeneratedDay[], travelers: number) {
-  return summarizeItemCosts(days, travelers);
+function buildCostsFromDays(days: AiGeneratedDay[], travelers: number, flights?: TripFlights) {
+  return summarizeItemCosts(days, travelers, flightCostExpenses(flights));
 }
 
 export function buildReplacementItem(
@@ -2911,6 +2930,73 @@ function capArrivalDepartureDays(
   });
 }
 
+/** Mirrors capArrivalDepartureDays's item-level checks — real activities are not allowed before landing or after the return-flight buffer starts. */
+function itemViolatesArrivalDepartureWindow(
+  item: AiGeneratedItem,
+  day: AiGeneratedDay,
+  isArrivalDay: boolean,
+  isDepartureDay: boolean,
+  window: ArrivalDepartureWindow
+): boolean {
+  if (NON_ACTIVITY_CATEGORIES.has(item.category)) return false;
+  return violatesArrivalDepartureWindow(item.plannedStartTime, day.date, isArrivalDay, isDepartureDay, window);
+}
+
+/**
+ * Flight-aware repair pass (spec §D16/§E.1/§E.2) — a real, non-logistics
+ * activity scheduled before the traveler could realistically have landed
+ * and checked in, or after they'd need to already be heading to the
+ * airport, gets bumped to the next day (arrival side, reusing
+ * moveOverflowItem's forward search) or dropped to alternatives (departure
+ * side, since there is no later day to move it to). Locked/fixed-time items
+ * are never touched, matching every other repair pass in this file.
+ */
+function enforceArrivalDepartureWindow(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  window: ArrivalDepartureWindow,
+  dayCount: number
+): AiGeneratedDay[] {
+  if (!window.earliestUsableTimeOnArrivalDay && !window.latestUsableTimeOnDepartureDay) return days;
+
+  const mutableDays = [...days];
+
+  for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
+    const day = mutableDays[dayIndex];
+    const isArrivalDay = day.dayNumber === 1;
+    const isDepartureDay = day.dayNumber === dayCount;
+    if (!isArrivalDay && !isDepartureDay) continue;
+
+    const violating = day.items.filter(
+      (item) =>
+        !item.locked &&
+        !item.fixedTime &&
+        itemViolatesArrivalDepartureWindow(item, day, isArrivalDay, isDepartureDay, window)
+    );
+    if (violating.length === 0) continue;
+
+    let remainingItems = day.items;
+    let alternatives = day.alternatives;
+
+    for (const item of violating) {
+      remainingItems = remainingItems.filter((candidate) => candidate !== item);
+      const moved = isArrivalDay ? moveOverflowItem(mutableDays, dayIndex, item, payload, profile) : false;
+      if (!moved) {
+        alternatives = normalizeActionableMessages([...alternatives, item.name]);
+      }
+    }
+
+    mutableDays[dayIndex] = fillDerivedDayFields(
+      { ...day, items: remainingItems, alternatives },
+      payload,
+      profile
+    );
+  }
+
+  return mutableDays;
+}
+
 function lightenHighEnergyStreaks(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
@@ -3026,7 +3112,7 @@ async function applyBestEffortRoutingValidation(
     })
   );
 
-  const costs = buildCostsFromDays(days, payload.preferences.travelers);
+  const costs = buildCostsFromDays(days, payload.preferences.travelers, payload.preferences.flights);
   return {
     ...plan,
     days,
@@ -3042,7 +3128,11 @@ export function repairPlan(
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
   tripFrame: TripFrame,
-  exchangeRateContext: ExchangeRateContext | null
+  exchangeRateContext: ExchangeRateContext | null,
+  arrivalDepartureWindow: ArrivalDepartureWindow = computeArrivalDepartureWindow(
+    payload.preferences.flights,
+    payload.isoA2
+  )
 ): AiItineraryResponse {
   const fallback = buildFallbackAiItinerary(payload);
   const dayCount = getTripDayCount(payload.preferences.startDate, payload.preferences.endDate, 0);
@@ -3122,12 +3212,13 @@ export function repairPlan(
     );
     repairedDays = fixOverloadedDays(repairedDays, payload, profile);
     repairedDays = capArrivalDepartureDays(repairedDays, payload, profile, dayCount);
+    repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
     repairedDays = lightenHighEnergyStreaks(repairedDays, payload, profile);
     repairedDays = enforceBudgetOnDays(repairedDays, payload, profile).map((day) =>
       fillDerivedDayFields(normalizeDayCollections(day), payload, profile)
     );
 
-    let computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers);
+    let computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers, payload.preferences.flights);
     let totalEstimatedCost = computedCosts.totalEstimatedCost;
     let estimatedTransportCost = computedCosts.estimatedTransportCost;
     let averageDailyCost = computedCosts.averageDailyCost;
@@ -3147,7 +3238,7 @@ export function repairPlan(
       days: repairedDays,
     };
 
-    let diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame);
+    let diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame, arrivalDepartureWindow);
     if (diagnostics.diversityRisk) {
       repairedDays = diversifyActivities(
         repairedDays,
@@ -3157,7 +3248,7 @@ export function repairPlan(
         diagnostics.activityMixSkew
       ).map((day) => fillDerivedDayFields(normalizeDayCollections(day), payload, profile));
 
-      computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers);
+      computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers, payload.preferences.flights);
       totalEstimatedCost = computedCosts.totalEstimatedCost;
       estimatedTransportCost = computedCosts.estimatedTransportCost;
       averageDailyCost = computedCosts.averageDailyCost;
@@ -3175,7 +3266,7 @@ export function repairPlan(
         categoryBreakdown: computedCosts.categoryBreakdown,
         days: repairedDays,
       };
-      diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame);
+      diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame, arrivalDepartureWindow);
     }
 
     lastPlan = repairedPlan;
@@ -3217,7 +3308,8 @@ export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagn
     diagnostics.baseMismatchDays === 0 &&
     !diagnostics.overSoftBudget &&
     !diagnostics.outOfBudget &&
-    !diagnostics.diversityRisk
+    !diagnostics.diversityRisk &&
+    diagnostics.arrivalDepartureWindowViolations === 0
   );
 }
 
@@ -3239,6 +3331,7 @@ function describeFailingDiagnostics(diagnostics: PlanDiagnostics): Record<string
     "missingAnchorDays",
     "longMealDetours",
     "baseMismatchDays",
+    "arrivalDepartureWindowViolations",
   ];
   for (const field of numericFields) {
     const value = diagnostics[field];
@@ -3322,6 +3415,10 @@ export async function generateCountryItineraryPlan(
     dayCount
   );
   const tripFrame = await buildTripFrame(normalizedPayload, dayCount, knowledge);
+  const arrivalDepartureWindow = computeArrivalDepartureWindow(
+    normalizedPayload.preferences.flights,
+    normalizedPayload.isoA2
+  );
 
   logGenerationStage("AI generation started", {
     isoA2: normalizedPayload.isoA2,
@@ -3339,10 +3436,11 @@ export async function generateCountryItineraryPlan(
         profile,
         exchangeRateContext,
         tripFrame,
+        arrivalDepartureWindow,
         knowledge
       );
-      const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext);
-      const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame);
+      const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext, arrivalDepartureWindow);
+      const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame, arrivalDepartureWindow);
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
         logGenerationStage(`AI generation parsed and validated (attempt ${attempts})`);
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
@@ -3368,9 +3466,10 @@ export async function generateCountryItineraryPlan(
     normalizedPayload,
     profile,
     tripFrame,
-    exchangeRateContext
+    exchangeRateContext,
+    arrivalDepartureWindow
   );
-  const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame);
+  const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame, arrivalDepartureWindow);
   if (fallbackDiagnostics.outOfBudget || fallbackDiagnostics.duplicatePlaces > 0) {
     // The deterministic template is budget-driven by construction, so this
     // should be unreachable in practice — but per spec, a severely broken

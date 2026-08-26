@@ -22,10 +22,19 @@ import {
   type ProfileSummaryLine,
 } from "@/lib/trip-preference-overrides";
 import {
+  createEmptyFlightLeg,
   ITINERARY_GENERATION_MODE_LABELS,
   type CountryTripWorkspaceState,
+  type FlightBookingStatus,
+  type TripFlightLeg,
   type TripPreferences,
 } from "@/lib/trip-workspace";
+
+const FLIGHT_BOOKING_STATUS_LABELS: Record<FlightBookingStatus, string> = {
+  not_booked: "לא הוזמן",
+  booked: "הוזמן",
+  paid: "שולם",
+};
 
 const TRIP_PACE_LABELS: Record<TripPreferences["tripPace"], string> = {
   relaxed: "רגוע",
@@ -316,6 +325,137 @@ export function TripSpecialRequirementsSection({
             placeholder="למשל הימנעות מהעברות לילה, הליכה קצרה בלבד, אזורים בטוחים יותר..."
           />
         </PreferenceField>
+      </div>
+    </details>
+  );
+}
+
+interface FlightsSectionProps {
+  preferences: CountryTripWorkspaceState["preferences"];
+  updatePreferences: (patch: Partial<TripPreferences>) => void;
+}
+
+function FlightLegFields({
+  label,
+  leg,
+  onChange,
+}: {
+  label: string;
+  leg: TripFlightLeg;
+  onChange: (patch: Partial<TripFlightLeg>) => void;
+}) {
+  return (
+    <div className="space-y-3 rounded-xl border border-border/70 p-3">
+      <p className="text-sm font-medium">{label}</p>
+
+      <div className="grid grid-cols-2 gap-3">
+        <PreferenceField label="שדה תעופה יציאה">
+          <Input
+            value={leg.departureAirport}
+            onChange={(event) => onChange({ departureAirport: event.target.value })}
+            placeholder="TLV"
+          />
+        </PreferenceField>
+        <PreferenceField label="שדה תעופה נחיתה">
+          <Input
+            value={leg.arrivalAirport}
+            onChange={(event) => onChange({ arrivalAirport: event.target.value })}
+            placeholder="TBS"
+          />
+        </PreferenceField>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <PreferenceField label="תאריך ושעת המראה">
+          <div className="grid grid-cols-2 gap-2">
+            <Input type="date" value={leg.departureDate} onChange={(event) => onChange({ departureDate: event.target.value })} />
+            <Input type="time" value={leg.departureTime} onChange={(event) => onChange({ departureTime: event.target.value })} />
+          </div>
+        </PreferenceField>
+        <PreferenceField label="תאריך ושעת נחיתה">
+          <div className="grid grid-cols-2 gap-2">
+            <Input type="date" value={leg.arrivalDate} onChange={(event) => onChange({ arrivalDate: event.target.value })} />
+            <Input type="time" value={leg.arrivalTime} onChange={(event) => onChange({ arrivalTime: event.target.value })} />
+          </div>
+        </PreferenceField>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <PreferenceField label="חברת תעופה ומספר טיסה (אופציונלי)">
+          <div className="grid grid-cols-2 gap-2">
+            <Input value={leg.airline} onChange={(event) => onChange({ airline: event.target.value })} placeholder="El Al" />
+            <Input
+              value={leg.flightNumber}
+              onChange={(event) => onChange({ flightNumber: event.target.value })}
+              placeholder="LY123"
+            />
+          </div>
+        </PreferenceField>
+        <PreferenceField label="עלות ומצב הזמנה">
+          <div className="grid grid-cols-2 gap-2">
+            <Input
+              type="number"
+              value={leg.cost ?? ""}
+              onChange={(event) =>
+                onChange({ cost: event.target.value === "" ? null : Number(event.target.value) })
+              }
+              placeholder="₪"
+            />
+            <Select
+              value={leg.bookingStatus}
+              onValueChange={(value) => onChange({ bookingStatus: value as FlightBookingStatus })}
+            >
+              <SelectTrigger>
+                <span>{FLIGHT_BOOKING_STATUS_LABELS[leg.bookingStatus]}</span>
+              </SelectTrigger>
+              <SelectContent>
+                {Object.entries(FLIGHT_BOOKING_STATUS_LABELS).map(([value, statusLabel]) => (
+                  <SelectItem key={value} value={value}>
+                    {statusLabel}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </PreferenceField>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Israel is the fixed home base for every trip (never per-trip configurable
+ * here) — see HOME_COUNTRY_ISO_A2/HOME_TIMEZONE in flight-planning.ts. All
+ * datetimes entered are local to their own airport.
+ */
+export function TripFlightsSection({ preferences, updatePreferences }: FlightsSectionProps) {
+  const flights = preferences.flights;
+  const hasAnyLeg = flights?.outbound != null || flights?.return != null;
+
+  function patchOutbound(patch: Partial<TripFlightLeg>) {
+    const current = flights?.outbound ?? createEmptyFlightLeg();
+    updatePreferences({ flights: { outbound: { ...current, ...patch }, return: flights?.return ?? null } });
+  }
+
+  function patchReturn(patch: Partial<TripFlightLeg>) {
+    const current = flights?.return ?? createEmptyFlightLeg();
+    updatePreferences({ flights: { outbound: flights?.outbound ?? null, return: { ...current, ...patch } } });
+  }
+
+  return (
+    <details className="section-card group space-y-0 p-4 [&_summary::-webkit-details-marker]:hidden">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-2">
+        <span className="font-medium">טיסות</span>
+        <span className="text-xs text-muted-foreground">{hasAnyLeg ? "הוזנו פרטי טיסה" : "אופציונלי"}</span>
+      </summary>
+
+      <div className="mt-4 space-y-4">
+        <p className="text-xs text-muted-foreground">
+          הזנת פרטי הטיסה עוזרת ל-AI לתכנן את היום הראשון והאחרון בצורה ריאלית — בלי פעילויות לפני שהגעתם בפועל
+          וללא פעילויות אחרי שצריך לצאת לשדה.
+        </p>
+        <FlightLegFields label="טיסת הלוך" leg={flights?.outbound ?? createEmptyFlightLeg()} onChange={patchOutbound} />
+        <FlightLegFields label="טיסת חזור" leg={flights?.return ?? createEmptyFlightLeg()} onChange={patchReturn} />
       </div>
     </details>
   );

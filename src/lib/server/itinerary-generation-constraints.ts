@@ -8,6 +8,7 @@ import type {
   TripRecommendation,
 } from "../trip-workspace";
 import { estimateTravelMinutes, haversineKm } from "../trip-workspace";
+import { violatesArrivalDepartureWindow, type ArrivalDepartureWindow } from "../flight-planning";
 import {
   ACTIVITY_MIX_TARGETS,
   classifyActivityTier,
@@ -93,6 +94,12 @@ export interface PlanDiagnostics {
    * `ACTIVITY_MIX_TARGETS`. Empty when the mix is reasonably balanced.
    */
   activityMixSkew: Array<{ tier: ActivityTier; share: number; target: { min: number; max: number } }>;
+  /**
+   * Real activities scheduled before the traveler could realistically have
+   * arrived, or after they'd need to already be heading to the airport —
+   * spec §D16/E.1/E.2. A hard gate, not advisory, unlike activityMixSkew.
+   */
+  arrivalDepartureWindowViolations: number;
 }
 
 export interface RouteProximityScore {
@@ -1091,10 +1098,38 @@ function buildPlaceKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" |
   return `name:${item.name.trim().toLowerCase()}::${item.location.trim().toLowerCase()}`;
 }
 
+/** Categories that represent arrival/transfer/logistics rather than a discretionary activity. */
+export const NON_ACTIVITY_CATEGORIES = new Set<RecommendationCategory>(["transportation", "hotel", "practical"]);
+
+function countArrivalDepartureWindowViolations(
+  plan: AiItineraryResponse,
+  window: ArrivalDepartureWindow | null | undefined
+): number {
+  if (!window) return 0;
+  const dayCount = plan.days.length;
+  let violations = 0;
+
+  for (const day of plan.days) {
+    const isArrivalDay = day.dayNumber === 1;
+    const isDepartureDay = day.dayNumber === dayCount;
+    if (!isArrivalDay && !isDepartureDay) continue;
+
+    for (const item of day.items) {
+      if (NON_ACTIVITY_CATEGORIES.has(item.category)) continue;
+      if (violatesArrivalDepartureWindow(item.plannedStartTime, day.date, isArrivalDay, isDepartureDay, window)) {
+        violations += 1;
+      }
+    }
+  }
+
+  return violations;
+}
+
 export function collectPlanDiagnostics(
   plan: AiItineraryResponse,
   profile: TripPreferenceProfile,
-  tripFrame?: TripFrame | null
+  tripFrame?: TripFrame | null,
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null
 ): PlanDiagnostics {
   let missingMeals = 0;
   let duplicatePlaces = 0;
@@ -1297,6 +1332,7 @@ export function collectPlanDiagnostics(
     highEnergyRhythmViolation: maxConsecutiveHighEnergyDays > MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
     baseMismatchDays,
     activityMixSkew,
+    arrivalDepartureWindowViolations: countArrivalDepartureWindowViolations(plan, arrivalDepartureWindow),
   };
 }
 
