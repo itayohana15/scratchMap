@@ -87,7 +87,6 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
       onPatchItem={dialog.patchItem}
       onRegenerate={dialog.handleRegenerate}
       onRestore={dialog.handleRestore}
-      onDuplicate={dialog.handleDuplicate}
       onArchive={dialog.handleArchive}
       onDelete={dialog.handleDelete}
       onExport={dialog.exportItinerary}
@@ -270,8 +269,8 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
           <h3 className="font-heading text-lg font-semibold">מועדפים</h3>
           {summary.favoritePlaces.length > 0 ? (
             <div className="flex flex-wrap gap-2">
-              {summary.favoritePlaces.map((place) => (
-                <Badge key={place.name} variant="outline" className="gap-1">
+              {summary.favoritePlaces.map((place, index) => (
+                <Badge key={`${place.name}-${index}`} variant="outline" className="gap-1">
                   ❤️ {place.name}
                   {place.count > 1 ? <span className="text-muted-foreground">· ביקרתם {place.count} פעמים</span> : null}
                 </Badge>

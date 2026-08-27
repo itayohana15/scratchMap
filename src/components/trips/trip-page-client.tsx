@@ -36,7 +36,6 @@ import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-c
 import { appendDocument } from "@/lib/trip-documents";
 import type { ReadinessCategory } from "@/lib/trip-readiness";
 import { useCountryByIso } from "@/lib/queries/countries";
-import { useDuplicateCountryItinerary } from "@/lib/queries/country-itineraries";
 import { useItineraryById } from "@/lib/queries/itineraries";
 import { useRenameTripHubItinerary } from "@/lib/queries/trip-hub";
 import { buildTripHubTrip } from "@/lib/trip-hub";
@@ -89,7 +88,6 @@ export function TripPageClient({ tripId }: { tripId: string }) {
   const { data: country } = useCountryByIso(isoA2);
   const controller = useItineraryDialogController(isoA2 ?? "");
   const renameItinerary = useRenameTripHubItinerary();
-  const duplicateItinerary = useDuplicateCountryItinerary(isoA2 ?? "");
 
   const hasSeededRef = useRef<string | null>(null);
   useEffect(() => {
@@ -152,16 +150,6 @@ export function TripPageClient({ tripId }: { tripId: string }) {
     }
   }
 
-  async function handleDuplicate() {
-    try {
-      const duplicate = await duplicateItinerary.mutateAsync(draft!.id);
-      toast.success("נוצר עותק חדש");
-      router.push(`/trips/${duplicate.id}`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "השכפול נכשל");
-    }
-  }
-
   async function handleDelete() {
     await controller.handleDelete(draft!.id);
     router.push("/trips");
@@ -187,8 +175,7 @@ export function TripPageClient({ tripId }: { tripId: string }) {
       <TripHeroHeader trip={trip} />
       <TripPrimaryMetrics trip={trip} />
 
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <TripTabNav activeTab={activeTab} />
+      <div className="flex justify-start">
         <div className="flex shrink-0 items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setEditModalOpen(true)}>
             עריכת המסלול
@@ -217,7 +204,6 @@ export function TripPageClient({ tripId }: { tripId: string }) {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => void handleRename()}>שנה שם</DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void handleDuplicate()}>שכפל</DropdownMenuItem>
               <DropdownMenuItem onClick={() => void controller.handleArchive(draft!.id)}>
                 העבר לארכיון
               </DropdownMenuItem>
@@ -229,7 +215,9 @@ export function TripPageClient({ tripId }: { tripId: string }) {
         </div>
       </div>
 
-      <div>
+      <div className="grid gap-4 lg:grid-cols-[14rem_minmax(0,1fr)] lg:items-start">
+        <TripTabNav activeTab={activeTab} />
+        <div className="min-w-0">
         {activeTab === "overview" ? (
           <TripOverviewTab
             trip={trip}
@@ -248,6 +236,9 @@ export function TripPageClient({ tripId }: { tripId: string }) {
             onSelectDay={(dayId) => goToTab("itinerary", dayId)}
             onPatchDay={controller.patchDay}
             onPatchItem={controller.patchItem}
+            onRemoveItem={controller.removeItemFromDay}
+            onMoveItemToDay={controller.moveItemToDay}
+            onPatchDraft={controller.patchDraft}
             onRegenerateDay={(dayId) => void controller.handleRegenerate(draft.id, "day", dayId)}
             isRegenerating={controller.isRegenerating}
           />
@@ -319,6 +310,7 @@ export function TripPageClient({ tripId }: { tripId: string }) {
             ) : null}
           </div>
         ) : null}
+        </div>
       </div>
 
       <CountryItineraryDetailsDialog
@@ -347,7 +339,6 @@ export function TripPageClient({ tripId }: { tripId: string }) {
         onPatchItem={controller.patchItem}
         onRegenerate={controller.handleRegenerate}
         onRestore={controller.handleRestore}
-        onDuplicate={() => handleDuplicate()}
         onArchive={controller.handleArchive}
         onDelete={() => handleDelete()}
         onExport={controller.exportItinerary}

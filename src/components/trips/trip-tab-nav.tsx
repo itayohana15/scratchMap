@@ -29,7 +29,21 @@ export const TRIP_TAB_LABELS: Record<TripTabValue, string> = {
   journal: "יומן",
   photos: "תמונות",
   summary: "סיכום הטיול",
-  more: "עוד",
+  more: "צ'ק ליסט לטיסה",
+};
+
+const TRIP_TAB_EMOJIS: Record<TripTabValue, string> = {
+  overview: "🧭",
+  itinerary: "🗓️",
+  map: "🗺️",
+  accommodation: "🛏️",
+  transport: "🚆",
+  budget: "💳",
+  bookings: "🎟️",
+  journal: "📔",
+  photos: "📸",
+  summary: "✨",
+  more: "✅",
 };
 
 const PRIMARY_TABS: TripTabValue[] = [
@@ -40,10 +54,10 @@ const PRIMARY_TABS: TripTabValue[] = [
   "transport",
   "budget",
   "bookings",
+  "more",
   "journal",
   "photos",
   "summary",
-  "more",
 ];
 
 /**
@@ -69,7 +83,7 @@ export function TripTabNav({ activeTab }: { activeTab: TripTabValue }) {
 
   return (
     <nav
-      className="sticky top-0 z-30 -mx-4 flex gap-1 overflow-x-auto border-b border-border/70 bg-background/95 px-4 py-1.5 backdrop-blur-sm sm:mx-0 sm:rounded-2xl sm:border sm:px-2"
+      className="flex gap-1 overflow-x-auto rounded-2xl border border-border/70 bg-card p-2 lg:sticky lg:top-20 lg:flex-col lg:overflow-visible"
       aria-label="ניווט טיול"
     >
       {PRIMARY_TABS.map((tab) => (
@@ -78,12 +92,13 @@ export function TripTabNav({ activeTab }: { activeTab: TripTabValue }) {
           type="button"
           onClick={() => setTab(tab)}
           className={cn(
-            "shrink-0 rounded-xl px-3.5 py-2 text-sm font-medium whitespace-nowrap transition-colors",
+            "flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5 text-right text-sm font-medium whitespace-nowrap transition-colors lg:w-full",
             activeTab === tab
               ? "bg-primary text-primary-foreground"
               : "text-muted-foreground hover:bg-muted hover:text-foreground"
           )}
         >
+          <span aria-hidden="true">{TRIP_TAB_EMOJIS[tab]}</span>
           {TRIP_TAB_LABELS[tab]}
         </button>
       ))}

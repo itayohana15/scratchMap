@@ -24,6 +24,7 @@ const basePreferences: TripPreferences = {
   transportationPreferences: "public transport",
   accommodationArea: "",
   dietaryPreferences: "",
+  foodNotes: "",
   accessibilityNeeds: "",
   preferredRegions: "",
   mustVisitPlaces: "",

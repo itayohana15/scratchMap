@@ -50,20 +50,25 @@ function formatDistance(meters: number) {
 interface NearbySectionProps {
   places: NearbyPlaceResult[] | undefined;
   isLoading: boolean;
+  /** Restrict to a subset of categories (e.g. only food, or only non-food) — omit to show everything, unchanged from the original behavior. */
+  categories?: NearbyCategory[];
+  title?: string;
 }
 
-export function NearbySection({ places, isLoading }: NearbySectionProps) {
-  if (!isLoading && (!places || places.length === 0)) return null;
+export function NearbySection({ places, isLoading, categories, title = "בסביבה" }: NearbySectionProps) {
+  const filteredPlaces = categories ? (places ?? []).filter((place) => categories.includes(place.category)) : places;
+
+  if (!isLoading && (!filteredPlaces || filteredPlaces.length === 0)) return null;
 
   const grouped = new Map<NearbyCategory, NearbyPlaceResult[]>();
-  for (const place of places ?? []) {
+  for (const place of filteredPlaces ?? []) {
     const bucket = grouped.get(place.category) ?? [];
     bucket.push(place);
     grouped.set(place.category, bucket);
   }
 
   return (
-    <ModalSection title="בסביבה" icon={MapPinned}>
+    <ModalSection title={title} icon={MapPinned}>
       {isLoading ? (
         <p className="text-sm text-muted-foreground">מחפש מקומות בסביבה...</p>
       ) : (

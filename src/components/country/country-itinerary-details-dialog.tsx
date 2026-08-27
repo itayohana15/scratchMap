@@ -377,7 +377,6 @@ interface CountryItineraryDetailsDialogProps {
     liveInstruction?: string | null
   ) => Promise<void> | void;
   onRestore: (versionId: string) => Promise<void> | void;
-  onDuplicate: (itineraryId: string) => Promise<void> | void;
   onArchive: (itineraryId: string) => Promise<void> | void;
   onDelete: (itineraryId: string) => Promise<void> | void;
   onExport: (itinerary: CountryItineraryRecord) => void;
@@ -401,7 +400,6 @@ export function CountryItineraryDetailsDialog({
   onPatchItem,
   onRegenerate,
   onRestore,
-  onDuplicate,
   onArchive,
   onDelete,
   onExport,
@@ -707,10 +705,6 @@ export function CountryItineraryDetailsDialog({
                       <Ellipsis className="size-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-52">
-                      <DropdownMenuItem onClick={() => void onDuplicate(draft.id)}>
-                        <Copy className="size-4" />
-                        שכפול מסלול
-                      </DropdownMenuItem>
                       <DropdownMenuItem onClick={() => onExport(draft)}>
                         <Download className="size-4" />
                         ייצוא JSON

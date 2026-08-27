@@ -8,8 +8,11 @@ import {
   buildTripPreferenceProfile,
   calculateDayLoadMinutes,
   collectPlanDiagnostics,
+  countDayTimeOverlaps,
+  isDayTripDay,
   normalizeCoordinatePair,
   normalizeActionableMessages,
+  normalizePlaceNameSlug,
   scoreRouteProximity,
   withNormalizedRecommendationPrice,
   type ExchangeRateContext,
@@ -35,6 +38,7 @@ const basePreferences: TripPreferences = {
   transportationPreferences: "public transport",
   accommodationArea: "Tokyo Station",
   dietaryPreferences: "vegetarian",
+  foodNotes: "",
   accessibilityNeeds: "",
   preferredRegions: "Tokyo, Kyoto",
   mustVisitPlaces: "Senso-ji",
@@ -385,6 +389,131 @@ test("collectPlanDiagnostics flags budget, duplicates, overload, avoid conflicts
   assert.equal(diagnostics.foodDominantDays, 0);
   assert.equal(diagnostics.missingAnchorDays, 0);
   assert.ok(diagnostics.longMealDetours >= 1);
+});
+
+// Spec item 58's "three activities at 12:30" symptom — a structural check,
+// independent of any scheduler having run, so it also catches raw AI output.
+test("collectPlanDiagnostics flags overlapping items via timeOverlaps", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 1);
+  const overlappingDay = buildDay({
+    dayNumber: 1,
+    items: [
+      buildItem({ name: "Museum", plannedStartTime: "12:30", estimatedDurationMinutes: 120 }),
+      buildItem({ name: "Market", plannedStartTime: "12:30", estimatedDurationMinutes: 60 }),
+      buildItem({ name: "Viewpoint", plannedStartTime: "13:00", estimatedDurationMinutes: 30 }),
+    ],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Trip",
+    summary: "",
+    totalEstimatedCost: 0,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [overlappingDay],
+  };
+
+  const diagnostics = collectPlanDiagnostics(plan, profile);
+  assert.ok(diagnostics.timeOverlaps >= 2, `expected at least 2 overlaps, got ${diagnostics.timeOverlaps}`);
+});
+
+test("collectPlanDiagnostics reports zero timeOverlaps for a real sequential timeline", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 1);
+  const sequentialDay = buildDay({
+    dayNumber: 1,
+    items: [
+      buildItem({ name: "Museum", plannedStartTime: "09:00", estimatedDurationMinutes: 120 }),
+      buildItem({ name: "Market", plannedStartTime: "11:30", estimatedDurationMinutes: 60 }),
+      buildItem({ name: "Viewpoint", plannedStartTime: "13:00", estimatedDurationMinutes: 30 }),
+    ],
+  });
+  const plan: AiItineraryResponse = {
+    title: "Trip",
+    summary: "",
+    totalEstimatedCost: 0,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [sequentialDay],
+  };
+
+  assert.equal(collectPlanDiagnostics(plan, profile).timeOverlaps, 0);
+});
+
+test("normalizePlaceNameSlug strips parenthetical suffixes and punctuation so near-duplicate names match", () => {
+  assert.equal(normalizePlaceNameSlug("Mtatsminda Park (Funicular)"), normalizePlaceNameSlug("Mtatsminda Park"));
+  assert.notEqual(normalizePlaceNameSlug("Mtatsminda Park"), normalizePlaceNameSlug("Rike Park"));
+});
+
+// Spec item 52/56's "duplicate Mtatsminda Park" symptom — the AI can easily
+// hallucinate slightly different coordinates for the same real landmark
+// across two mentions; the old 4-decimal (~11m) coordinate key missed that
+// drift entirely.
+test("collectPlanDiagnostics catches the same place mentioned twice with slightly drifted coordinates", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 2);
+  const plan: AiItineraryResponse = {
+    title: "Trip",
+    summary: "",
+    totalEstimatedCost: 0,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days: [
+      buildDay({
+        dayNumber: 1,
+        items: [buildItem({ name: "Mtatsminda Park", lat: 41.693, lon: 44.789, recommendationId: null })],
+      }),
+      buildDay({
+        dayNumber: 2,
+        items: [
+          // Same real place, ~50m away (well within the same ~111m grid
+          // cell) and a slightly different mention of the name.
+          buildItem({ name: "Mtatsminda Park (Funicular)", lat: 41.6934, lon: 44.7893, recommendationId: null }),
+        ],
+      }),
+    ],
+  };
+
+  assert.equal(collectPlanDiagnostics(plan, profile).duplicatePlaces, 1);
+});
+
+// Spec item 13 — a day trip keeps its overnight base but its stops sit far
+// away for the day; that must never be flagged as the "wrong-city
+// restaurant"-style cross-city violation described in spec item 58.
+test("isDayTripDay recognizes a day-trip title but not a plain sightseeing day or a transfer day", () => {
+  assert.equal(isDayTripDay(buildDay({ title: "יום טיול לבורג'ומי", notes: "" })), true);
+  assert.equal(isDayTripDay(buildDay({ title: "Day trip to Borjomi", notes: "" })), true);
+  assert.equal(isDayTripDay(buildDay({ title: "טביליסי העתיקה", notes: "" })), false);
+  assert.equal(isDayTripDay(buildDay({ title: "מעבר לבטומי", notes: "checkout and transfer" })), false);
+});
+
+test("analyzeDayGeography does not flag a day trip's Tbilisi departure + Borjomi visit as cross-city mixing", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 1);
+  // Real coordinates: Tbilisi ~41.72,44.83 vs. Borjomi ~41.84,43.39 — well
+  // past DISTANT_CITY_DISTANCE_KM, which is exactly the "Borjomi and
+  // Tbilisi mixed in one day" symptom from spec item 58, except here it's a
+  // legitimate day trip, not a mistake.
+  const sharedItems = [
+    buildItem({ name: "Breakfast near the hotel", category: "cafe", location: "Tbilisi", lat: 41.7151, lon: 44.8271 }),
+    buildItem({ name: "Borjomi Park", location: "Borjomi", lat: 41.8407, lon: 43.3921, travelMinutes: 150 }),
+  ];
+
+  const plainDay = buildDay({ title: "טביליסי העתיקה", accommodation: "Tbilisi Hotel", cityRegion: "Tbilisi", items: sharedItems });
+  assert.ok(
+    analyzeDayGeography(plainDay, profile).crossCityItems.length > 0,
+    "sanity check: without day-trip recognition this mix would (correctly) be flagged"
+  );
+
+  const dayTrip = buildDay({
+    title: "יום טיול לבורג'ומי",
+    accommodation: "Tbilisi Hotel",
+    cityRegion: "Tbilisi",
+    items: sharedItems,
+  });
+  assert.equal(analyzeDayGeography(dayTrip, profile).crossCityItems.length, 0);
 });
 
 test("buildGenerationSummary highlights budget success and key trip counts", () => {

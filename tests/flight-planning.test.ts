@@ -4,7 +4,11 @@ import test from "node:test";
 import {
   computeArrivalDepartureWindow,
   computeFlightDurationMinutes,
+  computeMultiSegmentFlight,
   describeArrivalDepartureWindow,
+  estimateFlightArrival,
+  estimateFlightDurationMinutesByDistance,
+  resolveAirportTimeZone,
 } from "../src/lib/flight-planning";
 import { createEmptyFlightLeg, type TripFlights } from "../src/lib/trip-workspace";
 
@@ -116,4 +120,112 @@ test("describeArrivalDepartureWindow mentions both computed times when both wind
   });
   assert.match(text, /17:15/);
   assert.match(text, /11:15/);
+});
+
+// Airport-aware flight duration/arrival estimation (spec items 2-9, 31-32).
+test("estimateFlightDurationMinutesByDistance returns a reasonable positive estimate for a known route", () => {
+  const minutes = estimateFlightDurationMinutesByDistance("TLV", "TBS");
+  assert.ok(minutes != null && minutes > 60 && minutes < 240, `expected a realistic short-haul duration, got ${minutes}`);
+});
+
+test("estimateFlightDurationMinutesByDistance returns null for an unrecognized airport", () => {
+  assert.equal(estimateFlightDurationMinutesByDistance("TLV", "ZZZ"), null);
+});
+
+test("resolveAirportTimeZone prefers the airport's own timezone over the fallback", () => {
+  assert.equal(resolveAirportTimeZone("TBS", "Etc/UTC"), "Asia/Tbilisi");
+  assert.equal(resolveAirportTimeZone("ZZZ", "Etc/UTC"), "Etc/UTC");
+});
+
+test("estimateFlightArrival computes a timezone-aware arrival, never a naive same-zone addition", () => {
+  const estimate = estimateFlightArrival("TLV", "TBS", "2026-08-26", "20:25", "Asia/Jerusalem", "Asia/Tbilisi");
+  assert.ok(estimate != null);
+  // Naive same-zone addition would give a TLV-local time (e.g. ~22:52) —
+  // the real Tbilisi local time is one hour ahead of that.
+  assert.notEqual(estimate!.arrivalTime, "22:52");
+  assert.match(estimate!.arrivalTime, /^\d{2}:\d{2}$/);
+  assert.ok(estimate!.estimatedFlightDurationMinutes > 60);
+});
+
+test("estimateFlightArrival returns null for an unrecognized airport (falls back to manual entry)", () => {
+  assert.equal(estimateFlightArrival("TLV", "ZZZ", "2026-08-26", "20:25", "Asia/Jerusalem", "Etc/UTC"), null);
+});
+
+test("estimateFlightArrival returns null when required fields are missing", () => {
+  assert.equal(estimateFlightArrival("", "TBS", "2026-08-26", "20:25", "Asia/Jerusalem", "Asia/Tbilisi"), null);
+  assert.equal(estimateFlightArrival("TLV", "TBS", "2026-08-26", "", "Asia/Jerusalem", "Asia/Tbilisi"), null);
+});
+
+test("estimateFlightArrival flags next-calendar-day arrival for a late-night departure", () => {
+  const estimate = estimateFlightArrival("TLV", "TBS", "2026-08-26", "23:30", "Asia/Jerusalem", "Asia/Tbilisi");
+  assert.ok(estimate != null);
+  assert.equal(estimate!.arrivesNextCalendarDay, true);
+  assert.equal(estimate!.arrivalDate, "2026-08-27");
+});
+
+test("computeMultiSegmentFlight with zero connections matches a direct estimateFlightArrival", () => {
+  const direct = estimateFlightArrival("TLV", "TBS", "2026-08-26", "18:30", "Asia/Jerusalem", "Asia/Tbilisi");
+  const result = computeMultiSegmentFlight(
+    "TLV",
+    "TBS",
+    "2026-08-26",
+    "18:30",
+    [],
+    "Asia/Jerusalem",
+    "Asia/Tbilisi"
+  );
+  assert.ok(direct != null && result != null);
+  assert.equal(result!.segments.length, 1);
+  assert.equal(result!.finalArrivalDate, direct!.arrivalDate);
+  assert.equal(result!.finalArrivalTime, direct!.arrivalTime);
+  // No layover on a direct flight — airborne time equals total journey time.
+  assert.equal(result!.totalAirborneMinutes, result!.totalJourneyMinutes);
+  assert.equal(result!.totalAirborneMinutes, direct!.estimatedFlightDurationMinutes);
+});
+
+test("computeMultiSegmentFlight chains one connection, adds the layover, and sums both totals", () => {
+  const result = computeMultiSegmentFlight(
+    "TLV",
+    "TBS",
+    "2026-08-26",
+    "18:30",
+    [{ airport: "IST", layoverMinutes: 130 }],
+    "Asia/Jerusalem",
+    "Asia/Tbilisi"
+  );
+  assert.ok(result != null);
+  assert.equal(result!.segments.length, 2);
+  assert.equal(result!.segments[0].origin, "TLV");
+  assert.equal(result!.segments[0].destination, "IST");
+  assert.equal(result!.segments[1].origin, "IST");
+  assert.equal(result!.segments[1].destination, "TBS");
+  // Second segment must depart no earlier than the first segment's arrival plus the layover.
+  assert.equal(result!.segments[1].departureDate >= result!.segments[0].arrivalDate, true);
+  const perSegmentSum = result!.segments.reduce((sum, segment) => sum + segment.durationMinutes, 0);
+  assert.equal(result!.totalAirborneMinutes, perSegmentSum);
+  // Total journey = airborne + the one layover, so it must be strictly greater than airborne alone.
+  assert.ok(result!.totalJourneyMinutes > result!.totalAirborneMinutes);
+  assert.equal(result!.totalJourneyMinutes - result!.totalAirborneMinutes, 130);
+});
+
+test("computeMultiSegmentFlight returns null when any airport in the chain is unrecognized", () => {
+  assert.equal(
+    computeMultiSegmentFlight(
+      "TLV",
+      "TBS",
+      "2026-08-26",
+      "18:30",
+      [{ airport: "ZZZ", layoverMinutes: 90 }],
+      "Asia/Jerusalem",
+      "Asia/Tbilisi"
+    ),
+    null
+  );
+});
+
+test("computeMultiSegmentFlight returns null when required top-level fields are missing", () => {
+  assert.equal(
+    computeMultiSegmentFlight("", "TBS", "2026-08-26", "18:30", [], "Asia/Jerusalem", "Asia/Tbilisi"),
+    null
+  );
 });

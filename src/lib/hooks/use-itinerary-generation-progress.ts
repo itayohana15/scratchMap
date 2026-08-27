@@ -8,7 +8,12 @@ export interface GenerationStageDefinition {
   checkpoint: number;
 }
 
-export type GenerationStatus = "idle" | "pending" | "success" | "error";
+export type GenerationStatus = "idle" | "submitting" | "generating" | "success" | "error";
+
+export type GenerationRunResult<T> =
+  | { status: "success"; value: T }
+  | { status: "error" }
+  | { status: "aborted" };
 
 export interface GenerationStageState {
   key: string;
@@ -48,7 +53,15 @@ export function useItineraryGenerationProgress<T>(stages: GenerationStageDefinit
   const [status, setStatus] = useState<GenerationStatus>("idle");
   const [stageIndex, setStageIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [errorDetails, setErrorDetails] = useState<unknown>(null);
   const [result, setResult] = useState<T | null>(null);
+  // Elapsed-time timer (spec items 19-25): generationStartedAt is the single
+  // source of truth (Date.now() captured once, synchronously, at the top of
+  // start() — never an incrementing counter, so re-renders/stage changes
+  // can't drift it). finalElapsedMs freezes the exact duration the instant
+  // status leaves "pending", independent of when the UI happens to re-render.
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [finalElapsedMs, setFinalElapsedMs] = useState<number | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const intervalRef = useRef<number | null>(null);
 
@@ -66,34 +79,47 @@ export function useItineraryGenerationProgress<T>(stages: GenerationStageDefinit
       clearTimer();
       const controller = new AbortController();
       controllerRef.current = controller;
-      setStatus("pending");
+      const startedAt = Date.now();
+      setStatus("submitting");
       setError(null);
+      setErrorDetails(null);
       setResult(null);
       setStageIndex(0);
+      setGenerationStartedAt(startedAt);
+      setFinalElapsedMs(null);
 
       intervalRef.current = window.setInterval(() => {
         setStageIndex((current) => (current < stages.length - 1 ? current + 1 : current));
       }, STAGE_INTERVAL_MS);
 
       try {
+        setStatus("generating");
         const value = await run(controller.signal);
         clearTimer();
         // Never claim 100% before the real request actually resolves (§B4) —
         // hold briefly on the final stage so the transition feels intentional (§B12).
         setStageIndex(stages.length - 1);
         await new Promise((resolve) => window.setTimeout(resolve, FINAL_HOLD_MS));
+        setFinalElapsedMs(Date.now() - startedAt);
         setResult(value);
         setStatus("success");
-        return value;
+        return { status: "success", value } satisfies GenerationRunResult<T>;
       } catch (err) {
         clearTimer();
         if (err instanceof DOMException && err.name === "AbortError") {
           setStatus("idle");
-          return null;
+          setGenerationStartedAt(null);
+          return { status: "aborted" } satisfies GenerationRunResult<T>;
         }
+        setFinalElapsedMs(Date.now() - startedAt);
         setError(err instanceof Error ? err.message : "בניית המסלול נכשלה");
+        setErrorDetails(
+          typeof err === "object" && err !== null && "body" in err
+            ? (err as { body: unknown }).body
+            : { message: err instanceof Error ? err.message : String(err) }
+        );
         setStatus("error");
-        return null;
+        return { status: "error" } satisfies GenerationRunResult<T>;
       }
     },
     [clearTimer, stages.length]
@@ -107,8 +133,11 @@ export function useItineraryGenerationProgress<T>(stages: GenerationStageDefinit
     clearTimer();
     setStatus("idle");
     setError(null);
+    setErrorDetails(null);
     setResult(null);
     setStageIndex(0);
+    setGenerationStartedAt(null);
+    setFinalElapsedMs(null);
   }, [clearTimer]);
 
   const currentStage = stages[stageIndex] ?? stages[0];
@@ -128,9 +157,37 @@ export function useItineraryGenerationProgress<T>(stages: GenerationStageDefinit
     stageLabel: currentStage?.label ?? "",
     stageChecklist,
     error,
+    errorDetails,
     result,
+    generationStartedAt,
+    finalElapsedMs,
     start,
     cancel,
     reset,
   };
+}
+
+/**
+ * Live elapsed-time display (spec items 19-25): always recomputed from
+ * Date.now() - generationStartedAt (never an incrementing counter, so it
+ * can't drift), ticking about once a second while running. Once
+ * finalElapsedMs is set (generation finished or failed), that frozen value
+ * is returned regardless of ticking — the displayed duration stops moving.
+ */
+export function useElapsedDisplayMs(
+  generationStartedAt: number | null,
+  finalElapsedMs: number | null,
+  isRunning: boolean
+): number {
+  const [, forceTick] = useState(0);
+
+  useEffect(() => {
+    if (!isRunning || generationStartedAt == null || finalElapsedMs != null) return;
+    const intervalId = window.setInterval(() => forceTick((tick) => tick + 1), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [isRunning, generationStartedAt, finalElapsedMs]);
+
+  if (finalElapsedMs != null) return finalElapsedMs;
+  if (generationStartedAt == null) return 0;
+  return Date.now() - generationStartedAt;
 }

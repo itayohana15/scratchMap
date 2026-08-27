@@ -116,6 +116,7 @@ export interface Database {
           created_at: string;
           updated_at: string;
           external_key: string | null;
+          client_request_id: string | null;
         };
         Insert: Partial<
           Pick<
@@ -145,6 +146,7 @@ export interface Database {
             | "created_at"
             | "updated_at"
             | "external_key"
+            | "client_request_id"
           >
         > &
           Pick<

@@ -368,3 +368,40 @@ test("applyAiPlanToWorkspace re-points booking/document itineraryItemId links to
   assert.equal(next.documents[0].itineraryItemId, newItemId, "document link should follow the item to its new id");
 });
 
+// 7. day_load readiness category flags a day with too many/too-long items,
+// without suggesting a specific fix (spec Part F1/F2 — that's the
+// generator's job, not something readiness should nudge about).
+test("computeTripReadiness: day_load is complete for a light day, partial for an overloaded one", () => {
+  const lightDay = { ...createEmptyDay(1, "2026-10-06"), items: [item({ id: "a1" })] };
+  const light = buildItinerary({ itineraryDays: [lightDay] });
+  const lightReadiness = computeTripReadiness(light).categories.find((category) => category.key === "day_load");
+  assert.equal(lightReadiness?.status, "complete");
+
+  const heavyItems = Array.from({ length: 6 }, (_, index) => item({ id: `h${index}`, name: `Stop ${index}` }));
+  const heavyDay = { ...createEmptyDay(1, "2026-10-06"), title: "יום 1", items: heavyItems };
+  const heavy = buildItinerary({ itineraryDays: [heavyDay] });
+  const heavyReadiness = computeTripReadiness(heavy).categories.find((category) => category.key === "day_load");
+  assert.equal(heavyReadiness?.status, "partial");
+  assert.match(heavyReadiness?.detail ?? "", /יום 1/);
+});
+
+// 8. travel_time readiness category flags a long single travel leg, but not
+// on a recognized intercity transfer day (where a long leg is expected).
+test("computeTripReadiness: travel_time ignores long legs on intercity transfer days", () => {
+  const longLegItem = item({ id: "t1", travelMinutes: 120 });
+  const regularDay = { ...createEmptyDay(1, "2026-10-06"), title: "יום 1", items: [longLegItem] };
+  const regular = buildItinerary({ itineraryDays: [regularDay] });
+  const regularReadiness = computeTripReadiness(regular).categories.find((category) => category.key === "travel_time");
+  assert.equal(regularReadiness?.status, "partial");
+
+  const transferDay = {
+    ...createEmptyDay(2, "2026-10-07"),
+    title: "מעבר בין ערים",
+    notes: "יום מעבר בין ערים",
+    items: [longLegItem],
+  };
+  const transfer = buildItinerary({ itineraryDays: [transferDay] });
+  const transferReadiness = computeTripReadiness(transfer).categories.find((category) => category.key === "travel_time");
+  assert.equal(transferReadiness?.status, "complete");
+});
+

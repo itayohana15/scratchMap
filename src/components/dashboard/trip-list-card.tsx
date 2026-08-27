@@ -1,5 +1,3 @@
-import { Plane } from "lucide-react";
-
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTripDateRange } from "@/lib/format";
 import type { TripHubTrip } from "@/lib/trip-hub";
@@ -33,7 +31,13 @@ export function TripListCard({ title, trips, isLoading, emptyLabel, onOpen }: Tr
                 className="flex w-full items-center justify-between gap-3 rounded-xl border border-border/60 px-3 py-2.5 text-right transition-colors hover:border-primary/40 hover:bg-muted/40"
               >
                 <div className="flex items-center gap-2.5">
-                  <Plane className="size-4 text-primary" />
+                  <Image
+                    src={`/flags/${trip.isoA2.toLowerCase()}.png`}
+                    alt={`דגל ${trip.countryName}`}
+                    width={28}
+                    height={20}
+                    className="h-5 w-7 rounded-sm border border-border/50 object-cover shadow-sm"
+                  />
                   <div>
                     <p className="text-sm font-medium">{trip.countryName}</p>
                     <p className="text-xs text-muted-foreground">
@@ -56,3 +60,4 @@ export function TripListCard({ title, trips, isLoading, emptyLabel, onOpen }: Tr
     </section>
   );
 }
+import Image from "next/image";

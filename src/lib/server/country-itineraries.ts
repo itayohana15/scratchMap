@@ -12,7 +12,11 @@ import {
   type CountryItineraryRecord,
   type CountryItineraryVersionSource,
 } from "@/lib/itineraries";
-import { applyDeterministicReplacement, generateCountryItineraryPlan } from "@/lib/server/country-itinerary-generation";
+import {
+  applyDeterministicReplacement,
+  generateCountryItineraryPlan,
+  ItineraryGenerationInfeasibleError,
+} from "@/lib/server/country-itinerary-generation";
 import { buildTripPreferenceProfile } from "@/lib/server/itinerary-generation-constraints";
 import { mergeLiveReplanResult } from "@/lib/live-trip-planner";
 import { buildPersonalizationSummary, computeBehaviorSignals, deriveInferredPreferences } from "@/lib/preference-learning";
@@ -33,6 +37,30 @@ import {
 import { isMissingCountryItineraryStorageError, toCountryItineraryStorageError } from "@/lib/server/country-itinerary-storage";
 
 type DbClient = SupabaseClient<Database>;
+
+export type ItineraryGenerationFailureStage =
+  | "request validation"
+  | "trip wizard payload parsing"
+  | "flight data"
+  | "airport data"
+  | "dietary preferences"
+  | "itinerary AI request"
+  | "AI response parsing"
+  | "schema validation"
+  | "DB save"
+  | "recommendation/place resolution"
+  | "final response serialization";
+
+export class ItineraryGenerationPipelineError extends Error {
+  constructor(
+    public stage: ItineraryGenerationFailureStage,
+    message: string,
+    public details: Record<string, unknown> = {}
+  ) {
+    super(message);
+    this.name = "ItineraryGenerationPipelineError";
+  }
+}
 
 interface UpdateCountryItineraryInput {
   title?: string;
@@ -185,6 +213,30 @@ export async function getCountryItinerary(supabase: DbClient, itineraryId: strin
   return normalizeCountryItineraryRow(row);
 }
 
+/**
+ * Duplicate-generation protection (spec E7/E8): looks up a previously
+ * generated itinerary by the wizard's client-generated request id, so a
+ * second request carrying the same id — a double-click race, a network
+ * retry, or two requests that both raced past this same lookup — resolves
+ * to the existing row instead of generating (and billing) a second trip.
+ * `maybeSingle` returns null cleanly when nothing matches yet.
+ */
+export async function findCountryItineraryByClientRequestId(
+  supabase: DbClient,
+  clientRequestId: string
+): Promise<CountryItineraryRecord | null> {
+  const { data, error } = await supabase
+    .from("country_itineraries")
+    .select("*")
+    .eq("client_request_id", clientRequestId)
+    .maybeSingle();
+  if (error) {
+    if (isMissingCountryItineraryStorageError(error)) return null;
+    throw toCountryItineraryStorageError(error);
+  }
+  return data ? normalizeCountryItineraryRow(data) : null;
+}
+
 export async function listCountryItineraryVersions(supabase: DbClient, itineraryId: string) {
   const { data, error } = await supabase
     .from("country_itinerary_versions")
@@ -240,17 +292,53 @@ function devLog(message: string, details?: Record<string, unknown>) {
   else console.log(`[Itinerary] ${message}`);
 }
 
+async function runGenerationStage<T>(
+  stage: ItineraryGenerationFailureStage,
+  work: () => Promise<T>,
+  details?: Record<string, unknown>
+): Promise<T> {
+  devLog(`${stage}: started`, details);
+  try {
+    const value = await work();
+    devLog(`${stage}: complete`, details);
+    return value;
+  } catch (error) {
+    if (error instanceof ItineraryGenerationInfeasibleError || error instanceof ItineraryGenerationPipelineError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : "Unknown generation failure";
+    devLog(`${stage}: failed`, { ...details, message });
+    throw new ItineraryGenerationPipelineError(stage, message, details);
+  }
+}
+
 export async function generateAndStoreCountryItinerary(
   supabase: DbClient,
   country: Tables<"countries">,
   payload: AiItineraryRequest,
   guide: CountryAiRecommendation | null
 ) {
+  // Duplicate-generation protection (E7): checked before doing any AI work
+  // at all, so a repeat request with the same wizard-minted id never
+  // re-generates or re-bills a second trip — it just returns the first one.
+  if (payload.clientRequestId) {
+    const existing = await runGenerationStage("DB save", () =>
+      findCountryItineraryByClientRequestId(supabase, payload.clientRequestId!)
+    );
+    if (existing) {
+      devLog("duplicate request — returning existing itinerary", {
+        clientRequestId: payload.clientRequestId,
+        itineraryId: existing.id,
+      });
+      return existing;
+    }
+  }
+
   const personalizationSummary = await loadPersonalizationSummary(supabase);
   devLog("profile loaded", { hasPersonalizationSummary: personalizationSummary != null });
-  const generated = await generateCountryItineraryPlan(
-    { ...payload, personalizationSummary },
-    guide
+  const generated = await runGenerationStage("itinerary AI request", () =>
+    generateCountryItineraryPlan({ ...payload, personalizationSummary }, guide),
+    { isoA2: country.iso_a2 }
   );
   devLog("AI generation complete", { days: generated.days.length, usedFallback: generated.usedFallback });
   const initialWorkspace = buildInitialWorkspace(country.name, payload);
@@ -258,14 +346,22 @@ export async function generateAndStoreCountryItinerary(
   // Normalize before aggregation (spec §A2): merge "Tbilisi"/"טביליסי"-style
   // duplicates into one canonical city BEFORE cost summary / city counts /
   // route grouping ever see the days, not just in the UI.
-  const canonicalizedDays = await canonicalizeItineraryCities(
-    generatedWorkspaceRaw.itineraryDays,
-    country.iso_a2
-  ).catch(() => generatedWorkspaceRaw.itineraryDays);
+  const canonicalizedDays = await runGenerationStage(
+    "recommendation/place resolution",
+    () => canonicalizeItineraryCities(generatedWorkspaceRaw.itineraryDays, country.iso_a2),
+    { days: generatedWorkspaceRaw.itineraryDays.length }
+  ).catch((error) => {
+    devLog("recommendation/place resolution: using uncanonicalized places", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return generatedWorkspaceRaw.itineraryDays;
+  });
   const generatedWorkspace = { ...generatedWorkspaceRaw, itineraryDays: canonicalizedDays };
   const costSummary = computeItineraryCostSummary(generatedWorkspace);
   const title =
-    generated.title || buildSuggestedItineraryTitle(country.name, payload.preferences.startDate, payload.preferences.endDate);
+    payload.userProvidedTitle?.trim() ||
+    generated.title ||
+    buildSuggestedItineraryTitle(country.name, payload.preferences.startDate, payload.preferences.endDate);
   const archived = false;
   const status = deriveItineraryStatus(
     payload.preferences.startDate,
@@ -276,9 +372,8 @@ export async function generateAndStoreCountryItinerary(
   );
 
   devLog("database save started");
-  const { data, error } = await supabase
-    .from("country_itineraries")
-    .insert({
+  const { data, error } = await runGenerationStage("DB save", async () =>
+    await supabase.from("country_itineraries").insert({
       country_id: country.id,
       iso_a2: country.iso_a2,
       title,
@@ -299,16 +394,30 @@ export async function generateAndStoreCountryItinerary(
       version: 1,
       manually_edited: false,
       archived,
-    })
-    .select("*")
-    .single();
+      client_request_id: payload.clientRequestId ?? null,
+    }).select("*").single(),
+    { clientRequestId: payload.clientRequestId ?? null }
+  );
   if (error) {
+    // E8's real backstop: two requests raced past the lookup above and both
+    // reached the insert — the unique index lets exactly one through. The
+    // loser doesn't fail the user's request; it just returns the winner.
+    if (error.code === "23505" && payload.clientRequestId) {
+      const winner = await findCountryItineraryByClientRequestId(supabase, payload.clientRequestId);
+      if (winner) {
+        devLog("duplicate insert race — returning the winning itinerary", { itineraryId: winner.id });
+        return winner;
+      }
+    }
     devLog("failed at database insert", { message: error.message, code: error.code });
-    throw toCountryItineraryStorageError(error);
+    const storageError = toCountryItineraryStorageError(error);
+    throw new ItineraryGenerationPipelineError("DB save", storageError.message, { code: error.code });
   }
 
   const itinerary = normalizeCountryItineraryRow(data);
-  await insertVersion(supabase, itinerary, "ai", "initial generation");
+  await runGenerationStage("DB save", () => insertVersion(supabase, itinerary, "ai", "initial generation"), {
+    itineraryId: itinerary.id,
+  });
   return itinerary;
 }
 

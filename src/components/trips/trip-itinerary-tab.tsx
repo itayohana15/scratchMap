@@ -1,8 +1,9 @@
 "use client";
 
-import { ArrowDown, Footprints, MapPin, Sparkles } from "lucide-react";
+import { ArrowDown, ArrowLeft, Footprints, MapPin, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 
+import { ActivityDetailsModal } from "@/components/trips/activity-modal";
 import { ItineraryDayRouteSection } from "@/components/country/itinerary-route-map";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -45,10 +46,10 @@ function TransportConnector({ item }: { item: TripItineraryItem }) {
 
 function ActivityCard({
   item,
-  onFocus,
+  onOpenDetails,
 }: {
   item: TripItineraryItem;
-  onFocus: (itemId: string) => void;
+  onOpenDetails: (itemId: string) => void;
 }) {
   const bookingLabel = item.reservationRequired
     ? item.bookingCompleted
@@ -59,21 +60,29 @@ function ActivityCard({
   return (
     <button
       type="button"
-      onClick={() => onFocus(item.id)}
-      className="section-card w-full space-y-1.5 p-4 text-right transition-shadow hover:shadow-md"
+      onClick={() => onOpenDetails(item.id)}
+      className="section-card group w-full cursor-pointer space-y-1.5 border border-transparent p-4 text-right transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-md"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-xs font-medium tabular-nums text-primary">
-            {item.plannedStartTime || DAY_PART_LABELS[item.slot]}
+            {item.plannedStartTime
+              ? item.endTime
+                ? `${item.plannedStartTime}–${item.endTime}`
+                : item.plannedStartTime
+              : DAY_PART_LABELS[item.slot]}
           </p>
           <h4 className="truncate text-base font-semibold text-foreground">{item.name}</h4>
         </div>
-        {bookingLabel ? (
-          <Badge variant={item.bookingCompleted ? "secondary" : "outline"} className="shrink-0">
-            {bookingLabel}
-          </Badge>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-2">
+          {bookingLabel ? (
+            <Badge variant={item.bookingCompleted ? "secondary" : "outline"}>{bookingLabel}</Badge>
+          ) : null}
+          <span className="flex items-center gap-1 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
+            פרטים
+            <ArrowLeft className="size-3.5" />
+          </span>
+        </div>
       </div>
 
       <p className="text-xs text-muted-foreground">
@@ -123,6 +132,9 @@ interface TripItineraryTabProps {
   onSelectDay: (dayId: string) => void;
   onPatchDay: (dayId: string, updater: (day: TripItineraryDay) => TripItineraryDay) => void;
   onPatchItem: (dayId: string, itemId: string, updater: (item: TripItineraryItem) => TripItineraryItem) => void;
+  onRemoveItem: (dayId: string, itemId: string) => void;
+  onMoveItemToDay: (fromDayId: string, toDayId: string, itemId: string) => void;
+  onPatchDraft: (updater: (current: CountryItineraryRecord) => CountryItineraryRecord) => void;
   onRegenerateDay: (dayId: string) => void;
   isRegenerating: boolean;
 }
@@ -134,10 +146,14 @@ export function TripItineraryTab({
   onSelectDay,
   onPatchDay,
   onPatchItem,
+  onRemoveItem,
+  onMoveItemToDay,
+  onPatchDraft,
   onRegenerateDay,
   isRegenerating,
 }: TripItineraryTabProps) {
   const [focusItemId, setFocusItemId] = useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const days = itinerary.itineraryDays;
   const selectedDay = days.find((day) => day.id === selectedDayId) ?? days[0] ?? null;
 
@@ -145,6 +161,21 @@ export function TripItineraryTab({
     if (!selectedDay) return [];
     return [...selectedDay.items].sort((a, b) => a.plannedStartTime.localeCompare(b.plannedStartTime));
   }, [selectedDay]);
+
+  // Re-derived from `days` on every render (not cached in state) so it
+  // always reflects the latest edit/move/remove immediately, and so
+  // "העבר ליום אחר" naturally keeps the modal in sync if it stays open.
+  const selectedItemContext = useMemo(() => {
+    if (!selectedItemId) return null;
+    for (const day of days) {
+      const sorted = [...day.items].sort((a, b) => a.plannedStartTime.localeCompare(b.plannedStartTime));
+      const index = sorted.findIndex((candidate) => candidate.id === selectedItemId);
+      if (index !== -1) {
+        return { day, item: sorted[index], previousItem: index > 0 ? sorted[index - 1] : null };
+      }
+    }
+    return null;
+  }, [days, selectedItemId]);
 
   return (
     <div className="space-y-4">
@@ -203,7 +234,7 @@ export function TripItineraryTab({
               sortedItems.map((item, index) => (
                 <div key={item.id}>
                   {index > 0 ? <TransportConnector item={item} /> : null}
-                  <ActivityCard item={item} onFocus={setFocusItemId} />
+                  <ActivityCard item={item} onOpenDetails={setSelectedItemId} />
                 </div>
               ))
             )}
@@ -222,6 +253,26 @@ export function TripItineraryTab({
           </div>
         </div>
       ) : null}
+
+      <ActivityDetailsModal
+        open={selectedItemId != null}
+        onOpenChange={(open) => {
+          if (!open) setSelectedItemId(null);
+        }}
+        item={selectedItemContext?.item ?? null}
+        day={selectedItemContext?.day ?? null}
+        days={days}
+        previousItem={selectedItemContext?.previousItem ?? null}
+        countryName={countryName}
+        itineraryId={itinerary.id}
+        preferences={itinerary.preferencesSnapshot}
+        memories={itinerary.workspaceSnapshot?.memories ?? []}
+        onPatchItem={onPatchItem}
+        onRemoveItem={onRemoveItem}
+        onMoveItemToDay={onMoveItemToDay}
+        onPatchDraft={onPatchDraft}
+        onShowOnDailyMap={setFocusItemId}
+      />
     </div>
   );
 }

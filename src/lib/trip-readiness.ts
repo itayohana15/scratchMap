@@ -92,6 +92,54 @@ export function computeTripReadiness(itinerary: CountryItineraryRecord): TripRea
     section: "route",
   });
 
+  // Day load — deterministic only (spec Part F1/F2): flags days that are
+  // genuinely too dense to safely execute. Unlike the removed pre-generation
+  // "SmartPlanningInsights" heuristic this never suggests the AI should have
+  // added a specific nearby stop — that's the generator's job, not a
+  // readiness issue for the traveler to act on.
+  const overloadedDays = days.filter((day) => {
+    const totalMinutes = day.items.reduce(
+      (sum, item) => sum + (item.estimatedDurationMinutes ?? 90) + (item.travelMinutes ?? 0),
+      0
+    );
+    return day.items.length > 5 || totalMinutes > 540;
+  });
+  categories.push(
+    days.length === 0
+      ? { key: "day_load", label: "עומס ימים", status: "not_applicable", detail: "", section: "route" }
+      : {
+          key: "day_load",
+          label: "עומס ימים",
+          status: overloadedDays.length === 0 ? "complete" : "partial",
+          detail:
+            overloadedDays.length === 0
+              ? "העומס בכל הימים סביר."
+              : `${overloadedDays.length} ימים עמוסים יחסית: ${overloadedDays.map((day) => day.title).join(", ")}.`,
+          section: "route",
+        }
+  );
+
+  // Long travel segments — days with an unusually long single travel leg,
+  // excluding intercity transfer days (already an expected long-travel day).
+  const LONG_TRAVEL_MINUTES = 90;
+  const daysWithLongTravel = days.filter(
+    (day) => !isIntercityTransferDay(day) && day.items.some((item) => (item.travelMinutes ?? 0) > LONG_TRAVEL_MINUTES)
+  );
+  categories.push(
+    days.length === 0
+      ? { key: "travel_time", label: "זמני נסיעה", status: "not_applicable", detail: "", section: "route" }
+      : {
+          key: "travel_time",
+          label: "זמני נסיעה",
+          status: daysWithLongTravel.length === 0 ? "complete" : "partial",
+          detail:
+            daysWithLongTravel.length === 0
+              ? "אין נסיעות ארוכות במיוחד בתוך הימים."
+              : `נסיעה ארוכה ב-${daysWithLongTravel.length} ימים: ${daysWithLongTravel.map((day) => day.title).join(", ")}.`,
+          section: "route",
+        }
+  );
+
   // Intercity transportation
   const transferDays = days.filter((day) => isIntercityTransferDay(day));
   const transferDayHasTransport = (day: (typeof days)[number]) =>

@@ -60,14 +60,14 @@ export class ApiRequestError extends Error {
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as
-      | { error?: string; message?: string }
+      | { error?: string; code?: string; message?: string }
       | null;
     // `message` is the human-readable text; `error` is a machine code
     // (e.g. "PLAN_NOT_FEASIBLE") that would otherwise leak straight into the UI.
     throw new ApiRequestError(
-      body?.message ?? body?.error ?? "Request failed",
+      body?.message ?? body?.error ?? body?.code ?? "Request failed",
       response.status,
-      body?.error,
+      body?.error ?? body?.code,
       body
     );
   }

@@ -9,7 +9,6 @@ import {
   computePassportStats,
   favoriteCountries,
   getCompletedTrips,
-  getUpcomingTrips,
   type FavoriteCountry,
 } from "@/lib/travel-passport";
 import type { TripHubTrip } from "@/lib/trip-hub";
@@ -80,7 +79,14 @@ export function useDashboardStats() {
       averageRating,
       favoriteCountry: favorites[0] ?? null,
       latestTrips: completed.slice().sort((a, b) => b.sortDate.localeCompare(a.sortDate)).slice(0, 5),
-      upcomingTrips: getUpcomingTrips(trips).slice(0, 5),
+      upcomingTrips: trips
+        .filter((trip) => trip.status === "active" || trip.status === "upcoming")
+        .sort((first, second) => {
+          if (first.status === "active" && second.status !== "active") return -1;
+          if (second.status === "active" && first.status !== "active") return 1;
+          return first.sortDate.localeCompare(second.sortDate);
+        })
+        .slice(0, 5),
     };
   }, [trips, tripsQuery.isLoading, countriesQuery.data, countriesQuery.isLoading, ratingsQuery.data]);
 

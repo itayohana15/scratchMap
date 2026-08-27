@@ -1,8 +1,10 @@
 import { addMinutes, format } from "date-fns";
 import { fromZonedTime, toZonedTime } from "date-fns-tz";
 
+import { findAirportByIata } from "@/lib/facts/airports-data";
 import { getCountryTimezone } from "@/lib/facts/country-timezones";
-import type { TripFlightLeg, TripFlights } from "@/lib/trip-workspace";
+import { haversineKm } from "@/lib/trip-workspace";
+import type { TripFlightConnection, TripFlightLeg, TripFlights } from "@/lib/trip-workspace";
 
 /** Israel is the fixed home base for every trip — never inferred from the destination. */
 export const HOME_COUNTRY_ISO_A2 = "IL";
@@ -31,7 +33,7 @@ function combineDateTime(date: string, time: string): string {
   return `${date}T${time}:00`;
 }
 
-function shiftLocalDateTime(date: string, time: string, timeZone: string, minutesToAdd: number): LocalDateTime {
+export function shiftLocalDateTime(date: string, time: string, timeZone: string, minutesToAdd: number): LocalDateTime {
   const utcInstant = fromZonedTime(combineDateTime(date, time), timeZone);
   const shifted = addMinutes(utcInstant, minutesToAdd);
   const zoned = toZonedTime(shifted, timeZone);
@@ -55,6 +57,188 @@ export function computeFlightDurationMinutes(
   return minutes > 0 ? minutes : null;
 }
 
+// Reasonable-estimate fallback (spec item 3, tier 4 — no paid aviation API
+// available in this project): average commercial-jet ground speed including
+// climb/cruise/descent, plus a fixed taxi/takeoff/landing/approach overhead.
+// Good enough for planning-buffer purposes, never presented as an exact
+// schedule.
+// Short/medium-haul routes spend proportionally more time climbing and
+// descending than cruising, so a flat long-haul cruise speed overstates
+// them — a single more conservative average (rather than exact cruise
+// speed) fits both better than either extreme alone.
+const AVERAGE_BLOCK_SPEED_KMH = 750;
+const FIXED_GROUND_OPERATIONS_MINUTES = 35;
+
+/** Great-circle distance between two known airports → a reasonable duration estimate. Null if either airport is unrecognized. */
+export function estimateFlightDurationMinutesByDistance(
+  departureAirportIata: string,
+  arrivalAirportIata: string
+): number | null {
+  const departure = findAirportByIata(departureAirportIata);
+  const arrival = findAirportByIata(arrivalAirportIata);
+  if (!departure || !arrival) return null;
+
+  const distanceKm = haversineKm(departure.lat, departure.lon, arrival.lat, arrival.lon);
+  if (distanceKm <= 0) return null;
+
+  return Math.round((distanceKm / AVERAGE_BLOCK_SPEED_KMH) * 60 + FIXED_GROUND_OPERATIONS_MINUTES);
+}
+
+/** The airport's own IANA timezone when known (spec item 4), else the fallback (typically the country-level zone). */
+export function resolveAirportTimeZone(iata: string, fallbackTimeZone: string): string {
+  return findAirportByIata(iata)?.timezone ?? fallbackTimeZone;
+}
+
+export interface FlightArrivalEstimate {
+  arrivalDate: string;
+  arrivalTime: string;
+  estimatedFlightDurationMinutes: number;
+  /** True when arrivalDate is a later calendar day than departureDate — spec item 5's "27.8 · 00:00" case. */
+  arrivesNextCalendarDay: boolean;
+}
+
+/**
+ * Deterministic arrival calculation (spec items 2-5) — never asks the AI to
+ * invent this (spec item 31). Resolves each airport's own timezone from the
+ * curated dataset when known, else falls back to the given country-level
+ * zones, and estimates duration from great-circle distance when both
+ * airports are recognized. Returns null when duration can't be determined
+ * (airport not in the dataset) — callers should fall back to leaving
+ * arrival time for manual entry in that case.
+ */
+export function estimateFlightArrival(
+  departureAirportIata: string,
+  arrivalAirportIata: string,
+  departureDate: string,
+  departureTime: string,
+  fallbackDepartureTimeZone: string,
+  fallbackArrivalTimeZone: string
+): FlightArrivalEstimate | null {
+  if (!departureAirportIata || !arrivalAirportIata || !departureDate || !departureTime) return null;
+
+  const estimatedFlightDurationMinutes = estimateFlightDurationMinutesByDistance(
+    departureAirportIata,
+    arrivalAirportIata
+  );
+  if (estimatedFlightDurationMinutes == null) return null;
+
+  const departureTimeZone = resolveAirportTimeZone(departureAirportIata, fallbackDepartureTimeZone);
+  const arrivalTimeZone = resolveAirportTimeZone(arrivalAirportIata, fallbackArrivalTimeZone);
+
+  // Convert departure wall-clock time to a real UTC instant, add the flight
+  // duration, then convert that instant into the arrival airport's own
+  // wall-clock time — never a naive same-zone addition across two zones.
+  const departureInstant = fromZonedTime(combineDateTime(departureDate, departureTime), departureTimeZone);
+  const arrivalInstant = addMinutes(departureInstant, estimatedFlightDurationMinutes);
+  const arrivalZoned = toZonedTime(arrivalInstant, arrivalTimeZone);
+  const arrivalDateResult = format(arrivalZoned, "yyyy-MM-dd");
+  const arrivalTimeResult = format(arrivalZoned, "HH:mm");
+
+  return {
+    arrivalDate: arrivalDateResult,
+    arrivalTime: arrivalTimeResult,
+    estimatedFlightDurationMinutes,
+    arrivesNextCalendarDay: arrivalDateResult > departureDate,
+  };
+}
+
+export interface FlightSegmentResult {
+  origin: string;
+  destination: string;
+  departureDate: string;
+  departureTime: string;
+  arrivalDate: string;
+  arrivalTime: string;
+  durationMinutes: number;
+}
+
+export interface MultiSegmentFlightResult {
+  segments: FlightSegmentResult[];
+  finalArrivalDate: string;
+  finalArrivalTime: string;
+  /** Sum of segment durations only — time actually airborne (spec item 38). */
+  totalAirborneMinutes: number;
+  /** Airborne time plus every layover — what actually determines usable-time-on-arrival (spec item 38/39). */
+  totalJourneyMinutes: number;
+}
+
+/**
+ * Chains estimateFlightArrival across zero or more intermediate connections
+ * (spec items 17-21) — each segment is calculated independently, with the
+ * layover added (in the connection airport's own local time) between one
+ * segment's arrival and the next segment's departure. Zero connections is
+ * the default, ordinary direct-flight path (spec item 22) and returns a
+ * single-segment result identical in shape to a connecting itinerary.
+ * Returns null if any airport in the chain can't be resolved — same
+ * manual-entry fallback contract as estimateFlightArrival.
+ */
+export function computeMultiSegmentFlight(
+  departureAirportIata: string,
+  finalArrivalAirportIata: string,
+  departureDate: string,
+  departureTime: string,
+  connections: TripFlightConnection[],
+  departureTimeZoneFallback: string,
+  arrivalTimeZoneFallback: string
+): MultiSegmentFlightResult | null {
+  if (!departureAirportIata || !finalArrivalAirportIata || !departureDate || !departureTime) return null;
+
+  const stops = [departureAirportIata, ...connections.map((connection) => connection.airport), finalArrivalAirportIata];
+  if (stops.some((iata) => !iata)) return null;
+
+  const segments: FlightSegmentResult[] = [];
+  let currentDate = departureDate;
+  let currentTime = departureTime;
+  let totalAirborneMinutes = 0;
+  let totalLayoverMinutes = 0;
+
+  for (let index = 0; index < stops.length - 1; index += 1) {
+    const origin = stops[index];
+    const destination = stops[index + 1];
+    const isFirstHop = index === 0;
+    const isLastHop = index === stops.length - 2;
+
+    const estimate = estimateFlightArrival(
+      origin,
+      destination,
+      currentDate,
+      currentTime,
+      isFirstHop ? departureTimeZoneFallback : arrivalTimeZoneFallback,
+      isLastHop ? arrivalTimeZoneFallback : arrivalTimeZoneFallback
+    );
+    if (!estimate) return null;
+
+    segments.push({
+      origin,
+      destination,
+      departureDate: currentDate,
+      departureTime: currentTime,
+      arrivalDate: estimate.arrivalDate,
+      arrivalTime: estimate.arrivalTime,
+      durationMinutes: estimate.estimatedFlightDurationMinutes,
+    });
+    totalAirborneMinutes += estimate.estimatedFlightDurationMinutes;
+
+    if (!isLastHop) {
+      const layoverMinutes = Math.max(0, connections[index]?.layoverMinutes ?? 0);
+      totalLayoverMinutes += layoverMinutes;
+      const layoverTimeZone = resolveAirportTimeZone(destination, arrivalTimeZoneFallback);
+      const next = shiftLocalDateTime(estimate.arrivalDate, estimate.arrivalTime, layoverTimeZone, layoverMinutes);
+      currentDate = next.date;
+      currentTime = next.time;
+    }
+  }
+
+  const lastSegment = segments[segments.length - 1];
+  return {
+    segments,
+    finalArrivalDate: lastSegment.arrivalDate,
+    finalArrivalTime: lastSegment.arrivalTime,
+    totalAirborneMinutes,
+    totalJourneyMinutes: totalAirborneMinutes + totalLayoverMinutes,
+  };
+}
+
 /**
  * Destination-local windows a first/last itinerary day must respect, derived
  * from the outbound arrival and return departure times plus fixed processing
@@ -73,7 +257,7 @@ export function computeArrivalDepartureWindow(
       ? shiftLocalDateTime(
           outbound.arrivalDate,
           outbound.arrivalTime,
-          destinationTimeZone,
+          resolveAirportTimeZone(outbound.arrivalAirport, destinationTimeZone),
           ARRIVAL_PROCESSING_MINUTES + AIRPORT_TO_ACCOMMODATION_MINUTES + ACCOMMODATION_CHECKIN_MINUTES
         )
       : null;
@@ -84,7 +268,7 @@ export function computeArrivalDepartureWindow(
       ? shiftLocalDateTime(
           returnLeg.departureDate,
           returnLeg.departureTime,
-          destinationTimeZone,
+          resolveAirportTimeZone(returnLeg.departureAirport, destinationTimeZone),
           -(INTERNATIONAL_DEPARTURE_BUFFER_MINUTES + ACCOMMODATION_TO_AIRPORT_MINUTES)
         )
       : null;

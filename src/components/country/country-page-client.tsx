@@ -29,7 +29,6 @@ import type { Status, Tables } from "@/lib/supabase/types";
 
 const TAB_EMOJIS: Record<TripWorkspaceTab, string> = {
   overview: "🧭",
-  plan: "📝",
   itinerary: "🧳",
   map: "🗺️",
   recommendations: "⭐",

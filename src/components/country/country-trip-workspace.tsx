@@ -4,17 +4,13 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 import type { Feature, MultiPolygon, Polygon } from "geojson";
 import {
-  BedDouble,
   CalendarDays,
   Filter,
-  LoaderCircle,
   MapPin,
   Plus,
   Route,
   Save,
-  Sparkles,
   Trash2,
-  TriangleAlert,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useRouter } from "next/navigation";
@@ -22,28 +18,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { AttractionModal } from "@/components/country/attraction-modal";
-import {
-  AiGenerationProgressModal,
-  isMeaningfullyOverBudget,
-  type BudgetWarningAction,
-  type GenerationModalView,
-} from "@/components/country/ai-generation-progress-modal";
 import { RecommendationFeedbackButtons } from "@/components/country/recommendation-feedback-buttons";
 import { CountryAboutSection } from "@/components/country/country-about-section";
 import { CountryItineraryHistorySection } from "@/components/country/country-itinerary-history-section";
-import { CountryItinerarySuccessDialog } from "@/components/country/country-itinerary-success-dialog";
 import { CountryCitiesSection } from "@/components/country/country-cities-section";
 import { CountryCurrencyConverter } from "@/components/country/country-currency-converter";
 import { CountrySafetyInfo } from "@/components/country/country-safety-info";
 import { CountryTripSummarySection } from "@/components/country/country-trip-summary-section";
 import { CountryWeatherSection } from "@/components/country/country-weather-section";
-import {
-  ProfilePreferencesSummary,
-  TripFlightsSection,
-  TripOverridesSection,
-  TripSpecialRequirementsSection,
-  useProfileDerivedTripDefaults,
-} from "@/components/country/trip-preferences-panel";
+import { TripCreationWizard } from "@/components/country/trip-wizard/trip-creation-wizard";
 import { useCountryMiniMap } from "@/components/country/use-country-mini-map";
 import type { useCountryTripWorkspace } from "@/components/country/use-country-trip-workspace";
 import { CountryAiRecommendations } from "@/components/shared/country-ai-recommendations";
@@ -72,20 +55,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { TabsContent } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  createWorkspaceFromItineraryRecord,
-  type CountryItineraryGenerationSuccessPayload,
-  type CountryItineraryRecord,
-} from "@/lib/itineraries";
-import {
-  buildGenerationStages,
-  useItineraryGenerationProgress,
-} from "@/lib/hooks/use-itinerary-generation-progress";
-import {
-  useCountryItineraries,
-  useGenerateCountryItinerary,
-  type GenerateCountryItineraryResult,
-} from "@/lib/queries/country-itineraries";
+import { useCountryItineraries } from "@/lib/queries/country-itineraries";
 import { usePlacesForCountry } from "@/lib/queries/places";
 import { usePreferenceProfile } from "@/lib/queries/preference-profile";
 import { useAllRecommendationFeedback } from "@/lib/queries/recommendation-feedback";
@@ -98,12 +68,9 @@ import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureProperties } from "@/lib/map/geo";
 import type { Tables } from "@/lib/supabase/types";
 import {
-  BOOKING_STATUS_LABELS,
-  BOOKING_TYPE_LABELS,
   DAY_PART_LABELS,
   EXPENSE_CATEGORY_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
-  TRIP_STATUS_LABELS,
   buildMapLink,
   buildTripComparison,
   buildTripStatistics,
@@ -114,7 +81,6 @@ import {
   type TripExpense,
   type TripItineraryDay,
   type TripItineraryItem,
-  type TripPhase,
   type TripRecommendation,
   type TripWorkspaceTab,
 } from "@/lib/trip-workspace";
@@ -347,77 +313,11 @@ function buildLiveRecommendations(
   return [...seen.values()];
 }
 
-function canOpenSuccessDialog(result: GenerateCountryItineraryResult) {
-  return Boolean(
-    result.success.itineraryId &&
-      result.success.countryCode &&
-      result.success.countryName &&
-      result.success.totalDays > 0 &&
-      result.itinerary.itineraryDays.length > 0
-  );
-}
-
 function plannedVsActualBadge(item: TripItineraryItem) {
   if (item.completed) return <Badge variant="secondary">בוצע</Badge>;
   if (item.skipped) return <Badge variant="outline">דולג</Badge>;
   if (item.optional) return <Badge variant="outline">אופציונלי</Badge>;
   return <Badge variant="outline">מתוכנן</Badge>;
-}
-
-function SmartPlanningInsights({
-  days,
-  recommendations,
-}: {
-  days: TripItineraryDay[];
-  recommendations: TripRecommendation[];
-}) {
-  const insights = useMemo(() => {
-    return days.flatMap((day) => {
-      const warnings: string[] = [];
-      const totalMinutes = day.items.reduce(
-        (sum, item) => sum + (item.estimatedDurationMinutes ?? 90) + (item.travelMinutes ?? 0),
-        0
-      );
-      if (day.items.length > 5 || totalMinutes > 540) {
-        warnings.push(`${day.title} עמוס יחסית. כדאי להזיז פעילות אחת ליום אחר.`);
-      }
-      if (day.items.some((item) => item.openingHours.toLowerCase().includes("סגור"))) {
-        warnings.push(`${day.title} כולל מקום עם אזהרת שעות פתיחה.`);
-      }
-      const restaurantSuggestion = recommendations.find(
-        (recommendation) =>
-          (recommendation.category === "restaurant" || recommendation.category === "cafe") &&
-          day.items.every((item) => item.name !== recommendation.name)
-      );
-      if (restaurantSuggestion) {
-        warnings.push(`הוסיפו גם עצירת אוכל קרובה כמו ${restaurantSuggestion.name}.`);
-      }
-      return warnings;
-    });
-  }, [days, recommendations]);
-
-  return (
-    <section className="space-y-3">
-      <div className="flex items-center gap-2">
-        <Sparkles className="size-4 text-primary" />
-        <h3 className="font-heading text-lg font-semibold">תכנון מסלול חכם</h3>
-      </div>
-      {insights.length > 0 ? (
-        <div className="grid gap-3 lg:grid-cols-2">
-          {insights.map((insight) => (
-            <div key={insight} className="section-card flex items-start gap-3 p-4 text-sm">
-              <TriangleAlert className="mt-0.5 size-4 shrink-0 text-amber-500" />
-              <p>{insight}</p>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="section-card p-4 text-sm text-muted-foreground">
-          המסלול נראה מאוזן כרגע. ככל שתוסיפו עוד עצירות נציג כאן המלצות על סדר, עומס ומסעדות קרובות.
-        </div>
-      )}
-    </section>
-  );
 }
 
 function MapFilterChips({
@@ -752,21 +652,6 @@ function SectionShell({
   );
 }
 
-function PreferenceField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label className="text-xs font-medium tracking-[0.02em] text-muted-foreground">{label}</Label>
-      {children}
-    </div>
-  );
-}
-
 function ExpenseTable({
   title,
   bucket,
@@ -898,16 +783,8 @@ export function CountryTripWorkspaceContent({
   const { data: attractionPlaces } = usePlacesForCountry(country.id, "attraction");
   const { data: restaurantPlaces } = usePlacesForCountry(country.id, "restaurant");
   const { data: hotelPlaces } = usePlacesForCountry(country.id, "hotel");
-  const generateSavedItinerary = useGenerateCountryItinerary(iso);
   const [selectedDayId, setSelectedDayId] = useState(workspace.itineraryDays[0]?.id ?? "");
-  const generationStages = useMemo(() => buildGenerationStages(country.name), [country.name]);
-  const generationProgress = useItineraryGenerationProgress<GenerateCountryItineraryResult>(generationStages);
-  const [successDialogPayload, setSuccessDialogPayload] =
-    useState<CountryItineraryGenerationSuccessPayload | null>(null);
-  const latestGeneratedItineraryRef = useRef<CountryItineraryRecord | null>(null);
-  const lastShownSuccessItineraryIdRef = useRef<string | null>(null);
-  const profileDefaults = useProfileDerivedTripDefaults();
-  const hasSyncedProfileDefaultsRef = useRef(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
   const [activeRecommendationCategory, setActiveRecommendationCategory] =
     useState<RecommendationCategory>("attraction");
   const [apiRecommendationsByCategory, setApiRecommendationsByCategory] = useState<
@@ -948,56 +825,6 @@ export function CountryTripWorkspaceContent({
   const [recommendationDialogOpen, setRecommendationDialogOpen] = useState(false);
   const [recommendationDraft, setRecommendationDraft] =
     useState<TripRecommendation>(createEmptyRecommendationDraft);
-
-  // Runs once: brand-new/never-touched workspaces (still at factory defaults)
-  // start from the profile's derived pace/interests instead of a generic
-  // "balanced"/empty default (spec §A1/§A8 — never overwrites a trip that
-  // already has explicit or loaded values).
-  useEffect(() => {
-    if (hasSyncedProfileDefaultsRef.current || profileDefaults.isLoading) return;
-    hasSyncedProfileDefaultsRef.current = true;
-    if (workspace.preferences.tripPace === "balanced" && workspace.preferences.interests === "") {
-      actions.updatePreferences({
-        tripPace: profileDefaults.derivedPace,
-        interests: profileDefaults.derivedInterests,
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profileDefaults.isLoading]);
-
-  // Post-generation handoff (spec §B11/B12/B14): loads the result into the
-  // workspace immediately, then either holds on a brief "success" beat before
-  // handing off to the existing success dialog, or — if the real cost meaningfully
-  // exceeds the configured budget — stays on the modal's budget-warning view.
-  useEffect(() => {
-    if (generationProgress.status !== "success" || !generationProgress.result) return;
-    const result = generationProgress.result;
-    actions.loadWorkspace(createWorkspaceFromItineraryRecord(result.itinerary, country.name));
-    latestGeneratedItineraryRef.current = result.itinerary;
-    setSelectedDayId(result.itinerary.itineraryDays[0]?.id ?? "");
-
-    if (
-      isMeaningfullyOverBudget(result.itinerary.costSummary.totalEstimatedCost, workspace.preferences.budget)
-    ) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      generationProgress.reset();
-      if (
-        canOpenSuccessDialog(result) &&
-        lastShownSuccessItineraryIdRef.current !== result.success.itineraryId
-      ) {
-        lastShownSuccessItineraryIdRef.current = result.success.itineraryId;
-        setSuccessDialogPayload(result.success);
-      } else {
-        toast.success("המסלול נוצר ונשמר בהיסטוריה");
-      }
-    }, 800);
-
-    return () => window.clearTimeout(timeoutId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generationProgress.status, generationProgress.result]);
 
   useEffect(() => {
     if (!workspace.itineraryDays.some((day) => day.id === selectedDayId)) {
@@ -1123,134 +950,6 @@ export function CountryTripWorkspaceContent({
   }, [liveRecommendations, selectedRecommendation]);
   const budgetComparison = buildTripComparison(workspace);
   const tripStatistics = buildTripStatistics(workspace);
-  const isGeneratingItinerary = generationProgress.status === "pending";
-  const generationModalView: GenerationModalView =
-    generationProgress.status === "pending"
-      ? "pending"
-      : generationProgress.status === "error"
-        ? "error"
-        : generationProgress.status === "success"
-          ? isMeaningfullyOverBudget(
-              generationProgress.result?.itinerary.costSummary.totalEstimatedCost ?? 0,
-              workspace.preferences.budget
-            )
-            ? "budgetWarning"
-            : "success"
-          : null;
-  const generationSuccessSummary = generationProgress.result
-    ? `נוצר מסלול של ${generationProgress.result.itinerary.daysCount} ימים`
-    : null;
-
-  async function buildRecommendationsForAiGeneration() {
-    if (!iso) return liveRecommendations;
-
-    const categoriesToFetch = AI_SOURCED_CATEGORIES.filter(
-      (category) => !apiRecommendationsByCategory[category]
-    );
-
-    if (categoriesToFetch.length === 0) {
-      return liveRecommendations;
-    }
-
-    const results = await Promise.allSettled(
-      categoriesToFetch.map(async (category) => {
-        const result = await fetchCategoryRecommendations(
-          iso,
-          category,
-          API_RECOMMENDATION_COUNT,
-          workspace.preferences.startDate || undefined,
-          workspace.preferences.endDate || undefined
-        );
-        return [category, result.places] as const;
-      })
-    );
-
-    const nextRecommendationsByCategory = {
-      ...apiRecommendationsByCategory,
-    } as Partial<Record<RecommendationCategory, TripRecommendation[]>>;
-
-    for (const result of results) {
-      if (result.status !== "fulfilled") continue;
-      const [category, recommendations] = result.value;
-      nextRecommendationsByCategory[category] = recommendations;
-    }
-
-    setApiRecommendationsByCategory(nextRecommendationsByCategory);
-
-    return buildLiveRecommendations(
-      workspace,
-      Object.values(nextRecommendationsByCategory).flat(),
-      attractionPlaces,
-      restaurantPlaces,
-      hotelPlaces
-    );
-  }
-
-  async function handleAiPlan() {
-    if (!workspace.preferences.startDate || !workspace.preferences.endDate) {
-      toast.error("צריך לבחור תאריכי התחלה וסיום כדי ליצור מסלול מלא.");
-      return;
-    }
-
-    setSuccessDialogPayload(null);
-    const recommendationsForGeneration = await buildRecommendationsForAiGeneration();
-    const clientRequestId = crypto.randomUUID();
-    await generationProgress.start((signal) =>
-      generateSavedItinerary.mutateAsync({
-        countryId: country.id,
-        countryName: country.name,
-        isoA2: iso.toUpperCase(),
-        tripStatus: workspace.tripStatus,
-        preferences: workspace.preferences,
-        selectedPlaces: workspace.recommendations,
-        recommendations: recommendationsForGeneration,
-        bookings: workspace.bookings,
-        existingDays: workspace.itineraryDays,
-        clientRequestId,
-        signal,
-      })
-    );
-  }
-
-  function handleCancelGeneration() {
-    generationProgress.cancel();
-  }
-
-  function handleCloseGenerationModal() {
-    generationProgress.reset();
-  }
-
-  function handleBudgetWarningAction(action: BudgetWarningAction) {
-    generationProgress.reset();
-    switch (action) {
-      case "cheaper":
-        toast.info('אפשר לבחור Mode חסכוני יותר תחת "דרישות מיוחדות" וליצור מסלול מחדש.');
-        break;
-      case "increaseBudget":
-        toast.info("אפשר לעדכן את התקציב בהגדרות הטיול וליצור מסלול מחדש.");
-        break;
-      case "shorten":
-        toast.info("אפשר לקצר את תאריכי הטיול וליצור מסלול מחדש.");
-        break;
-      case "editAgain":
-        break;
-    }
-  }
-
-  function handleOpenGeneratedItinerary(itineraryId: string) {
-    setSuccessDialogPayload(null);
-    router.push(`/trips/${itineraryId}`);
-  }
-
-  function handleContinueEditingGeneratedItinerary() {
-    const itinerary = latestGeneratedItineraryRef.current;
-    if (itinerary) {
-      actions.loadWorkspace(createWorkspaceFromItineraryRecord(itinerary, country.name));
-      setSelectedDayId(itinerary.itineraryDays[0]?.id ?? "");
-    }
-    setSuccessDialogPayload(null);
-  }
-
   function toggleMapFilter(category: RecommendationCategory) {
     setMapFilters((current) =>
       current.includes(category)
@@ -1316,241 +1015,18 @@ export function CountryTripWorkspaceContent({
         </SectionShell>
       </TabsContent>
 
-      <TabsContent value="plan" className={cn("pt-0", activeTab !== "plan" && "hidden")}>
-        <SectionShell
-          title="תכנון חכם"
-          description="העדפות הטיול, AI itinerary, הזמנות ותובנות route נבנים כאן יחד."
-          action={
-            <Button className="gap-1.5" onClick={() => void handleAiPlan()} disabled={isGeneratingItinerary}>
-              {isGeneratingItinerary ? (
-                <LoaderCircle className="size-4 animate-spin" />
-              ) : (
-                <Sparkles className="size-4" />
-              )}
-              {isGeneratingItinerary ? "יוצרים מסלול..." : "Create itinerary with AI"}
-            </Button>
-          }
-        >
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_380px]">
-            <div className="space-y-4">
-              <SmartPlanningInsights days={workspace.itineraryDays} recommendations={liveRecommendations} />
-              <div className="section-card space-y-4 p-4">
-                <div className="flex items-center gap-2">
-                  <BedDouble className="size-4 text-primary" />
-                  <h3 className="font-medium">הזמנות ו-bookings</h3>
-                </div>
-                {workspace.bookings.length > 0 ? (
-                  <div className="space-y-3">
-                    {workspace.bookings.map((booking) => (
-                      <div key={booking.id} className="grid gap-2 rounded-2xl border border-border/70 p-3 md:grid-cols-6">
-                        <Input
-                          value={booking.title}
-                          onChange={(event) =>
-                            actions.upsertBooking({ ...booking, title: event.target.value })
-                          }
-                          placeholder="שם הזמנה"
-                        />
-                        <Select
-                          value={booking.type}
-                          onValueChange={(value) =>
-                            actions.upsertBooking({
-                              ...booking,
-                              type: value as typeof booking.type,
-                            })
-                          }
-                        >
-                          <SelectTrigger size="sm">
-                            <span>{BOOKING_TYPE_LABELS[booking.type]}</span>
-                          </SelectTrigger>
-                          <SelectContent>
-                            {Object.entries(BOOKING_TYPE_LABELS).map(([value, label]) => (
-                              <SelectItem key={value} value={value}>
-                                {label}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <Input
-                          type="datetime-local"
-                          value={booking.startDateTime}
-                          onChange={(event) =>
-                            actions.upsertBooking({ ...booking, startDateTime: event.target.value })
-                          }
-                        />
-                        <Select
-                          value={booking.status}
-                          onValueChange={(value) =>
-                            actions.upsertBooking({
-                              ...booking,
-                              status: value as typeof booking.status,
-                            })
-                          }
-                        >
-                          <SelectTrigger size="sm">
-                            <span>{BOOKING_STATUS_LABELS[booking.status]}</span>
-                          </SelectTrigger>
-                          <SelectContent>
-                            {Object.entries(BOOKING_STATUS_LABELS).map(([value, label]) => (
-                              <SelectItem key={value} value={value}>
-                                {label}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <div className="flex gap-2">
-                          <Input
-                            value={booking.bookingReference}
-                            onChange={(event) =>
-                              actions.upsertBooking({
-                                ...booking,
-                                bookingReference: event.target.value,
-                              })
-                            }
-                            placeholder="מספר הזמנה"
-                          />
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            onClick={() => actions.removeBooking(booking.id)}
-                            aria-label="מחיקת הזמנה"
-                          >
-                            <Trash2 className="size-4" />
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    עדיין אין bookings. אפשר להוסיף טיסות, מלונות, מסעדות ותחבורה.
-                  </p>
-                )}
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="gap-1.5"
-                  onClick={() => actions.upsertBooking(actions.createBooking())}
-                >
-                  <Plus className="size-4" />
-                  הוספת booking
-                </Button>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div className="section-card space-y-4 p-4">
-                <div className="flex items-center gap-2">
-                  <Save className="size-4 text-primary" />
-                  <h3 className="font-medium">הגדרות טיול</h3>
-                </div>
-                <div className="space-y-4">
-                  <PreferenceField label="סטטוס טיול">
-                    <Select
-                      value={workspace.tripStatus}
-                      onValueChange={(value) => actions.setTripStatus(value as TripPhase)}
-                    >
-                      <SelectTrigger>
-                        <span>{TRIP_STATUS_LABELS[workspace.tripStatus]}</span>
-                      </SelectTrigger>
-                      <SelectContent>
-                        {Object.entries(TRIP_STATUS_LABELS).map(([value, label]) => (
-                          <SelectItem key={value} value={value}>
-                            {label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </PreferenceField>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <p className="text-xs font-medium text-muted-foreground">תאריך התחלה</p>
-                      <Input
-                        type="date"
-                        value={workspace.preferences.startDate}
-                        onChange={(event) =>
-                          actions.updatePreferences({ startDate: event.target.value })
-                        }
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <p className="text-xs font-medium text-muted-foreground">תאריך סיום</p>
-                      <Input
-                        type="date"
-                        value={workspace.preferences.endDate}
-                        onChange={(event) =>
-                          actions.updatePreferences({ endDate: event.target.value })
-                        }
-                      />
-                    </div>
-                  </div>
-
-                  <PreferenceField label="מספר נוסעים">
-                    <Input
-                      type="number"
-                      value={workspace.preferences.travelers}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          travelers: Number(event.target.value) || 1,
-                        })
-                      }
-                    />
-                  </PreferenceField>
-
-                  <PreferenceField label="תקציב משוער">
-                    <Input
-                      type="number"
-                      value={workspace.preferences.budget ?? ""}
-                      onChange={(event) =>
-                        actions.updatePreferences({
-                          budget: event.target.value ? Number(event.target.value) : null,
-                        })
-                      }
-                      placeholder="למשל 8500"
-                    />
-                  </PreferenceField>
-                </div>
-              </div>
-
-              <ProfilePreferencesSummary
-                isLoading={profileDefaults.isLoading}
-                summaryLines={profileDefaults.summaryLines}
-              />
-
-              <TripOverridesSection
-                preferences={workspace.preferences}
-                updatePreferences={actions.updatePreferences}
-                derivedPace={profileDefaults.derivedPace}
-                derivedInterests={profileDefaults.derivedInterests}
-              />
-
-              <TripSpecialRequirementsSection
-                preferences={workspace.preferences}
-                updatePreferences={actions.updatePreferences}
-              />
-
-              <TripFlightsSection
-                preferences={workspace.preferences}
-                updatePreferences={actions.updatePreferences}
-              />
-
-              <div className="rounded-2xl border border-border/70 p-3 text-sm text-muted-foreground">
-                {workspace.lastAiPlanSummary ||
-                  "אחרי יצירת AI itinerary, נציג כאן תקציר מעשי של ההיגיון מאחורי המסלול."}
-              </div>
-            </div>
-          </div>
-        </SectionShell>
-      </TabsContent>
-
       <TabsContent value="itinerary" className={cn("pt-0", activeTab !== "itinerary" && "hidden")}>
         <CountryItineraryHistorySection
           iso={iso}
           country={country}
-          workspace={workspace}
-          isGenerating={isGeneratingItinerary}
-          generationStage={isGeneratingItinerary ? generationProgress.stageLabel : null}
-          onGenerate={handleAiPlan}
+          onOpenWizard={() => setWizardOpen(true)}
+        />
+        <TripCreationWizard
+          iso={iso}
+          country={country}
+          open={wizardOpen}
+          onOpenChange={setWizardOpen}
+          onGenerated={(itineraryId) => router.push(`/trips/${itineraryId}`)}
         />
       </TabsContent>
 
@@ -2073,34 +1549,6 @@ export function CountryTripWorkspaceContent({
                   </div>
                 </DialogContent>
               </Dialog>
-
-              <CountryItinerarySuccessDialog
-                open={Boolean(successDialogPayload)}
-                success={successDialogPayload}
-                onOpenChange={(open) => {
-                  if (!open) {
-                    setSuccessDialogPayload(null);
-                  }
-                }}
-                onOpenItinerary={handleOpenGeneratedItinerary}
-                onContinueEditing={handleContinueEditingGeneratedItinerary}
-              />
-
-              <AiGenerationProgressModal
-                isoA2={iso}
-                countryName={country.name}
-                view={generationModalView}
-                progress={generationProgress.progress}
-                stageLabel={generationProgress.stageLabel}
-                stageChecklist={generationProgress.stageChecklist}
-                error={generationProgress.error}
-                successSummary={generationSuccessSummary}
-                budgetTarget={workspace.preferences.budget}
-                onCancel={handleCancelGeneration}
-                onRetry={() => void handleAiPlan()}
-                onClose={handleCloseGenerationModal}
-                onBudgetAction={handleBudgetWarningAction}
-              />
             </div>
           </div>
         </SectionShell>

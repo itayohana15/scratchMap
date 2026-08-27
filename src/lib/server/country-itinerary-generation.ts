@@ -47,10 +47,12 @@ import {
   getBudgetCapForItem,
   MAX_LOCAL_TRAVEL_MINUTES,
   MAX_NORMAL_DAY_TRAVEL_MINUTES,
+  isDayTripDay,
   isPremiumVenue,
   NON_ACTIVITY_CATEGORIES,
   normalizeCoordinatePair,
   normalizeActionableMessages,
+  normalizePlaceNameSlug,
   scoreRouteProximity,
   scoreBudgetFitness,
   summarizeItemCosts,
@@ -65,10 +67,17 @@ import {
   buildTripFramePhases,
   classifyActivityTier,
   classifyItemEnergy,
+  classifyVisitScale,
   getTripLengthBucket,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
   describeActivityMixTargets,
 } from "@/lib/server/itinerary-planning-principles";
+import {
+  clockToMinutes,
+  DEFAULT_DAY_WINDOW,
+  scheduleDayItems,
+} from "@/lib/server/itinerary-scheduler";
+import { describeHolidayContext } from "@/lib/facts/jewish-holidays";
 import { fetchDrivingRouteBestEffort } from "@/lib/routing/osrm-server";
 import {
   buildFallbackAiItinerary,
@@ -91,6 +100,7 @@ import {
   type TripItineraryDay,
   type TripFlights,
   type TripItineraryItem,
+  type TripPreferences,
   type TripRecommendation,
 } from "@/lib/trip-workspace";
 
@@ -767,6 +777,10 @@ function buildPrompt(
       ]
     : [];
 
+  // Advisory only, never a hard block on the dates themselves (spec item 34).
+  const holidayContext = describeHolidayContext(payload.preferences.startDate, payload.preferences.endDate);
+  const holidayGuidance = holidayContext ? [holidayContext] : [];
+
   const tripFrameGuidance = [
     `Locked trip frame (decided before this prompt, geography-first): ${describeTripFrame(tripFrame)}.`,
     "Treat this trip frame as a hard constraint: every day's cityRegion and accommodation must match its assigned base/phase above, except for the specific day(s) where the frame itself transitions between phases (those become transfer days).",
@@ -778,6 +792,7 @@ function buildPrompt(
     "You are a practical itinerary planner, not a travel writer.",
     "Behavioral reference: plan like a strong independent traveler's multi-week trip, not like a generic sightseeing brochure.",
     ...flightWindowGuidance,
+    ...holidayGuidance,
     "Plan geography first: the trip frame below already fixed base cities/regions and nights per base. Build each day's content to fit inside its assigned base, not the other way around.",
     ...tripFrameGuidance,
     "Return JSON only, matching the schema exactly.",
@@ -817,7 +832,11 @@ function buildPrompt(
     `Generation mode: ${payload.preferences.generationMode} (${ITINERARY_GENERATION_MODE_LABELS[payload.preferences.generationMode]}).`,
     `Interests: ${payload.preferences.interests || "לא הוגדר"}.`,
     `Preferred transportation: ${payload.preferences.transportationPreferences || "לא הוגדר"}.`,
-    `Dietary preferences: ${payload.preferences.dietaryPreferences || "ללא"}.`,
+    `Dietary preferences (hard constraints — treat every one as mandatory, never optional): ${payload.preferences.dietaryPreferences || "ללא"}.`,
+    payload.preferences.foodNotes
+      ? `Additional food notes from the traveler: ${payload.preferences.foodNotes}`
+      : "",
+    "Food behavior: first choose attractions and the geographic route, then find food options close to those locations — food stops should normally be within 25 minutes travel of the nearby activity, preferring 10-15 minutes or less when possible. If the traveler selected multiple food interests (e.g. local cuisine + street food + cafes + vegetarian), combine all of them when choosing food stops — never interpret multiple selections as picking just one.",
     `Accessibility needs: ${payload.preferences.accessibilityNeeds || "ללא"}.`,
     `Accommodation base: ${payload.preferences.accommodationArea || "לא הוגדר"}.`,
     `Preferred regions/cities: ${payload.preferences.preferredRegions || "לא הוגדר"}.`,
@@ -1066,31 +1085,35 @@ function sharesDayArea(left: string, right: string) {
   );
 }
 
+/**
+ * Assigns a real slot label matching a scheduled clock time — purely
+ * cosmetic/UI grouping now that plannedStartTime itself is the real source
+ * of truth (from scheduleDayItems), not the other way around.
+ */
+function slotForClockTime(minutes: number): DayPart {
+  if (minutes < 11 * 60) return "morning";
+  if (minutes < 15 * 60) return "lunch";
+  if (minutes < 18 * 60) return "afternoon";
+  if (minutes < 20 * 60) return "dinner";
+  if (minutes < 22 * 60) return "evening";
+  return "night";
+}
+
 function resequenceDayItems(day: AiGeneratedDay) {
   const normalizedItems = sortItems(day.items.map(normalizeGeneratedItemCoordinates));
   const transferDay = isIntercityTransferDay(day);
 
   if (transferDay) {
-    return {
-      ...day,
-      items: normalizedItems.map<AiGeneratedItem>((item, index) => {
-        const slot: DayPart =
-          item.category === "transportation"
-            ? index === 0
-              ? "morning"
-              : "afternoon"
-            : item.slot;
-        return {
-          ...item,
-          plannedStartTime: item.plannedStartTime || defaultSlotTime(slot),
-          slot,
-        };
-      }),
-    };
+    const ordered = normalizedItems.map((item, index) => ({
+      ...item,
+      slot: item.category === "transportation" ? (index === 0 ? ("morning" as DayPart) : ("afternoon" as DayPart)) : item.slot,
+    }));
+    const { items: scheduled } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
+    return { ...day, items: scheduled.map((item) => ({ ...item, slot: slotForClockTime((clockToMinutes(item.plannedStartTime) ?? 9 * 60)) })) };
   }
 
   const transportationItems = normalizedItems.filter((item) => item.category === "transportation");
-  const anchorItems = sortAnchorsByCluster(
+  const anchorCandidates = sortAnchorsByCluster(
     day,
     normalizedItems.filter((item) => isAnchorDayItem(item))
   );
@@ -1102,6 +1125,14 @@ function resequenceDayItems(day: AiGeneratedDay) {
       !isAnchorDayItem(item)
   );
 
+  // A full-day anchor (Disneyland, a national park, ...) consumes the day's
+  // entire planning capacity — spec item 12 explicitly: "Do not add Louvre
+  // or Eiffel Tower afterward." Any other anchor that day moves to
+  // alternatives instead of silently disappearing.
+  const fullDayAnchor = anchorCandidates.find((item) => classifyVisitScale(item) === "full_day");
+  const anchorItems = fullDayAnchor ? [fullDayAnchor] : anchorCandidates;
+  const droppedAnchors = fullDayAnchor ? anchorCandidates.filter((item) => item !== fullDayAnchor) : [];
+
   const lunch =
     mealItems.find((item) => item.slot === "lunch") ??
     mealItems.find((item) => item.category === "cafe") ??
@@ -1111,83 +1142,31 @@ function resequenceDayItems(day: AiGeneratedDay) {
     mealItems.find((item) => item.slot === "dinner") ??
     mealItems.find((item) => item !== lunch) ??
     null;
-  const leftoverMeals = mealItems.filter((item) => item !== lunch && item !== dinner);
+  const leftoverMeals = fullDayAnchor ? [] : mealItems.filter((item) => item !== lunch && item !== dinner);
   const firstHalfCount = anchorItems.length >= 3 ? 2 : Math.min(anchorItems.length, 1);
   const firstHalfAnchors = anchorItems.slice(0, firstHalfCount);
   const secondHalfAnchors = anchorItems.slice(firstHalfCount);
   const ordered = [
     ...transportationItems.filter((item) => item.slot === "morning"),
     ...firstHalfAnchors,
-    ...(lunch ? [lunch] : []),
+    ...(fullDayAnchor ? [] : lunch ? [lunch] : []),
     ...secondHalfAnchors,
-    ...(dinner && dinner !== lunch ? [dinner] : []),
+    ...(fullDayAnchor ? [] : dinner && dinner !== lunch ? [dinner] : []),
     ...leftoverMeals,
     ...transportationItems.filter((item) => item.slot !== "morning"),
-    ...nonAnchorSupportingItems,
+    ...(fullDayAnchor ? [] : nonAnchorSupportingItems),
   ];
 
-  let morningCount = 0;
-  let afternoonCount = 0;
-  let eveningCount = 0;
-  let lunchAssigned = false;
-  let dinnerAssigned = false;
+  const { items: scheduled, freeTimeItem } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
+  const withSlots = scheduled.map((item) => ({
+    ...item,
+    slot: item.category === "transportation" ? item.slot : slotForClockTime((clockToMinutes(item.plannedStartTime) ?? 9 * 60)),
+  }));
 
   return {
     ...day,
-    items: ordered.map<AiGeneratedItem>((item) => {
-      if (isFoodItem(item.category)) {
-        if (!lunchAssigned) {
-          lunchAssigned = true;
-          return { ...item, slot: "lunch", plannedStartTime: "12:45" };
-        }
-        if (!dinnerAssigned) {
-          dinnerAssigned = true;
-          return { ...item, slot: "dinner", plannedStartTime: "19:30" };
-        }
-
-        eveningCount += 1;
-        return {
-          ...item,
-          slot: item.category === "cafe" ? "evening" : "night",
-          plannedStartTime: item.category === "cafe" ? "21:00" : eveningCount > 1 ? "22:30" : "22:00",
-        };
-      }
-
-      if (item.category === "transportation") {
-        const slot = lunchAssigned && !dinnerAssigned ? "afternoon" : dinnerAssigned ? "evening" : "morning";
-        return {
-          ...item,
-          slot,
-          plannedStartTime:
-            slot === "morning" ? "08:15" : slot === "afternoon" ? "14:15" : "20:30",
-        };
-      }
-
-      if (!lunchAssigned) {
-        morningCount += 1;
-        return {
-          ...item,
-          slot: morningCount > 1 ? "afternoon" : "morning",
-          plannedStartTime: morningCount > 1 ? "11:15" : "09:00",
-        };
-      }
-
-      if (!dinnerAssigned) {
-        afternoonCount += 1;
-        return {
-          ...item,
-          slot: "afternoon",
-          plannedStartTime: afternoonCount > 1 ? "16:30" : "14:45",
-        };
-      }
-
-      eveningCount += 1;
-      return {
-        ...item,
-        slot: item.category === "nightlife" ? "night" : "evening",
-        plannedStartTime: item.category === "nightlife" ? "22:00" : eveningCount > 1 ? "21:45" : "21:00",
-      };
-    }),
+    items: freeTimeItem ? [...withSlots, freeTimeItem] : withSlots,
+    alternatives: droppedAnchors.length > 0 ? normalizeActionableMessages([...day.alternatives, ...droppedAnchors.map((item) => item.name)]) : day.alternatives,
   };
 }
 
@@ -1395,6 +1374,21 @@ function buildSupplementalMealItem(
   };
 }
 
+// Same reasoning as buildFreeExplorationReplacement's phrase rotation just
+// above — a fixed name+area repeated across days with no id/coordinates
+// would otherwise read as a duplicate place to buildItemKey's fallback
+// tier.
+const FALLBACK_LUNCH_MEAL_PHRASES = [
+  (area: string) => `שוק/אזור אוכל מקומי ב${area}`,
+  (area: string) => `פינת אוכל קלה באזור ${area}`,
+  (area: string) => `עצירת צהריים גמישה ב${area}`,
+];
+const FALLBACK_DINNER_MEAL_PHRASES = [
+  (area: string) => `ארוחת ערב מקומית באזור ${area}`,
+  (area: string) => `מסעדה נעימה באזור ${area}`,
+  (area: string) => `ארוחת ערב גמישה ליד ${area}`,
+];
+
 function buildFallbackMealPlaceholder(
   day: AiGeneratedDay,
   slot: DayPart,
@@ -1402,8 +1396,9 @@ function buildFallbackMealPlaceholder(
 ): AiGeneratedItem {
   const area = normalizeAreaLabel(day.cityRegion || day.items[0]?.location || payload.countryName);
   const isLunch = slot === "lunch";
+  const phrases = isLunch ? FALLBACK_LUNCH_MEAL_PHRASES : FALLBACK_DINNER_MEAL_PHRASES;
   return {
-    name: isLunch ? `שוק/אזור אוכל מקומי ב${area}` : `ארוחת ערב מקומית באזור ${area}`,
+    name: phrases[day.dayNumber % phrases.length](area),
     category: isLunch ? "cafe" : "restaurant",
     location: area,
     shortDescription: isLunch
@@ -2064,9 +2059,24 @@ async function generateWithGemini(
 export function buildItemKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
   if (item.recommendationId) return `id:${item.recommendationId}`;
   if (item.lat != null && item.lon != null) {
-    return `coords:${item.lat.toFixed(4)}:${item.lon.toFixed(4)}`;
+    // ~111m grid (was 4 decimals / ~11m) plus the normalized name — the AI
+    // can easily hallucinate slightly different coordinates for the same
+    // real landmark across two separate mentions, and 11m precision missed
+    // that drift entirely. Folding the name in too keeps two genuinely
+    // different nearby places from colliding just because they're close.
+    return `coords:${item.lat.toFixed(3)}:${item.lon.toFixed(3)}:${normalizePlaceNameSlug(item.name)}`;
   }
-  return `name:${item.name.trim().toLowerCase()}::${item.location.trim().toLowerCase()}`;
+  // No recommendationId and no coordinates means nothing here actually
+  // identifies a specific real place — this is generic/flexible filler
+  // content (buildFreeExplorationReplacement, buildFreeTimeItem, the meal
+  // placeholders), not a claim that a particular landmark exists. Two such
+  // fillers for the same area used to collide on name+location alone
+  // (a real reported bug: a sparse-candidate trip failed generation
+  // entirely because "free time in the same area" on two different days
+  // read as a duplicate place). There's nothing reliable to deduplicate
+  // against here, so these are never flagged as duplicates rather than
+  // trusting generated text to already be globally unique.
+  return `generic:${crypto.randomUUID()}`;
 }
 
 function isAvoidedItem(item: Pick<AiGeneratedItem, "name" | "location" | "shortDescription">, profile: TripPreferenceProfile) {
@@ -2131,11 +2141,31 @@ export function buildReplacementItem(
   };
 }
 
+// Several distinct phrasings rather than one fixed template — this filler is
+// used whenever the real candidate pool is exhausted for an area, which can
+// happen more than once across a long trip (or a country with a thin
+// candidate pool). A single fixed name repeated verbatim for the same area
+// used to produce byte-identical items with no id/coordinates to
+// distinguish them, which buildItemKey's own name+location fallback tier
+// then (correctly, given identical input) flagged as a duplicate place —
+// failing the whole plan even though "free time in the same area twice on
+// a long trip" isn't really a bug. Rotating the phrasing fixes both the
+// dedup false-positive and gives the traveler some real variety instead of
+// reading the same sentence on multiple days.
+const FREE_EXPLORATION_PHRASES: Array<(area: string) => string> = [
+  (area) => `שיטוט חופשי ב${area}`,
+  (area) => `זמן פנוי לגלות את ${area} בקצב שלכם`,
+  (area) => `הליכה רגועה וגמישה באזור ${area}`,
+  (area) => `זמן גמיש לבחירה חופשית ב${area}`,
+  (area) => `חיפוש פינות מקומיות באזור ${area}`,
+];
+
 export function buildFreeExplorationReplacement(item: AiGeneratedItem, day: AiGeneratedDay): AiGeneratedItem {
   const area = normalizeAreaLabel(day.cityRegion || item.location || day.accommodation || "");
+  const variantIndex = (day.dayNumber * 7 + SLOT_ORDER.indexOf(item.slot)) % FREE_EXPLORATION_PHRASES.length;
   return {
     ...item,
-    name: area ? `שיטוט חופשי ב${area}` : "שיטוט חופשי וגמיש",
+    name: area ? FREE_EXPLORATION_PHRASES[variantIndex](area) : "שיטוט חופשי וגמיש",
     category:
       item.category === "museum" || isFoodItem(item.category) || item.category === "transportation"
         ? "hidden_gem"
@@ -2810,6 +2840,97 @@ export function fixOverloadedDays(
   return mutableDays;
 }
 
+// Day-utilization targets (spec item 25) — expressed as a share of the
+// pace's own dailyCapacityMinutes (the same constant fixOverloadedDays
+// already treats as the max ceiling), so "underfilled" and "overloaded" are
+// two ends of one consistent scale rather than two unrelated concepts.
+const UTILIZATION_TARGETS: Record<TripPreferences["tripPace"], { min: number; max: number }> = {
+  relaxed: { min: 0.55, max: 0.68 },
+  balanced: { min: 0.65, max: 0.78 },
+  fast: { min: 0.75, max: 0.88 },
+};
+
+function buildInsertionTemplateItem(day: AiGeneratedDay): AiGeneratedItem {
+  const template = day.items[0];
+  if (template) return { ...template, slot: "afternoon", plannedStartTime: "", travelMinutes: null };
+  return {
+    name: "",
+    category: "attraction",
+    location: day.cityRegion,
+    shortDescription: "",
+    slot: "afternoon",
+    plannedStartTime: "",
+    estimatedDurationMinutes: null,
+    approximatePrice: null,
+    priceOriginalAmount: null,
+    priceOriginalCurrency: null,
+    priceConvertedAmount: null,
+    priceExchangeRate: null,
+    priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: null,
+    travelMinutes: null,
+    openingHours: "",
+    reservationRequired: false,
+    transportation: "",
+    mapLink: "",
+    lat: null,
+    lon: null,
+    bookingWarning: "",
+    alternativeSuggestion: "",
+    recommendationId: null,
+    locked: false,
+    priority: "optional",
+    fixedTime: false,
+  };
+}
+
+/**
+ * Real fix for an underfilled day (spec item 23) — until now,
+ * missingAnchorDays was only ever diagnosed, never repaired, which is the
+ * direct cause of the reported "empty Day 1" symptom. Inserts nearby unused
+ * candidates (reusing the exact same scoring machinery rebalanceDayItems
+ * already uses for replacements) until the day's load reaches its pace's
+ * utilization target — never past it, and never on a transfer/day-trip day,
+ * which are legitimately light by design.
+ */
+export function fillUnderfilledDay(
+  day: AiGeneratedDay,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  usedPlaceKeys: Set<string>
+): AiGeneratedDay {
+  if (isIntercityTransferDay(day) || isDayTripDay(day)) return day;
+
+  const target = UTILIZATION_TARGETS[payload.preferences.tripPace] ?? UTILIZATION_TARGETS.balanced;
+  let mutableDay = day;
+  let inserted = 0;
+
+  while (inserted < 4) {
+    const utilization =
+      profile.dailyCapacityMinutes > 0 ? calculateDayLoadMinutes(mutableDay) / profile.dailyCapacityMinutes : 1;
+    if (utilization >= target.min) break;
+
+    const template = buildInsertionTemplateItem(mutableDay);
+    const replacement = pickReplacementRecommendation({
+      payload,
+      day: mutableDay,
+      item: template,
+      profile,
+      usedPlaceKeys,
+      replacementMode: "non_food",
+    });
+    if (!replacement) break;
+
+    const newItem = buildReplacementItem(replacement, template, mutableDay, payload);
+    usedPlaceKeys.add(buildItemKey(newItem));
+    mutableDay = { ...mutableDay, items: [...mutableDay.items, newItem] };
+    inserted += 1;
+  }
+
+  return inserted > 0 ? resequenceDayItems(mutableDay) : mutableDay;
+}
+
 export function enforceBudgetOnDays(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
@@ -3211,6 +3332,17 @@ export function repairPlan(
       rebalanceDayItems(normalizeDayCollections(day), payload, profile, usedPlaceKeys)
     );
     repairedDays = fixOverloadedDays(repairedDays, payload, profile);
+
+    // Real fix, not just a diagnostic (spec item 23) — arrival/departure
+    // days are skipped here since their window is intentionally narrower
+    // and already handled by their own dedicated enforcement below.
+    const fillUsedPlaceKeys = new Set(repairedDays.flatMap((entry) => entry.items.map((item) => buildItemKey(item))));
+    repairedDays = repairedDays.map((day) =>
+      day.dayNumber === 1 || day.dayNumber === dayCount
+        ? day
+        : fillUnderfilledDay(day, payload, profile, fillUsedPlaceKeys)
+    );
+
     repairedDays = capArrivalDepartureDays(repairedDays, payload, profile, dayCount);
     repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
     repairedDays = lightenHighEnergyStreaks(repairedDays, payload, profile);
@@ -3309,7 +3441,8 @@ export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagn
     !diagnostics.overSoftBudget &&
     !diagnostics.outOfBudget &&
     !diagnostics.diversityRisk &&
-    diagnostics.arrivalDepartureWindowViolations === 0
+    diagnostics.arrivalDepartureWindowViolations === 0 &&
+    diagnostics.timeOverlaps === 0
   );
 }
 
@@ -3332,6 +3465,7 @@ function describeFailingDiagnostics(diagnostics: PlanDiagnostics): Record<string
     "longMealDetours",
     "baseMismatchDays",
     "arrivalDepartureWindowViolations",
+    "timeOverlaps",
   ];
   for (const field of numericFields) {
     const value = diagnostics[field];
@@ -3408,12 +3542,15 @@ export async function generateCountryItineraryPlan(
   }
 
   const exchangeRateContext = await loadExchangeRateContext(payload.isoA2);
+  logGenerationStage("flight data: parsed", { hasFlights: Boolean(payload.preferences.flights?.outbound || payload.preferences.flights?.return) });
   const normalizedPayload = normalizePayloadPrices(payload, exchangeRateContext);
+  logGenerationStage("airport data: normalized", { recommendations: normalizedPayload.recommendations.length });
   const profile = buildTripPreferenceProfile(
     normalizedPayload.preferences,
     normalizedPayload.countryName,
     dayCount
   );
+  logGenerationStage("dietary preferences: parsed", { hasDietaryPreferences: Boolean(normalizedPayload.preferences.dietaryPreferences?.trim()) });
   const tripFrame = await buildTripFrame(normalizedPayload, dayCount, knowledge);
   const arrivalDepartureWindow = computeArrivalDepartureWindow(
     normalizedPayload.preferences.flights,
@@ -3439,9 +3576,11 @@ export async function generateCountryItineraryPlan(
         arrivalDepartureWindow,
         knowledge
       );
+      logGenerationStage(`AI response parsing: received (attempt ${attempts})`);
       const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext, arrivalDepartureWindow);
       const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame, arrivalDepartureWindow);
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
+        logGenerationStage(`schema validation: passed (attempt ${attempts})`);
         logGenerationStage(`AI generation parsed and validated (attempt ${attempts})`);
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
           () => repaired
@@ -3452,6 +3591,7 @@ export async function generateCountryItineraryPlan(
         isPlanComplete: isPlanComplete(raw, normalizedPayload),
         failingDiagnostics: describeFailingDiagnostics(diagnostics),
       });
+      logGenerationStage(`schema validation: failed (attempt ${attempts})`);
     } catch (error) {
       logGenerationStage(`Gemini attempt ${attempts} failed`, {
         error: error instanceof Error ? error.message : String(error),

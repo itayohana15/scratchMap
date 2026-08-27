@@ -101,6 +101,39 @@ export function useItineraryDialogController(iso: string) {
     [patchDay]
   );
 
+  // "הסר מהמסלול" (activity details modal's overflow menu) — same
+  // dirty-draft + existing save flow as every other edit, no new mutation
+  // path.
+  const removeItemFromDay = useCallback(
+    (dayId: string, itemId: string) => {
+      patchDay(dayId, (day) => ({ ...day, items: day.items.filter((item) => item.id !== itemId) }));
+    },
+    [patchDay]
+  );
+
+  // "העבר ליום אחר" — touches two days at once, so it goes through
+  // patchDraft directly rather than the single-day patchDay.
+  const moveItemToDay = useCallback(
+    (fromDayId: string, toDayId: string, itemId: string) => {
+      if (fromDayId === toDayId) return;
+      patchDraft((current) => {
+        const fromDay = current.itineraryDays.find((day) => day.id === fromDayId);
+        const item = fromDay?.items.find((candidate) => candidate.id === itemId);
+        if (!item) return current;
+
+        return {
+          ...current,
+          itineraryDays: current.itineraryDays.map((day) => {
+            if (day.id === fromDayId) return { ...day, items: day.items.filter((candidate) => candidate.id !== itemId) };
+            if (day.id === toDayId) return { ...day, items: [...day.items, item] };
+            return day;
+          }),
+        };
+      });
+    },
+    [patchDraft]
+  );
+
   async function saveDraft() {
     if (!draft) return;
     try {
@@ -254,6 +287,8 @@ export function useItineraryDialogController(iso: string) {
     patchDraft,
     patchDay,
     patchItem,
+    removeItemFromDay,
+    moveItemToDay,
     saveDraft,
     handleArchive,
     handleDelete,

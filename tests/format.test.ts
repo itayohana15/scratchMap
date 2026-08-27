@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatTripDateRange } from "../src/lib/format";
+import { formatElapsedDuration, formatTripDateRange, formatTripDateRangeExpanded } from "../src/lib/format";
 
 test("same month + same year: 2026-10-05 -> 2026-10-27", () => {
   assert.equal(formatTripDateRange("2026-10-05", "2026-10-27"), "5-27 באוקטובר 2026");
@@ -45,4 +45,31 @@ test("only one of start/end known falls back to a single formatted date, not a r
   const result = formatTripDateRange("2026-10-05", null);
   assert.ok(result.includes("2026"));
   assert.ok(!result.includes("-27"));
+});
+
+test("expanded trip date range prefers readable month names across months", () => {
+  assert.equal(
+    formatTripDateRangeExpanded("2026-08-26", "2026-09-05"),
+    "26 באוג׳ - 5 בספט׳ 2026"
+  );
+});
+
+test("expanded trip date range keeps partial month-year dates readable", () => {
+  assert.equal(formatTripDateRangeExpanded(null, null, "2023-06"), "יוני 2023");
+});
+
+test("formatElapsedDuration uses MM:SS under an hour", () => {
+  assert.equal(formatElapsedDuration(0), "00:00");
+  assert.equal(formatElapsedDuration(47_000), "00:47");
+  assert.equal(formatElapsedDuration(3 * 60_000 + 42_000), "03:42");
+  assert.equal(formatElapsedDuration(59 * 60_000 + 59_000), "59:59");
+});
+
+test("formatElapsedDuration switches to HH:MM:SS at an hour and beyond", () => {
+  assert.equal(formatElapsedDuration(60 * 60_000), "01:00:00");
+  assert.equal(formatElapsedDuration(60 * 60_000 + 4 * 60_000 + 21_000), "01:04:21");
+});
+
+test("formatElapsedDuration never goes negative", () => {
+  assert.equal(formatElapsedDuration(-500), "00:00");
 });

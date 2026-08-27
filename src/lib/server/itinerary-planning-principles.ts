@@ -326,3 +326,119 @@ export function classifyItemEnergy(item: {
 }
 
 export const MAX_CONSECUTIVE_HIGH_ENERGY_DAYS = 2;
+
+/**
+ * How much of a day's planning capacity a stop realistically consumes — the
+ * missing piece that let every attraction get the same generic ~90-minute
+ * treatment regardless of whether it's a viewpoint or a theme park. Used by
+ * itinerary-scheduler.ts to build a real per-day timeline instead of
+ * assigning fixed slot-default clock times.
+ */
+export type VisitScale = "quick_stop" | "short" | "medium" | "half_day" | "full_day" | "event_fixed";
+
+export const VISIT_SCALE_DURATION_MINUTES: Record<VisitScale, { min: number; max: number; default: number }> = {
+  quick_stop: { min: 15, max: 45, default: 30 },
+  short: { min: 30, max: 90, default: 60 },
+  medium: { min: 60, max: 150, default: 90 },
+  half_day: { min: 150, max: 300, default: 210 },
+  full_day: { min: 300, max: 720, default: 480 },
+  // A timed reservation's duration comes from the reservation itself
+  // (estimatedDurationMinutes), not a generic range — this scale exists so
+  // the scheduler can recognize "this is a fixed anchor" distinctly from a
+  // flexible half/full-day block.
+  event_fixed: { min: 30, max: 480, default: 120 },
+};
+
+const QUICK_STOP_KEYWORDS = [
+  "viewpoint",
+  "lookout",
+  "photo stop",
+  "street",
+  "square",
+  "bridge",
+  "statue",
+  "מצפה",
+  "תצפית",
+  "כיכר",
+  "גשר",
+  "פסל",
+];
+
+const HALF_DAY_KEYWORDS = ["half-day", "half day", "louvre", "חצי יום"];
+
+const FULL_DAY_KEYWORDS = [
+  "theme park",
+  "amusement park",
+  "disneyland",
+  "disney",
+  "national park",
+  "safari",
+  "ski",
+  "פארק שעשועים",
+  "פארק אטרקציות",
+  "יום שלם",
+];
+
+/**
+ * Same category+keyword heuristic style as classifyItemEnergy — a
+ * reservation with a known time is always event_fixed (its duration comes
+ * from the reservation, not a generic estimate); otherwise category/keyword
+ * signals pick a scale, and an AI-provided estimatedDurationMinutes (if any)
+ * only clamps into that scale's range rather than being trusted blindly.
+ */
+export function classifyVisitScale(item: {
+  category: RecommendationCategory;
+  name: string;
+  shortDescription: string;
+  reservationRequired?: boolean;
+  estimatedDurationMinutes?: number | null;
+}): VisitScale {
+  if (item.reservationRequired) return "event_fixed";
+
+  const text = `${item.name} ${item.shortDescription}`;
+  if (includesAnyKeywordLocal(text, FULL_DAY_KEYWORDS) || item.category === "day_trip") return "full_day";
+  if (includesAnyKeywordLocal(text, HALF_DAY_KEYWORDS)) return "half_day";
+  if (includesAnyKeywordLocal(text, QUICK_STOP_KEYWORDS)) return "quick_stop";
+
+  if (item.category === "museum" || item.category === "hidden_gem") return "medium";
+  if (item.category === "nature" || item.category === "attraction") return "medium";
+  if (item.category === "shopping" || item.category === "nightlife" || item.category === "cafe") return "short";
+
+  const duration = item.estimatedDurationMinutes;
+  if (duration != null) {
+    if (duration >= VISIT_SCALE_DURATION_MINUTES.full_day.min) return "full_day";
+    if (duration >= VISIT_SCALE_DURATION_MINUTES.half_day.min) return "half_day";
+    if (duration >= VISIT_SCALE_DURATION_MINUTES.medium.min) return "medium";
+    if (duration >= VISIT_SCALE_DURATION_MINUTES.short.min) return "short";
+    return "quick_stop";
+  }
+
+  return "medium";
+}
+
+/**
+ * Resolves the real minutes to schedule for an item: an AI-provided
+ * estimate is clamped into its visit-scale's realistic range rather than
+ * trusted as-is (spec item 11 — "do not estimate all attractions with one
+ * generic duration"), and a missing estimate falls back to the scale's own
+ * default instead of a flat 90-minute guess used everywhere today.
+ */
+export function resolveVisitDurationMinutes(
+  item: {
+    category: RecommendationCategory;
+    name: string;
+    shortDescription: string;
+    reservationRequired?: boolean;
+    estimatedDurationMinutes?: number | null;
+  },
+  scale: VisitScale = classifyVisitScale(item)
+): number {
+  const range = VISIT_SCALE_DURATION_MINUTES[scale];
+  if (scale === "event_fixed" && item.estimatedDurationMinutes != null && item.estimatedDurationMinutes > 0) {
+    return item.estimatedDurationMinutes;
+  }
+  if (item.estimatedDurationMinutes != null && item.estimatedDurationMinutes > 0) {
+    return Math.min(Math.max(item.estimatedDurationMinutes, range.min), range.max);
+  }
+  return range.default;
+}

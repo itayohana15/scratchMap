@@ -149,8 +149,8 @@ function NamedNotes({ items }: { items: CountryNamedNote[] }) {
 
   return (
     <div className="grid gap-3 md:grid-cols-2">
-      {items.map((item) => (
-        <div key={item.name} className="rounded-2xl border border-border/70 p-4">
+      {items.map((item, index) => (
+        <div key={`${item.name}-${index}`} className="rounded-2xl border border-border/70 p-4">
           <p className="text-sm font-semibold text-foreground">{item.name}</p>
           {item.note && <p className="mt-2 text-sm leading-6 text-muted-foreground">{item.note}</p>}
         </div>
@@ -625,8 +625,8 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
                 </p>
               </div>
               <div className="grid gap-4 xl:grid-cols-2">
-                {data.foodGuide.recommendedSpots.map((spot) => (
-                  <FoodSpotCard key={`${spot.name}-${spot.cityOrArea}`} spot={spot} />
+                {data.foodGuide.recommendedSpots.map((spot, index) => (
+                  <FoodSpotCard key={`${spot.name}-${spot.cityOrArea}-${index}`} spot={spot} />
                 ))}
               </div>
             </div>
@@ -640,8 +640,8 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
         icon={MapPinned}
       >
         <div className="grid gap-4 xl:grid-cols-2">
-          {data.topDestinations.map((destination) => (
-            <DestinationCard key={destination.name} destination={destination} />
+          {data.topDestinations.map((destination, index) => (
+            <DestinationCard key={`${destination.name}-${index}`} destination={destination} />
           ))}
         </div>
       </HubSection>
@@ -661,8 +661,8 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
                 <span className="text-sm text-muted-foreground">{group.attractions.length} מקומות בולטים</span>
               </div>
               <div className="grid gap-4 xl:grid-cols-2">
-                {group.attractions.map((attraction) => (
-                  <AttractionCard key={`${group.category}-${attraction.name}`} attraction={attraction} />
+                {group.attractions.map((attraction, index) => (
+                  <AttractionCard key={`${group.category}-${attraction.name}-${index}`} attraction={attraction} />
                 ))}
               </div>
             </section>
@@ -676,8 +676,8 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
         icon={Landmark}
       >
         <div className="grid gap-4 xl:grid-cols-2">
-          {data.cities.map((city) => (
-            <article key={city.name} className="rounded-[24px] border border-border/70 bg-background/75 p-5">
+          {data.cities.map((city, index) => (
+            <article key={`${city.name}-${index}`} className="rounded-[24px] border border-border/70 bg-background/75 p-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h4 className="text-lg font-semibold text-foreground">{city.name}</h4>
@@ -775,8 +775,8 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
         <div className="space-y-5">
           {data.transportation.airports.length > 0 && (
             <div className="grid gap-4 xl:grid-cols-2">
-              {data.transportation.airports.map((airport) => (
-                <div key={`${airport.name}-${airport.city}`} className="rounded-[24px] border border-border/70 bg-background/75 p-4">
+              {data.transportation.airports.map((airport, index) => (
+                <div key={`${airport.name}-${airport.city}-${index}`} className="rounded-[24px] border border-border/70 bg-background/75 p-4">
                   <h4 className="text-sm font-semibold text-foreground">{airport.name}</h4>
                   <p className="mt-1 text-sm text-muted-foreground">{airport.city}</p>
                   {airport.notes && <p className="mt-3 text-sm leading-6 text-muted-foreground">{airport.notes}</p>}

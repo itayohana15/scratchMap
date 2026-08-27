@@ -74,7 +74,7 @@ export function TripOverviewTab({
     (booking) => booking.status !== "booked" && booking.status !== "not_required" && booking.status !== "cancelled"
   );
   const warnings = itinerary.itineraryDays.flatMap((day) =>
-    day.warnings.map((warning) => ({ dayNumber: day.dayNumber, warning }))
+    day.warnings.map((warning) => ({ dayId: day.id, dayNumber: day.dayNumber, warning }))
   );
 
   return (
@@ -117,8 +117,14 @@ export function TripOverviewTab({
           <h3 className="font-heading text-base font-semibold">אזהרות עיקריות</h3>
           <ul className="space-y-1 text-sm text-muted-foreground">
             {warnings.slice(0, 5).map((entry, index) => (
-              <li key={index}>
-                יום {entry.dayNumber}: {entry.warning}
+              <li key={`${entry.dayId}-${index}`}>
+                <button
+                  type="button"
+                  className="text-right underline-offset-4 transition-colors hover:text-primary hover:underline"
+                  onClick={() => onOpenDay(entry.dayId)}
+                >
+                  יום {entry.dayNumber}: {entry.warning}
+                </button>
               </li>
             ))}
           </ul>
@@ -152,4 +158,3 @@ export function TripOverviewTab({
     </div>
   );
 }
-

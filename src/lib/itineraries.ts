@@ -17,6 +17,7 @@ import {
   type FlightBookingStatus,
   type ItineraryGenerationMode,
   type TripExpense,
+  type TripFlightConnection,
   type TripFlightLeg,
   type TripFlights,
   type TripItineraryDay,
@@ -108,6 +109,14 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(toText).filter(Boolean) : [];
 }
 
+function normalizeFlightConnections(value: unknown): TripFlightConnection[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(isRecord)
+    .map((entry) => ({ airport: toText(entry.airport), layoverMinutes: toNumber(entry.layoverMinutes) ?? 0 }))
+    .filter((connection) => connection.airport);
+}
+
 function normalizeFlightLeg(value: unknown): TripFlightLeg | null {
   if (!isRecord(value)) return null;
   const bookingStatus =
@@ -125,6 +134,13 @@ function normalizeFlightLeg(value: unknown): TripFlightLeg | null {
     flightNumber: toText(value.flightNumber),
     cost: toNumber(value.cost),
     bookingStatus,
+    estimated: value.estimated === true,
+    estimatedWindowStart: toText(value.estimatedWindowStart),
+    estimatedWindowEnd: toText(value.estimatedWindowEnd),
+    estimatedFlightDurationMinutes: toNumber(value.estimatedFlightDurationMinutes),
+    arrivalManuallySet: value.arrivalManuallySet === true,
+    connections: normalizeFlightConnections(value.connections),
+    totalJourneyMinutes: toNumber(value.totalJourneyMinutes),
   };
   const hasAnyData = Object.values(leg).some((field) => typeof field === "string" && field.trim() !== "");
   return hasAnyData ? leg : null;
@@ -171,6 +187,7 @@ function normalizeTripPreferences(value: unknown): TripPreferences {
     transportationPreferences: toText(record.transportationPreferences),
     accommodationArea: toText(record.accommodationArea),
     dietaryPreferences: toText(record.dietaryPreferences),
+    foodNotes: toText(record.foodNotes),
     accessibilityNeeds: toText(record.accessibilityNeeds),
     preferredRegions: toText(record.preferredRegions),
     mustVisitPlaces: toText(record.mustVisitPlaces),

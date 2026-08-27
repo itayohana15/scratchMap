@@ -3,12 +3,16 @@ import test from "node:test";
 
 import {
   buildTripPreferenceProfile,
+  calculateDayLoadMinutes,
   collectPlanDiagnostics,
   type ExchangeRateContext,
   type PlanDiagnostics,
 } from "../src/lib/server/itinerary-generation-constraints";
 import {
+  buildFreeExplorationReplacement,
+  buildItemKey,
   enforceBudgetOnDays,
+  fillUnderfilledDay,
   fixOverloadedDays,
   passesValidation,
   pickNearbyMealRecommendation,
@@ -16,6 +20,7 @@ import {
   repairDayGeography,
   resolveItemPriceFields,
 } from "../src/lib/server/country-itinerary-generation";
+import { buildFallbackAiItinerary } from "../src/lib/trip-workspace";
 import type {
   AiGeneratedDay,
   AiGeneratedItem,
@@ -38,6 +43,7 @@ const basePreferences: TripPreferences = {
   transportationPreferences: "public transport",
   accommodationArea: "Tokyo Station",
   dietaryPreferences: "",
+  foodNotes: "",
   accessibilityNeeds: "",
   preferredRegions: "Tokyo",
   mustVisitPlaces: "",
@@ -176,6 +182,7 @@ function cleanDiagnostics(overrides: Partial<PlanDiagnostics> = {}): PlanDiagnos
     baseMismatchDays: 0,
     activityMixSkew: [],
     arrivalDepartureWindowViolations: 0,
+    timeOverlaps: 0,
     ...overrides,
   };
 }
@@ -471,6 +478,44 @@ test("fixOverloadedDays brings an overloaded day's load back under daily capacit
   );
 });
 
+// Spec item 23 — an underfilled day must actually get filled, not just
+// diagnosed. This is the direct fix for the reported "empty Day 1" symptom:
+// missingAnchorDays used to be computed and gate validation, but nothing
+// ever inserted anything.
+test("fillUnderfilledDay inserts nearby candidates until the day reaches its pace's utilization target", () => {
+  const recommendations = [
+    buildRecommendation({ id: "rec-a", name: "Old Fortress", estimatedDurationMinutes: 150, lat: 35.681, lon: 139.767 }),
+    buildRecommendation({ id: "rec-b", name: "City Park", estimatedDurationMinutes: 150, lat: 35.682, lon: 139.768 }),
+    buildRecommendation({ id: "rec-c", name: "Local Museum", estimatedDurationMinutes: 150, lat: 35.683, lon: 139.769 }),
+    buildRecommendation({ id: "rec-d", name: "Viewpoint", estimatedDurationMinutes: 150, lat: 35.684, lon: 139.77 }),
+  ];
+  const payload = buildPayload({ recommendations });
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
+
+  const emptyDay = buildDay({ dayNumber: 2, items: [] });
+  const usedPlaceKeys = new Set<string>();
+
+  const filled = fillUnderfilledDay(emptyDay, payload, profile, usedPlaceKeys);
+
+  assert.ok(filled.items.length > 0, "expected at least one activity to be inserted into the empty day");
+  const utilization = calculateDayLoadMinutes(filled) / profile.dailyCapacityMinutes;
+  assert.ok(utilization >= 0.55, `expected the filled day to reach a reasonable utilization, got ${utilization}`);
+});
+
+test("fillUnderfilledDay leaves a transfer day and a day-trip day alone — they're legitimately light", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ id: "rec-a", name: "Extra Stop", estimatedDurationMinutes: 150 })],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
+  const usedPlaceKeys = new Set<string>();
+
+  const transferDay = buildDay({ dayNumber: 2, title: "Transfer to Kyoto", transportation: "shinkansen", items: [] });
+  assert.deepEqual(fillUnderfilledDay(transferDay, payload, profile, usedPlaceKeys).items, []);
+
+  const dayTrip = buildDay({ dayNumber: 2, title: "Day trip to Nikko", items: [] });
+  assert.deepEqual(fillUnderfilledDay(dayTrip, payload, profile, usedPlaceKeys).items, []);
+});
+
 // 9. Trip preferences must visibly affect activity-category distribution:
 // a plan skewed entirely toward one tier should trip the activity-mix diagnostic.
 test("collectPlanDiagnostics flags an activity mix that's all one tier", () => {
@@ -662,4 +707,56 @@ test("collectPlanDiagnostics ignores arrival/departure windows on middle days", 
   };
   const diagnostics = collectPlanDiagnostics(plan, profile, null, window);
   assert.equal(diagnostics.arrivalDepartureWindowViolations, 0);
+});
+
+// Regression: a real reported bug — generating a domestic/sparse-candidate
+// trip repeatedly failed with "PLAN_NOT_FEASIBLE" because the deterministic
+// fallback's generic filler content (buildFreeExplorationReplacement) used
+// one fixed name per area with no id/coordinates to distinguish repeats,
+// so the same area needing a filler on two different days produced a
+// byte-identical item that collectPlanDiagnostics correctly (given the
+// identical input) flagged as a duplicate place — failing the whole plan
+// over harmless repeated filler content instead of a real duplicate. Fixed
+// at the root: an item with neither a recommendationId nor coordinates
+// isn't a verifiable claim about a specific real place, so buildItemKey
+// never treats it as a duplicate at all — regardless of whether its
+// generated text happens to repeat (which it may; the rotating phrasing is
+// a UX nicety, not what correctness depends on here).
+test("buildItemKey never treats two generic-filler items (no id, no coordinates) as duplicates, even with identical text", () => {
+  const area = "Tel Aviv";
+  const dayA = buildDay({ dayNumber: 3, cityRegion: area });
+  const dayB = buildDay({ dayNumber: 3, cityRegion: area }); // same day number on purpose — worst case for phrase rotation
+  const itemA = buildItem({ slot: "morning" });
+  const itemB = buildItem({ slot: "morning" }); // same slot too — forces an identical generated name
+
+  const replacementA = buildFreeExplorationReplacement(itemA, dayA);
+  const replacementB = buildFreeExplorationReplacement(itemB, dayB);
+  assert.equal(replacementA.name, replacementB.name, "sanity check: this setup does produce identical filler text");
+
+  assert.notEqual(
+    buildItemKey(replacementA),
+    buildItemKey(replacementB),
+    "two generic-filler items must never share a dedup key, even when their text is identical"
+  );
+});
+
+test("buildFallbackAiItinerary never produces duplicate-place-flagged filler when the candidate pool is exhausted across many days", () => {
+  // Deliberately no recommendations at all — forces every day to fall back
+  // to generic filler content, exactly like the reported sparse-candidate
+  // scenario.
+  const payload = buildPayload({
+    preferences: { ...basePreferences, startDate: "2026-09-01", endDate: "2026-09-15" },
+    recommendations: [],
+    selectedPlaces: [],
+  });
+  const profile = buildTripPreferenceProfile(payload.preferences, "Japan", 15);
+
+  const fallback = buildFallbackAiItinerary(payload);
+  const diagnostics = collectPlanDiagnostics(fallback, profile);
+
+  assert.equal(
+    diagnostics.duplicatePlaces,
+    0,
+    "repeated generic filler across a long, candidate-sparse trip must never be flagged as duplicate real places"
+  );
 });

@@ -4,9 +4,9 @@ import {
   Archive,
   CalendarRange,
   Clock3,
-  Copy,
   Ellipsis,
   ExternalLink,
+  FileDown,
   type LucideIcon,
   Luggage,
   MapPinned,
@@ -45,6 +45,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { openItineraryPdfExport } from "@/lib/itinerary-pdf-export";
 import {
   Select,
   SelectContent,
@@ -57,7 +58,6 @@ import { photoPublicUrl, usePhotosForItineraries } from "@/lib/queries/photos";
 import {
   useArchiveTripHubItinerary,
   useDeleteTripHubItinerary,
-  useDuplicateTripHubItinerary,
   useRenameTripHubItinerary,
   useTripHubTrips,
 } from "@/lib/queries/trip-hub";
@@ -99,6 +99,13 @@ const SORT_LABELS: Record<SortOption, string> = {
   longest_trip: "הטיול הארוך ביותר",
   highest_cost: "העלות הגבוהה ביותר",
 };
+
+const RATING_FILTER_OPTIONS = [
+  { value: "all", label: "כל הדירוגים", emoji: "✨" },
+  { value: "9", label: "9+ כוכבים", emoji: "🏆" },
+  { value: "7", label: "7+ כוכבים", emoji: "⭐" },
+  { value: "5", label: "5+ כוכבים", emoji: "👍" },
+] as const;
 
 function normalizeQuery(value: string) {
   return value.trim().toLowerCase();
@@ -277,7 +284,6 @@ function useUpcomingTripCardActions(trip: TripHubTrip) {
   const [renameValue, setRenameValue] = useState(trip.title);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const renameTrip = useRenameTripHubItinerary();
-  const duplicateTrip = useDuplicateTripHubItinerary();
   const archiveTrip = useArchiveTripHubItinerary();
   const deleteTrip = useDeleteTripHubItinerary();
 
@@ -293,15 +299,6 @@ function useUpcomingTripCardActions(trip: TripHubTrip) {
       setRenameOpen(false);
     } catch {
       toast.error("עדכון השם נכשל");
-    }
-  }
-
-  async function handleDuplicate() {
-    try {
-      await duplicateTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
-      toast.success("הטיול שוכפל");
-    } catch {
-      toast.error("השכפול נכשל");
     }
   }
 
@@ -333,7 +330,6 @@ function useUpcomingTripCardActions(trip: TripHubTrip) {
     setDeleteOpen,
     renameTrip,
     handleRename,
-    handleDuplicate,
     handleArchive,
     handleDelete,
   };
@@ -369,16 +365,21 @@ function UpcomingCardMenuAndDialogs({
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => {
+              const opened = openItineraryPdfExport(trip.itinerary, trip.countryName, trip.workspace);
+              if (!opened) toast.error("לא ניתן לפתוח את חלון הייצוא. יש לאפשר חלונות קופצים בדפדפן.");
+            }}
+          >
+            <FileDown className="size-4" />
+            ייצוא ל-PDF
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={() => {
               actions.setRenameValue(trip.title);
               actions.setRenameOpen(true);
             }}
           >
             <Pencil className="size-4" />
             שנה שם
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={actions.handleDuplicate}>
-            <Copy className="size-4" />
-            שכפל
           </DropdownMenuItem>
           <DropdownMenuItem onClick={actions.handleArchive}>
             <Archive className="size-4" />
@@ -1099,14 +1100,24 @@ export function TripsPageClient() {
             <Select value={ratingFilter} onValueChange={(value) => setRatingFilter(value ?? "all")}>
               <SelectTrigger className="w-full">
                 <span className="flex flex-1 text-right">
-                  {ratingFilter === "all" ? "כל הדירוגים" : `${ratingFilter}+ כוכבים`}
+                  {(() => {
+                    const option = RATING_FILTER_OPTIONS.find((item) => item.value === ratingFilter) ?? RATING_FILTER_OPTIONS[0];
+                    return (
+                      <Badge variant="secondary" className="gap-1.5 border-0 px-2.5 py-1 text-xs">
+                        <span aria-hidden="true">{option.emoji}</span>
+                        {option.label}
+                      </Badge>
+                    );
+                  })()}
                 </span>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">כל הדירוגים</SelectItem>
-                {[9, 7, 5].map((value) => (
-                  <SelectItem key={value} value={value.toString()}>
-                    {value}+ כוכבים
+                {RATING_FILTER_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    <Badge variant="secondary" className="gap-1.5 border-0 px-2 py-1 text-xs">
+                      <span aria-hidden="true">{option.emoji}</span>
+                      {option.label}
+                    </Badge>
                   </SelectItem>
                 ))}
               </SelectContent>

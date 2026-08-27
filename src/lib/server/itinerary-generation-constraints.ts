@@ -13,8 +13,10 @@ import {
   ACTIVITY_MIX_TARGETS,
   classifyActivityTier,
   classifyItemEnergy,
+  classifyVisitScale,
   findFramePhaseForDay,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
+  resolveVisitDurationMinutes,
   type ActivityTier,
   type EnergyLevel,
   type TripFrame,
@@ -100,6 +102,14 @@ export interface PlanDiagnostics {
    * spec §D16/E.1/E.2. A hard gate, not advisory, unlike activityMixSkew.
    */
   arrivalDepartureWindowViolations: number;
+  /**
+   * Two items on the same day whose visit-scale-derived windows overlap in
+   * wall-clock time (spec item 58's "three activities at 12:30" symptom) —
+   * a hard gate. Computed from plannedStartTime + a resolved duration, so it
+   * catches raw AI output even before any scheduler pass has assigned a
+   * real endTime.
+   */
+  timeOverlaps: number;
 }
 
 export interface RouteProximityScore {
@@ -288,6 +298,49 @@ const LOCATION_STOP_WORDS = new Set([
 
 const TRANSFER_DAY_PATTERN =
   /intercity|transfer|relocation|checkout|check-out|check in|check-in|airport|flight|bullet train|shinkansen|long-distance|ferry crossing|move to next city|מעבר|רכבת מהירה|רכבת בין-עירונית|שינקנסן|טיסה|צ'ק-אאוט|צ'ק אאוט|צ'ק-אין|צ'ק אין|שדה תעופה|מעבורת בין-עירונית|עוברים ליעד הבא|לינה חדשה/i;
+
+// A day trip keeps the traveler's overnight base unchanged but visits a
+// genuinely different area for the day (spec item 13) — e.g. a Tbilisi-based
+// day trip to Borjomi/Kazbegi. Without recognizing this, analyzeDayGeography
+// would (wrongly) flag it as "cross-city mixing," which is exactly the
+// "Borjomi and Tbilisi mixed in one day" false-positive/mis-structure
+// reported against the current generator. Same self-contained,
+// text-pattern-on-a-single-day style as TRANSFER_DAY_PATTERN — no neighbor-day
+// lookup needed, so every existing analyzeDayGeography call site benefits
+// with zero signature changes.
+const DAY_TRIP_PATTERN =
+  /day trip|day-trip|excursion|half-day trip|round trip to|round-trip to|טיול יום|יום טיול|נסיעת יום|יציאה ליום|סיור יום/i;
+
+export function isDayTripDay(day: Pick<AiGeneratedDay, "title" | "notes" | "transportation" | "transportSegments">) {
+  if (isIntercityTransferDay(day)) return false;
+  return DAY_TRIP_PATTERN.test(`${day.title} ${day.notes} ${day.transportation}`);
+}
+
+/**
+ * Counts real wall-clock overlaps between a day's items — the structural
+ * check behind spec item 58's "three activities at 12:30" symptom.
+ * Transportation legs are excluded (they're connective, not competing for
+ * the same slot). Duration comes from resolveVisitDurationMinutes so this
+ * works even on raw AI output that hasn't been through the scheduler yet.
+ */
+export function countDayTimeOverlaps(day: Pick<AiGeneratedDay, "items">): number {
+  const timedItems = day.items
+    .filter((item) => item.category !== "transportation")
+    .map((item) => {
+      const start = parseTimeToMinutes(item.plannedStartTime);
+      if (start == null) return null;
+      const duration = resolveVisitDurationMinutes(item, classifyVisitScale(item));
+      return { start, end: start + Math.max(duration, 1) };
+    })
+    .filter((entry): entry is { start: number; end: number } => entry != null)
+    .sort((a, b) => a.start - b.start);
+
+  let overlaps = 0;
+  for (let index = 1; index < timedItems.length; index += 1) {
+    if (timedItems[index].start < timedItems[index - 1].end) overlaps += 1;
+  }
+  return overlaps;
+}
 
 export const IDEAL_LOCAL_TRAVEL_MINUTES = 15;
 export const MAX_LOCAL_TRAVEL_MINUTES = 25;
@@ -619,6 +672,11 @@ export function analyzeDayGeography(
   const anchorItems = orderedItems.filter((item) => isAnchorCategory(item.category));
   const foodItems = orderedItems.filter((item) => isFoodCategory(item.category));
   const isTransferDay = isIntercityTransferDay(day);
+  // A day trip keeps the day's own overnight base (day.accommodation is
+  // unchanged from the surrounding days) but its stops genuinely sit far
+  // away for the day — cross-city distance there is expected, not a bug,
+  // same as it already is on a transfer day.
+  const skipCrossCityChecks = isTransferDay || isDayTripDay(day);
   const clusterLabel = buildDayClusterLabel(day, anchorItems);
   const clusterContext = `${clusterLabel} ${day.cityRegion} ${day.accommodation}`;
   const baseAnchor = anchorItems.find(hasCoordinates) ?? anchorItems[0] ?? null;
@@ -652,7 +710,7 @@ export function analyzeDayGeography(
 
     totalTravelMinutes += segmentMinutes ?? 0;
 
-    if (!isTransferDay && segmentMinutes > MAX_LOCAL_TRAVEL_MINUTES) {
+    if (!skipCrossCityChecks && segmentMinutes > MAX_LOCAL_TRAVEL_MINUTES) {
       longTravelSegments.push({
         fromName: previous.name,
         toName: current.name,
@@ -662,7 +720,7 @@ export function analyzeDayGeography(
     }
 
     if (
-      !isTransferDay &&
+      !skipCrossCityChecks &&
       normalizedPrevious.isValid &&
       normalizedCurrent.isValid &&
       distanceKm >= DISTANT_CITY_DISTANCE_KM &&
@@ -686,7 +744,7 @@ export function analyzeDayGeography(
       );
 
       if (
-        !isTransferDay &&
+        !skipCrossCityChecks &&
         normalizedBase.isValid &&
         normalizedItem.isValid &&
         distanceKm >= DISTANT_CITY_DISTANCE_KM &&
@@ -1093,9 +1151,53 @@ export function calculateDayLoadMinutes(day: Pick<AiGeneratedDay, "items" | "res
 function buildPlaceKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
   if (item.recommendationId) return `id:${item.recommendationId}`;
   if (item.lat != null && item.lon != null) {
-    return `coords:${item.lat.toFixed(4)}:${item.lon.toFixed(4)}`;
+    // ~111m grid (was 4 decimals / ~11m) plus the normalized name — see
+    // buildItemKey's identical reasoning in country-itinerary-generation.ts.
+    return `coords:${item.lat.toFixed(3)}:${item.lon.toFixed(3)}:${normalizePlaceNameSlug(item.name)}`;
   }
-  return `name:${item.name.trim().toLowerCase()}::${item.location.trim().toLowerCase()}`;
+  // No id and no coordinates means this isn't a claim about a specific real
+  // place — generic/flexible filler content (free-exploration/free-time/meal
+  // placeholders) — see buildItemKey's identical reasoning and the real bug
+  // it fixes in country-itinerary-generation.ts. Never treated as a
+  // duplicate rather than trusting generated filler text to already be
+  // globally unique.
+  return `generic:${crypto.randomUUID()}`;
+}
+
+const FUZZY_DUPLICATE_MAX_KM = 0.15; // ~150m
+
+// Strips parenthetical suffixes ("Mtatsminda Park (Funicular)" ->
+// "mtatsminda park") and punctuation so differently-worded mentions of the
+// same real place collapse to the same slug — buildPlaceKey's exact/coord
+// match alone misses this class of duplicate (spec item 52/56's "duplicate
+// Mtatsminda Park" symptom).
+export function normalizePlaceNameSlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+interface FuzzyPlaceRecord {
+  nameSlug: string;
+  lat: number | null;
+  lon: number | null;
+}
+
+function isFuzzyDuplicatePlace(a: FuzzyPlaceRecord, b: FuzzyPlaceRecord): boolean {
+  if (!a.nameSlug || !b.nameSlug) return false;
+  const namesMatch = a.nameSlug === b.nameSlug || a.nameSlug.startsWith(b.nameSlug) || b.nameSlug.startsWith(a.nameSlug);
+  if (!namesMatch) return false;
+  // Both slugs matched (one contains the other) — if we also have
+  // coordinates for both, only call it a duplicate when they're genuinely
+  // close together, so "Mtatsminda Park" in Tbilisi never collides with an
+  // unrelated same-named place elsewhere. Without coordinates for either
+  // side, the strict slug match alone is treated as sufficient (same trust
+  // level as buildPlaceKey's own name+location exact-match fallback).
+  if (a.lat == null || a.lon == null || b.lat == null || b.lon == null) return true;
+  return haversineKm(a.lat, a.lon, b.lat, b.lon) <= FUZZY_DUPLICATE_MAX_KM;
 }
 
 /** Categories that represent arrival/transfer/logistics rather than a discretionary activity. */
@@ -1145,9 +1247,11 @@ export function collectPlanDiagnostics(
   let missingAnchorDays = 0;
   let longMealDetours = 0;
   let baseMismatchDays = 0;
+  let timeOverlaps = 0;
   let currentHighEnergyStreak = 0;
   let maxConsecutiveHighEnergyDays = 0;
   const seenPlaces = new Set<string>();
+  const seenFuzzyPlaces: FuzzyPlaceRecord[] = [];
   const matchedMustVisitKeywords = new Set<string>();
   const activityCategoryCounts = new Map<RecommendationCategory, number>();
   let totalCountedActivities = 0;
@@ -1183,6 +1287,7 @@ export function collectPlanDiagnostics(
     }
 
     const geography = analyzeDayGeography(day, profile);
+    timeOverlaps += countDayTimeOverlaps(day);
     invalidCoordinates += geography.invalidCoordinateItems.length;
     if (geography.crossCityItems.length > 0) {
       crossCityDays += 1;
@@ -1238,10 +1343,19 @@ export function collectPlanDiagnostics(
 
     for (const item of day.items) {
       const key = buildPlaceKey(item);
-      if (seenPlaces.has(key)) {
+      // Only items that actually identify a specific real place (a known
+      // candidate id, or real coordinates) participate in the fuzzy
+      // name-similarity scan — generic filler content has nothing real to
+      // compare, and relies solely on its own always-unique key above.
+      const isRealPlace = Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
+      const fuzzyRecord: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon };
+      const isDuplicate =
+        seenPlaces.has(key) || (isRealPlace && seenFuzzyPlaces.some((seen) => isFuzzyDuplicatePlace(seen, fuzzyRecord)));
+      if (isDuplicate) {
         duplicatePlaces += 1;
       } else {
         seenPlaces.add(key);
+        if (isRealPlace) seenFuzzyPlaces.push(fuzzyRecord);
       }
 
        if (isAvoidedByProfile(item, profile)) {
@@ -1333,6 +1447,7 @@ export function collectPlanDiagnostics(
     baseMismatchDays,
     activityMixSkew,
     arrivalDepartureWindowViolations: countArrivalDepartureWindowViolations(plan, arrivalDepartureWindow),
+    timeOverlaps,
   };
 }
 

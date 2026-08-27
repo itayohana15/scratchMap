@@ -27,6 +27,7 @@
     "src/lib/server/country-itinerary-generation.ts",
     "src/lib/server/itinerary-generation-constraints.ts",
     "src/lib/server/itinerary-planning-principles.ts",
+    "src/lib/server/itinerary-scheduler.ts",
     "src/lib/packing.ts",
     "src/lib/trip-actual.ts",
     "src/lib/trip-memories.ts",
@@ -39,6 +40,9 @@
     "src/lib/places/nominatim.ts",
     "src/lib/trip-budget.ts",
     "src/lib/flight-planning.ts",
+    "src/lib/facts/airports-data.ts",
+    "src/lib/facts/jewish-holidays.ts",
+    "src/lib/itinerary-explain-placement.ts",
     "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
     "tests/itinerary-planning-principles.test.ts",
@@ -54,7 +58,11 @@
     "tests/trip-preference-overrides.test.ts",
     "tests/city-normalization.test.ts",
     "tests/trip-budget.test.ts",
-    "tests/flight-planning.test.ts"
+    "tests/flight-planning.test.ts",
+    "tests/airports-data.test.ts",
+    "tests/jewish-holidays.test.ts",
+    "tests/itinerary-explain-placement.test.ts",
+    "tests/itinerary-scheduler.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

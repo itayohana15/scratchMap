@@ -1,6 +1,6 @@
 "use client";
 
-import { Ellipsis, History, LoaderCircle, Route, Trash2 } from "lucide-react";
+import { Ellipsis, FileDown, FolderOpen, History, Pencil, Route, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -14,19 +14,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  buildSuggestedItineraryTitle,
-  type CountryItineraryRecord,
-  type CountryItineraryStatus,
-} from "@/lib/itineraries";
-import { formatCurrency, formatDate, formatTripDateRange } from "@/lib/format";
+import type { CountryItineraryRecord, CountryItineraryStatus } from "@/lib/itineraries";
+import { itineraryDisplayTitle, openItineraryPdfExport } from "@/lib/itinerary-pdf-export";
+import { formatCurrency, formatTripDateRangeExpanded } from "@/lib/format";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { useCountryItineraries, useUpdateCountryItinerary } from "@/lib/queries/country-itineraries";
 import type { Tables } from "@/lib/supabase/types";
-import {
-  ITINERARY_GENERATION_MODE_LABELS,
-  type CountryTripWorkspaceState,
-} from "@/lib/trip-workspace";
+import { ITINERARY_GENERATION_MODE_LABELS } from "@/lib/trip-workspace";
 
 type HistoryFilter =
   | "upcoming"
@@ -77,19 +71,13 @@ function itineraryMatchesFilter(
 interface CountryItineraryHistorySectionProps {
   iso: string;
   country: Tables<"countries">;
-  workspace: CountryTripWorkspaceState;
-  isGenerating: boolean;
-  generationStage: string | null;
-  onGenerate: () => Promise<void>;
+  onOpenWizard: () => void;
 }
 
 export function CountryItineraryHistorySection({
   iso,
   country,
-  workspace,
-  isGenerating,
-  generationStage,
-  onGenerate,
+  onOpenWizard,
 }: CountryItineraryHistorySectionProps) {
   const router = useRouter();
   const { data: itineraries = [], isLoading } = useCountryItineraries(iso);
@@ -97,8 +85,7 @@ export function CountryItineraryHistorySection({
 
   const [activeFilter, setActiveFilter] = useState<HistoryFilter | "all">("all");
 
-  const { handleArchive, handleDelete, handleDuplicate, handleRegenerate } =
-    useItineraryDialogController(iso);
+  const { handleDelete } = useItineraryDialogController(iso);
 
   function openTrip(itinerary: CountryItineraryRecord) {
     router.push(`/trips/${itinerary.id}`);
@@ -127,26 +114,12 @@ export function CountryItineraryHistorySection({
     }
   }
 
-  const emptySummary = [
-    workspace.preferences.startDate && workspace.preferences.endDate
-      ? `תאריכים: ${formatTripDateRange(
-          workspace.preferences.startDate,
-          workspace.preferences.endDate,
-          workspace.preferences.partialDate
-        )}`
-      : "תאריכים: עדיין לא הוגדרו",
-    `נוסעים: ${workspace.preferences.travelers}`,
-    workspace.preferences.budget
-      ? `תקציב יעד: ${formatCurrency(workspace.preferences.budget)}`
-      : "",
-    workspace.preferences.tripStyle ? `סגנון: ${workspace.preferences.tripStyle}` : "",
-    workspace.preferences.interests ? `תחומי עניין: ${workspace.preferences.interests}` : "",
-    workspace.preferences.generationMode
-      ? `Mode: ${ITINERARY_GENERATION_MODE_LABELS[workspace.preferences.generationMode]}`
-      : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  function exportItineraryPdf(itinerary: CountryItineraryRecord) {
+    const opened = openItineraryPdfExport(itinerary, country.name);
+    if (!opened) {
+      toast.error("לא ניתן לפתוח את חלון הייצוא. יש לאפשר חלונות קופצים בדפדפן.");
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -162,17 +135,10 @@ export function CountryItineraryHistorySection({
         </div>
 
         <div className="flex flex-col items-stretch gap-2 sm:items-end">
-          <Button className="gap-1.5" onClick={() => void onGenerate()} disabled={isGenerating}>
-            {isGenerating ? (
-              <LoaderCircle className="size-4 animate-spin" />
-            ) : (
-              <Route className="size-4" />
-            )}
+          <Button className="gap-1.5" onClick={onOpenWizard}>
+            <Route className="size-4" />
             צור מסלול עם AI
           </Button>
-          {generationStage ? (
-            <p className="text-sm font-medium text-primary">כרגע: {generationStage}</p>
-          ) : null}
         </div>
       </div>
 
@@ -212,17 +178,9 @@ export function CountryItineraryHistorySection({
                   ? "אפשר לבחור פילטר אחר או לפתוח מחדש את כל ההיסטוריה."
                   : "אחרי generation מוצלח, המסלול יישמר אוטומטית ויופיע כאן כהיסטוריה מסודרת של מסלולים, גרסאות ושינויים."}
               </p>
-              <p className="mt-3 text-sm text-muted-foreground">{emptySummary}</p>
-              {generationStage ? (
-                <p className="mt-3 text-sm font-medium text-primary">כרגע: {generationStage}</p>
-              ) : null}
               <div className="mt-4 flex flex-wrap gap-2">
-                <Button className="gap-1.5" onClick={() => void onGenerate()} disabled={isGenerating}>
-                  {isGenerating ? (
-                    <LoaderCircle className="size-4 animate-spin" />
-                  ) : (
-                    <Route className="size-4" />
-                  )}
+                <Button className="gap-1.5" onClick={onOpenWizard}>
+                  <Route className="size-4" />
                   צור מסלול עם AI
                 </Button>
                 {hasAnyItineraries ? (
@@ -253,34 +211,29 @@ export function CountryItineraryHistorySection({
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <h4 className="line-clamp-2 text-lg font-semibold text-foreground">
-                    {itinerary.title ||
-                      buildSuggestedItineraryTitle(
-                        country.name,
-                        itinerary.startDate,
-                        itinerary.endDate
-                      )}
+                    {itineraryDisplayTitle(itinerary, country.name)}
                   </h4>
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    <bdi dir="ltr">
-                      {formatTripDateRange(itinerary.startDate, itinerary.endDate, itinerary.preferencesSnapshot.partialDate)}
-                    </bdi>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {formatTripDateRangeExpanded(
+                      itinerary.startDate,
+                      itinerary.endDate,
+                      itinerary.preferencesSnapshot.partialDate
+                    )}
                   </p>
                 </div>
 
                 <div className="flex shrink-0 items-center gap-1.5">
                   <Button
-                    variant="outline"
-                    size="icon-sm"
-                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                    aria-label="מחיקת מסלול"
+                    size="sm"
+                    className="gap-1.5"
                     onClick={(event) => {
                       event.stopPropagation();
-                      void handleDelete(itinerary.id);
+                      openTrip(itinerary);
                     }}
                   >
-                    <Trash2 className="size-4" />
+                    <FolderOpen className="size-4" />
+                    פתח
                   </Button>
-
                   <DropdownMenu>
                     <DropdownMenuTrigger
                       render={
@@ -295,56 +248,35 @@ export function CountryItineraryHistorySection({
                       <Ellipsis className="size-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-52">
-                    <DropdownMenuItem
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        openTrip(itinerary);
-                      }}
-                    >
-                      פתח
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleRename(itinerary);
-                      }}
-                    >
-                      שנה שם
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleDuplicate(itinerary.id);
-                      }}
-                    >
-                      שכפל
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleRegenerate(itinerary.id, "full");
-                      }}
-                    >
-                      צור מחדש
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleArchive(itinerary.id);
-                      }}
-                    >
-                      העבר לארכיון
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      variant="destructive"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleDelete(itinerary.id);
-                      }}
-                    >
-                      מחק
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
+                      <DropdownMenuItem
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleRename(itinerary);
+                        }}
+                      >
+                        <Pencil className="size-4" />
+                        שנה שם
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          exportItineraryPdf(itinerary);
+                        }}
+                      >
+                        <FileDown className="size-4" />
+                        ייצוא ל-PDF
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        variant="destructive"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleDelete(itinerary.id);
+                        }}
+                      >
+                        <Trash2 className="size-4" />
+                        מחק
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
               </div>
@@ -375,50 +307,26 @@ export function CountryItineraryHistorySection({
                   </p>
                 </div>
                 <div className="rounded-2xl border border-border/70 p-3">
-                  <p className="text-xs text-muted-foreground">נוצר בתאריך</p>
+                  <p className="text-xs text-muted-foreground">עלות ממוצעת ליום</p>
                   <p className="mt-1 text-base font-semibold">
-                    {formatDate(itinerary.createdAt, "d בMMM yyyy")}
+                    {formatCurrency(itinerary.costSummary.averageDailyCost)}
                   </p>
                 </div>
               </div>
 
-              <div className="mt-3 rounded-2xl border border-border/70 p-3">
-                <p className="text-xs text-muted-foreground">עודכן לאחרונה</p>
-                <p className="mt-1 text-base font-semibold">
-                  {formatDate(itinerary.updatedAt, "d בMMM yyyy")}
-                </p>
-              </div>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    openTrip(itinerary);
-                  }}
-                >
-                  פתח את המסלול
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void handleRename(itinerary);
-                  }}
-                >
-                  שנה שם
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void handleDuplicate(itinerary.id);
-                  }}
-                >
-                  שכפל
-                </Button>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-border/70 p-3">
+                  <p className="text-xs text-muted-foreground">סגנון המסלול</p>
+                  <p className="mt-1 text-base font-semibold">
+                    {ITINERARY_GENERATION_MODE_LABELS[itinerary.generationMode]}
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-border/70 p-3">
+                  <p className="text-xs text-muted-foreground">תקציב יעד</p>
+                  <p className="mt-1 text-base font-semibold">
+                    {itinerary.budget != null ? formatCurrency(itinerary.budget) : "לא הוגדר"}
+                  </p>
+                </div>
               </div>
 
               {itinerary.summary ? (

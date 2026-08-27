@@ -15,7 +15,6 @@ export type ItineraryGenerationMode =
 
 export type TripWorkspaceTab =
   | "overview"
-  | "plan"
   | "itinerary"
   | "map"
   | "recommendations"
@@ -81,6 +80,12 @@ export type FlightBookingStatus = "not_booked" | "booked" | "paid";
  * departureAirport's zone, arrival fields to arrivalAirport's zone. See
  * flight-planning.ts for the timezone-aware arithmetic this enables.
  */
+/** One intermediate stop on a connecting flight (spec items 17-19) — airport + how long the layover is, in the connection airport's own local time. */
+export interface TripFlightConnection {
+  airport: string;
+  layoverMinutes: number;
+}
+
 export interface TripFlightLeg {
   departureAirport: string;
   arrivalAirport: string;
@@ -92,6 +97,33 @@ export interface TripFlightLeg {
   flightNumber: string;
   cost: number | null;
   bookingStatus: FlightBookingStatus;
+  /**
+   * True when the flight isn't booked yet — departureTime holds a
+   * representative time for the chosen period of day (estimatedWindowStart
+   * holds the period key: "morning"|"afternoon"|"evening"|"night"; see
+   * trip-wizard's step-flights.tsx for the exact representative times).
+   * estimatedWindowEnd is unused in this model, kept for JSONB compat.
+   * The date always comes from the trip's own start/end date, never entered
+   * here.
+   */
+  estimated: boolean;
+  estimatedWindowStart: string;
+  estimatedWindowEnd: string;
+  /** Deterministic distance-based estimate (flight-planning.ts) — never asked of the AI. Null until both airports resolve. */
+  estimatedFlightDurationMinutes: number | null;
+  /** True once the user has edited arrivalDate/arrivalTime by hand — the auto-calculation must never overwrite it again until reverted. */
+  arrivalManuallySet: boolean;
+  /**
+   * Empty = direct flight (the default — spec item 22). departureAirport/
+   * arrivalAirport/arrivalDate/arrivalTime above always describe the FINAL
+   * origin/destination and the FINAL calculated arrival regardless of how
+   * many connections exist, so every other consumer of TripFlightLeg
+   * (flight-planning.ts's window/budget logic, the AI prompt) needs zero
+   * changes to stay correct — connections only add displayed detail.
+   */
+  connections: TripFlightConnection[];
+  /** Sum of connections[].layoverMinutes + every segment's own duration — total door-to-door time, distinct from airborne-only time (spec item 38). */
+  totalJourneyMinutes: number | null;
 }
 
 export interface TripFlights {
@@ -111,6 +143,13 @@ export function createEmptyFlightLeg(): TripFlightLeg {
     flightNumber: "",
     cost: null,
     bookingStatus: "not_booked",
+    estimated: false,
+    estimatedWindowStart: "",
+    estimatedWindowEnd: "",
+    estimatedFlightDurationMinutes: null,
+    arrivalManuallySet: false,
+    connections: [],
+    totalJourneyMinutes: null,
   };
 }
 
@@ -132,7 +171,10 @@ export interface TripPreferences {
   interests: string;
   transportationPreferences: string;
   accommodationArea: string;
+  /** Comma-joined hard restrictions (e.g. "צמחוני, כשר") — a real AI hard constraint, distinct from foodNotes/interests (spec item 15). */
   dietaryPreferences: string;
+  /** Free-text food notes (spec item 17) — kept separate from dietaryPreferences so that field stays a clean, parseable restriction list. */
+  foodNotes: string;
   accessibilityNeeds: string;
   preferredRegions: string;
   mustVisitPlaces: string;
@@ -196,6 +238,8 @@ export interface TripItineraryItem {
   shortDescription: string;
   slot: DayPart;
   plannedStartTime: string;
+  /** Real end-of-visit clock time, from itinerary-scheduler.ts — lets the UI show "09:30–11:00" instead of a bare start time (spec item 15). Optional — absent on itineraries generated before this existed. */
+  endTime?: string;
   // Live Trip Mode delay/reorder response (Stage 4) — a temporary, in-day
   // rescheduling estimate distinct from BOTH `plannedStartTime` (the
   // original plan, never overwritten — spec: planned data must never be
@@ -595,9 +639,13 @@ export interface AiItineraryRequest {
   // generation must never depend on personalization succeeding.
   personalizationSummary?: string | null;
   // A fresh client-generated id per generation attempt (not per retry of the
-  // same attempt) — logged server-side so repeated/duplicate POSTs are
-  // distinguishable from genuinely separate user-initiated attempts.
+  // same attempt) — checked server-side so a duplicate POST (double-click,
+  // network retry, or a race) returns the original result instead of
+  // generating a second trip. See findCountryItineraryByClientRequestId.
   clientRequestId?: string;
+  // Optional user-entered trip name from the creation wizard's first step —
+  // wins over the AI-generated title when present.
+  userProvidedTitle?: string;
 }
 
 export interface AiGeneratedItem {
@@ -607,6 +655,8 @@ export interface AiGeneratedItem {
   shortDescription: string;
   slot: DayPart;
   plannedStartTime: string;
+  /** Real end-of-visit clock time, assigned by itinerary-scheduler.ts. Optional — absent on plans generated before the scheduler existed, or wherever an item is built without going through it. */
+  endTime?: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
   priceOriginalAmount: number | null;
@@ -685,7 +735,6 @@ export const TRIP_STATUS_LABELS: Record<TripPhase, string> = {
 
 export const WORKSPACE_TAB_LABELS: Record<TripWorkspaceTab, string> = {
   overview: "סקירה",
-  plan: "תכנון",
   itinerary: "מסלול",
   map: "מפה",
   recommendations: "המלצות",
@@ -796,7 +845,6 @@ export const CHECKLIST_CATEGORY_LABELS: Record<ChecklistCategory, string> = {
 
 export const DEFAULT_TAB_ORDER: TripWorkspaceTab[] = [
   "overview",
-  "plan",
   "itinerary",
   "map",
   "recommendations",
@@ -827,7 +875,6 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
       "itinerary",
       "map",
       "budget",
-      "plan",
       "recommendations",
       "country_summary",
       "practical",
@@ -840,7 +887,6 @@ export function getTabOrderForStatus(status: TripPhase): TripWorkspaceTab[] {
       "overview",
       "country_summary",
       "budget",
-      "plan",
       "recommendations",
       "map",
       "itinerary",
@@ -1035,6 +1081,7 @@ export function createDefaultWorkspace(countryName: string): CountryTripWorkspac
       transportationPreferences: "",
       accommodationArea: "",
       dietaryPreferences: "",
+      foodNotes: "",
       accessibilityNeeds: "",
       preferredRegions: "",
       mustVisitPlaces: "",
@@ -1869,19 +1916,34 @@ function selectFallbackCandidate(args: {
   return ranked[0]?.candidate ?? null;
 }
 
+// Same reasoning as buildFreeExplorationReplacement's phrase rotation
+// (country-itinerary-generation.ts) — a fixed name+area repeated across
+// several days with no id/coordinates to distinguish them would otherwise
+// read as a duplicate place to buildItemKey's fallback tier, failing the
+// whole plan over harmless repeated filler content.
+const FALLBACK_LUNCH_PHRASES = [
+  (area: string) => `אזור אוכל מקומי ב${area}`,
+  (area: string) => `שוק או פינת אוכל ב${area}`,
+  (area: string) => `עצירת צהריים גמישה באזור ${area}`,
+];
+const FALLBACK_DINNER_PHRASES = [
+  (area: string) => `ארוחת ערב באזור ${area}`,
+  (area: string) => `מסעדה מקומית באזור ${area}`,
+  (area: string) => `ארוחת ערב גמישה ליד ${area}`,
+];
+
 function createFallbackMealPlaceholder(
   slot: DayPart,
   dayArea: string,
-  input: AiItineraryRequest
+  input: AiItineraryRequest,
+  dayNumber: number
 ): AiGeneratedItem {
-  const name =
-    slot === "lunch"
-      ? dayArea
-        ? `אזור אוכל מקומי ב${dayArea}`
-        : "שוק או אזור אוכל מקומי"
-      : dayArea
-        ? `ארוחת ערב באזור ${dayArea}`
-        : "אזור אוכל מומלץ לערב";
+  const phrases = slot === "lunch" ? FALLBACK_LUNCH_PHRASES : FALLBACK_DINNER_PHRASES;
+  const name = dayArea
+    ? phrases[dayNumber % phrases.length](dayArea)
+    : slot === "lunch"
+      ? "שוק או אזור אוכל מקומי"
+      : "אזור אוכל מומלץ לערב";
 
   return {
     name,
@@ -2063,7 +2125,7 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
 
       if (!next) {
         if (slot === "lunch" || slot === "dinner") {
-          items.push(createFallbackMealPlaceholder(slot, preferredArea, input));
+          items.push(createFallbackMealPlaceholder(slot, preferredArea, input, dayNumber));
         }
         continue;
       }
@@ -2342,6 +2404,7 @@ export function applyAiPlanToWorkspace(
         shortDescription: item.shortDescription,
         slot: item.slot,
         plannedStartTime: item.plannedStartTime,
+        endTime: item.endTime,
         estimatedDurationMinutes: item.estimatedDurationMinutes,
         approximatePrice: item.approximatePrice,
         priceOriginalAmount: item.priceOriginalAmount,

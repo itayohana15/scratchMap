@@ -1,6 +1,13 @@
 import { differenceInCalendarDays, format, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
+function formatPartialMonthYear(partialDate: string | null | undefined) {
+  if (!partialDate) return null;
+  const [year, month] = partialDate.split("-").map(Number);
+  if (!year || !month) return null;
+  return format(new Date(year, month - 1, 1), "MMMM yyyy", { locale: he });
+}
+
 export function formatDate(value: string | null | undefined, pattern = "d בMMM yyyy") {
   if (!value) return null;
   return format(parseISO(value), pattern, { locale: he });
@@ -30,12 +37,8 @@ export function formatTripDateRange(
   partialDate?: string | null
 ) {
   if (!start && !end) {
-    if (partialDate) {
-      const [year, month] = partialDate.split("-").map(Number);
-      if (year && month) {
-        return format(new Date(year, month - 1, 1), "MMMM yyyy", { locale: he });
-      }
-    }
+    const partialMonthYear = formatPartialMonthYear(partialDate);
+    if (partialMonthYear) return partialMonthYear;
     return "ללא תאריכים";
   }
 
@@ -69,6 +72,43 @@ export function formatTripDateRange(
   return `${startDay}-${endDay} ב${monthName} ${startYear}`;
 }
 
+export function formatTripDateRangeExpanded(
+  start: string | null | undefined,
+  end: string | null | undefined,
+  partialDate?: string | null
+) {
+  if (!start && !end) {
+    return formatPartialMonthYear(partialDate) ?? "ללא תאריכים";
+  }
+
+  if (!start || !end) {
+    return formatDate(start ?? end) ?? "ללא תאריכים";
+  }
+
+  const startDate = parseISO(start);
+  const endDate = parseISO(end);
+  const startDay = startDate.getDate();
+  const endDay = endDate.getDate();
+  const startMonth = startDate.getMonth();
+  const endMonth = endDate.getMonth();
+  const startYear = startDate.getFullYear();
+  const endYear = endDate.getFullYear();
+
+  if (startYear !== endYear) {
+    return `${format(startDate, "d בMMM yyyy", { locale: he })} - ${format(endDate, "d בMMM yyyy", { locale: he })}`;
+  }
+
+  if (startMonth !== endMonth) {
+    return `${format(startDate, "d בMMM", { locale: he })} - ${format(endDate, "d בMMM yyyy", { locale: he })}`;
+  }
+
+  const monthName = format(startDate, "MMM", { locale: he });
+  if (startDay === endDay) {
+    return `${startDay} ב${monthName} ${startYear}`;
+  }
+  return `${startDay}-${endDay} ב${monthName} ${startYear}`;
+}
+
 export function formatCurrency(value: number | null | undefined, currency = "ILS") {
   if (value == null) return "—";
   return new Intl.NumberFormat("he-IL", {
@@ -86,4 +126,15 @@ export function tripDurationDays(start: string | null | undefined, end: string |
 export function formatRating(value: number | null | undefined) {
   if (value == null) return "—";
   return value.toFixed(1);
+}
+
+/** Elapsed duration display (spec item 23) — MM:SS under an hour, HH:MM:SS from an hour on. Never negative. */
+export function formatElapsedDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (value: number) => String(value).padStart(2, "0");
+
+  return hours > 0 ? `${pad(hours)}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
 }

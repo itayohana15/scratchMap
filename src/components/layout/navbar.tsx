@@ -11,11 +11,7 @@ import { cn } from "@/lib/utils";
 
 export function Navbar() {
   const pathname = usePathname() ?? "";
-  const hideNavbar = /^\/countries\/[^/]+$/.test(pathname) || /^\/trips\/[^/]+$/.test(pathname);
-
-  if (hideNavbar) {
-    return null;
-  }
+  const isSettingsPage = pathname.startsWith("/settings");
 
   return (
     <header className="sticky top-0 z-40 border-b border-white/10 bg-background/70 backdrop-blur-xl">
@@ -47,16 +43,19 @@ export function Navbar() {
             })}
           </nav>
         </div>
-        <Button
-          variant="ghost"
-          size="icon-lg"
-          aria-label="הגדרות"
-          nativeButton={false}
-          className={cn(pathname.startsWith("/settings") && "bg-primary/10 text-primary")}
-          render={<Link href="/settings" />}
-        >
-          <Settings className="size-5" />
-        </Button>
+        {!isSettingsPage ? (
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="הגדרות"
+            nativeButton={false}
+            className="gap-2"
+            render={<Link href="/settings" />}
+          >
+            <Settings className="size-5" />
+            הגדרות
+          </Button>
+        ) : null}
       </div>
     </header>
   );

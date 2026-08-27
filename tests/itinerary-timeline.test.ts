@@ -34,6 +34,7 @@ const basePreferences: TripPreferences = {
   transportationPreferences: "public transport",
   accommodationArea: "Tokyo Station",
   dietaryPreferences: "",
+  foodNotes: "",
   accessibilityNeeds: "",
   preferredRegions: "Tokyo",
   mustVisitPlaces: "",
