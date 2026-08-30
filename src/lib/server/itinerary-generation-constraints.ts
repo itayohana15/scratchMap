@@ -7,15 +7,34 @@ import type {
   TripPreferences,
   TripRecommendation,
 } from "../trip-workspace";
-import { estimateTravelMinutes, haversineKm } from "../trip-workspace";
-import { violatesArrivalDepartureWindow, type ArrivalDepartureWindow } from "../flight-planning";
+import {
+  estimateTravelMinutes,
+  haversineKm,
+  isFuzzyDuplicatePlace,
+  normalizePlaceNameSlug,
+  type FuzzyPlaceRecord,
+} from "../trip-workspace";
+import {
+  violatesArrivalDepartureWindow,
+  detectInvalidFlightLegs,
+  detectAirportBaseMismatch,
+  type ArrivalDepartureWindow,
+  type InvalidFlightLegDiagnostic,
+  type AirportBaseMismatchDiagnostic,
+} from "../flight-planning";
+import type { TripFlights } from "@/lib/trip-workspace";
+import { violatesOpeningHours } from "./opening-hours";
+import { findFixedTimeConflicts, type FixedTimeConflict } from "./itinerary-scheduler";
+import { isImplausiblyFastTravelTime, resolveTransportModeFromLabel } from "../transport-mode";
 import {
   ACTIVITY_MIX_TARGETS,
   classifyActivityTier,
   classifyItemEnergy,
   classifyVisitScale,
+  classifyWeatherSensitivity,
   findFramePhaseForDay,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
+  resolveItemEffectiveEndTime,
   resolveVisitDurationMinutes,
   type ActivityTier,
   type EnergyLevel,
@@ -38,6 +57,8 @@ export interface BudgetAllocation {
   food: number;
   transportation: number;
   attractions: number;
+  /** Spec item 22 — its own line rather than folded into attractions (spec item 53's shopping/souvenir time still needs a real budget share). */
+  shopping: number;
   buffer: number;
 }
 
@@ -103,6 +124,16 @@ export interface PlanDiagnostics {
    */
   arrivalDepartureWindowViolations: number;
   /**
+   * Thread 1 (locked/fixed-time hard requirement), item 7: two fixed-time
+   * items on the same day whose own times (plus real travel between them)
+   * genuinely cannot both be honored — a legitimate hard failure, never
+   * silently resolved by moving either one. Each entry names the day it
+   * happened on (dayId here is the day's dayNumber — AiGeneratedDay has no
+   * other stable id at generation time) plus both activities, their fixed
+   * times, and the travel time that was required.
+   */
+  fixedTimeConflicts: Array<FixedTimeConflict & { dayId: number }>;
+  /**
    * Two items on the same day whose visit-scale-derived windows overlap in
    * wall-clock time (spec item 58's "three activities at 12:30" symptom) —
    * a hard gate. Computed from plannedStartTime + a resolved duration, so it
@@ -110,6 +141,79 @@ export interface PlanDiagnostics {
    * real endTime.
    */
   timeOverlaps: number;
+  /**
+   * Items scheduled outside their own parsed opening-hours window (or past
+   * a distinct lastEntryTime) — spec items 16/17/84/85. A hard gate, only
+   * ever counts items whose opening hours AND start time both parsed with
+   * confidence (see violatesOpeningHours) — never a false positive from
+   * ambiguous source text.
+   */
+  openingHoursViolations: number;
+  /** A day with more than the two normal dedicated food stops (spec item 37). */
+  excessFoodStopsDays: number;
+  /** Consecutive food stops closer together than the spec's minimum spacing (item 39). */
+  mealSpacingViolations: number;
+  /** The same restaurant/cafe name appearing more than once across the whole trip (spec item 42). */
+  duplicateRestaurants: number;
+  /**
+   * A flight leg whose origin and destination airport are identical (spec
+   * §A2) — always a real data problem (an accidental default surviving two
+   * dropdowns), never a legitimate flight. A hard gate.
+   */
+  invalidFlightLegs: number;
+  /** Structured detail behind invalidFlightLegs, for debugging/logging — never itself a gate. */
+  invalidFlightLegDetails: InvalidFlightLegDiagnostic[];
+  /**
+   * The arrival or departure airport is real-distance-implausibly far from
+   * that day's own dominant activity coordinates — meaningfully more ground
+   * travel than the fixed buffer the arrival/departure window already
+   * assumes (spec §A3-A5). A hard gate: this is "physically impossible
+   * flight/base transition" territory, not a soft preference.
+   */
+  airportBaseMismatches: number;
+  /** Structured detail behind airportBaseMismatches, for debugging/logging. */
+  airportBaseMismatchDetails: AirportBaseMismatchDiagnostic[];
+  /**
+   * A locked/fixed-time item that sits in a geographically incompatible
+   * cluster on its day and could not be resolved by the geographic repair
+   * cascade (move/replace/remove all skip protected items by design — spec
+   * §B5). Surfaced for visibility only; never silently drops or moves
+   * protected content, so this stays a soft/advisory count, not a gate.
+   */
+  protectedGeographicConflicts: number;
+  /** Structured detail behind protectedGeographicConflicts. */
+  protectedGeographicConflictDetails: ProtectedGeographicConflict[];
+  /**
+   * A stay transition (spec §C) whose own estimated travel time alone
+   * already exceeds the day's realistic capacity — a genuinely impossible
+   * base change, not a scheduling inconvenience. A hard gate. No separate
+   * stayContinuityViolation exists: overnight continuity is already
+   * enforced per-day by baseMismatchDays (every day's own base must match
+   * its TripFrame phase), so a second diagnostic for the same invariant
+   * would be redundant (spec's own "avoid redundant diagnostics" rule).
+   */
+  impossibleStayTransitions: number;
+  /** Structured detail behind impossibleStayTransitions. */
+  impossibleStayTransitionDetails: ImpossibleStayTransition[];
+}
+
+/** One stay transition the repair pass found could not be made to fit, even after trimming optional content around it (spec §D/§E5). */
+export interface ImpossibleStayTransition {
+  fromStay: string;
+  toStay: string;
+  dayNumber: number;
+  requiredTravelMinutes: number;
+  availableMinutes: number;
+  reason: string;
+}
+
+/** One protected (locked/fixedTime) item the geographic repair cascade found in genuine conflict but correctly refused to touch (spec §B5). */
+export interface ProtectedGeographicConflict {
+  dayNumber: number;
+  itemName: string;
+  lat: number | null;
+  lon: number | null;
+  reason: string;
 }
 
 export interface RouteProximityScore {
@@ -167,6 +271,8 @@ export interface DayIntensitySummary {
   walkingKm: number;
   travelMinutes: number;
   activeMinutes: number;
+  /** Real gap time within the day's own active span — activeMinutes minus scheduled activity durations and travel (spec item 95). */
+  freeMinutes: number;
 }
 
 interface DayIntensityItemInput {
@@ -198,7 +304,7 @@ function parseTimeToMinutes(value: string): number | null {
  */
 export function computeDayIntensity(items: DayIntensityItemInput[]): DayIntensitySummary {
   if (items.length === 0) {
-    return { level: "קל", activityCount: 0, walkingKm: 0, travelMinutes: 0, activeMinutes: 0 };
+    return { level: "קל", activityCount: 0, walkingKm: 0, travelMinutes: 0, activeMinutes: 0, freeMinutes: 0 };
   }
 
   const activityCount = items.filter(
@@ -235,12 +341,23 @@ export function computeDayIntensity(items: DayIntensityItemInput[]): DayIntensit
 
   const level: DayIntensityLevel = score <= 1 ? "קל" : score <= 2 ? "בינוני" : "עמוס";
 
+  // Real gap time within the day's own active span (spec item 95) — the
+  // span already includes any slack between back-to-back items, so
+  // subtracting out what was actually scheduled (durations + travel)
+  // leaves the genuine free time, not a guess.
+  const scheduledMinutes = items.reduce(
+    (sum, item) => (item.category === "transportation" ? sum : sum + (item.estimatedDurationMinutes ?? 60)),
+    0
+  );
+  const freeMinutes = Math.max(0, Math.round(activeMinutes - scheduledMinutes - travelMinutes));
+
   return {
     level,
     activityCount,
     walkingKm: Math.round(walkingKm * 10) / 10,
     travelMinutes,
     activeMinutes,
+    freeMinutes,
   };
 }
 
@@ -296,8 +413,24 @@ const LOCATION_STOP_WORDS = new Set([
   "מרכז",
 ]);
 
+// Section I/J root cause (a real Georgia QA run): a day whose transportation
+// text read "נסיעה ברכב פרטי עם עצירות בדרך" (private-car drive with stops
+// along the way) — genuine, legitimate transfer/road-trip phrasing, real
+// waypoints along an actual intercity route — matched none of the existing
+// keywords, so it was scored as an ordinary day and its real (if
+// coordinate-less, in this candidate-starved sandbox) travel time wrongly
+// tripped longTravelDays. "stops along the way"/"עצירות בדרך" is added as a
+// generic phrase, not tied to any place name.
+// Section I/J root cause (a real Georgia QA run): a day whose transportation
+// text read "נסיעה ברכב פרטי עם עצירות בדרך" (private-car drive with stops
+// along the way) — genuine, legitimate transfer/road-trip phrasing, real
+// waypoints along an actual intercity route — matched none of the existing
+// keywords, so it was scored as an ordinary day and its real (if
+// coordinate-less, in this candidate-starved sandbox) travel time wrongly
+// tripped longTravelDays. "stops along the way"/"עצירות בדרך" is added as a
+// generic phrase, not tied to any place name.
 const TRANSFER_DAY_PATTERN =
-  /intercity|transfer|relocation|checkout|check-out|check in|check-in|airport|flight|bullet train|shinkansen|long-distance|ferry crossing|move to next city|מעבר|רכבת מהירה|רכבת בין-עירונית|שינקנסן|טיסה|צ'ק-אאוט|צ'ק אאוט|צ'ק-אין|צ'ק אין|שדה תעופה|מעבורת בין-עירונית|עוברים ליעד הבא|לינה חדשה/i;
+  /intercity|transfer|relocation|checkout|check-out|check in|check-in|airport|flight|bullet train|shinkansen|long-distance|ferry crossing|move to next city|road trip|stops? along the way|scenic drive|מעבר|רכבת מהירה|רכבת בין-עירונית|שינקנסן|טיסה|צ'ק-אאוט|צ'ק אאוט|צ'ק-אין|צ'ק אין|שדה תעופה|מעבורת בין-עירונית|עוברים ליעד הבא|לינה חדשה|עצירות בדרך|עצירה בדרך|נסיעה ארוכה בין ערים/i;
 
 // A day trip keeps the traveler's overnight base unchanged but visits a
 // genuinely different area for the day (spec item 13) — e.g. a Tbilisi-based
@@ -311,9 +444,45 @@ const TRANSFER_DAY_PATTERN =
 const DAY_TRIP_PATTERN =
   /day trip|day-trip|excursion|half-day trip|round trip to|round-trip to|טיול יום|יום טיול|נסיעת יום|יציאה ליום|סיור יום/i;
 
-export function isDayTripDay(day: Pick<AiGeneratedDay, "title" | "notes" | "transportation" | "transportSegments">) {
+/** A real one-way hop over this long from the day's own base makes it a day trip structurally (spec item 48). */
+const DAY_TRIP_REAL_DISTANCE_MINUTES = 60;
+/** How close the day's first and last anchor must be to count as "the same base" (spec item 7: day-trip start/end = same hotel). */
+const DAY_TRIP_BASE_RADIUS_KM = 5;
+
+/**
+ * Text-pattern wording is checked first; failing that, a genuine
+ * round-trip STRUCTURE also counts (spec items 7/48) — but distance alone
+ * is deliberately NOT sufficient. An earlier attempt that flagged any day
+ * with a >60-minute hop between two anchors, regardless of structure,
+ * falsely legitimized a same-day Tokyo+Osaka mix (a genuine AI geography
+ * error, never returning to Tokyo) as a "day trip" purely because the
+ * cities are far apart — that broke the cross-city hard constraint below.
+ * Requiring the first AND last anchor to both sit near the same base,
+ * with only a middle anchor genuinely far away, is what actually
+ * distinguishes a well-structured day trip from a chaotic geographic
+ * error — a chain that never returns (like Tokyo→Osaka) still correctly
+ * falls through to the cross-city check.
+ */
+export function isDayTripDay(
+  day: Pick<AiGeneratedDay, "title" | "notes" | "transportation" | "transportSegments" | "items">
+) {
   if (isIntercityTransferDay(day)) return false;
-  return DAY_TRIP_PATTERN.test(`${day.title} ${day.notes} ${day.transportation}`);
+  if (DAY_TRIP_PATTERN.test(`${day.title} ${day.notes} ${day.transportation}`)) return true;
+
+  const anchors = sortItemsBySchedule(
+    day.items.filter((item) => isAnchorCategory(item.category) && hasCoordinates(item))
+  );
+  if (anchors.length < 3) return false;
+
+  const first = anchors[0];
+  const last = anchors[anchors.length - 1];
+  const returnsToBase = haversineKm(first.lat, first.lon, last.lat, last.lon) <= DAY_TRIP_BASE_RADIUS_KM;
+  if (!returnsToBase) return false;
+
+  return anchors.slice(1, -1).some((middle) => {
+    const oneWayMinutes = estimateTravelMinutes(first.lat, first.lon, middle.lat, middle.lon, "balanced", "");
+    return oneWayMinutes > DAY_TRIP_REAL_DISTANCE_MINUTES;
+  });
 }
 
 /**
@@ -329,7 +498,26 @@ export function countDayTimeOverlaps(day: Pick<AiGeneratedDay, "items">): number
     .map((item) => {
       const start = parseTimeToMinutes(item.plannedStartTime);
       if (start == null) return null;
-      const duration = resolveVisitDurationMinutes(item, classifyVisitScale(item));
+      // Prefer the real scheduled end time when the item has already been
+      // through the scheduler — recomputing from resolveVisitDurationMinutes
+      // is only a stand-in for raw AI output that hasn't been scheduled yet.
+      const scheduledEnd = parseTimeToMinutes(item.endTime ?? "");
+      if (scheduledEnd != null && scheduledEnd > start) {
+        return { start, end: scheduledEnd };
+      }
+      // Same "practical" filler exclusion as calculateDayLoadMinutes and
+      // itinerary-scheduler.ts's isFillerItem branch — a free-time block's
+      // own deliberately-large duration (it fills whatever window is left,
+      // often hours) must never be run back through
+      // resolveVisitDurationMinutes/classifyVisitScale, which is built for
+      // real attractions. Root cause of a real France regression's phantom
+      // timeOverlaps: 1 — the filler's recomputed "attraction-scale"
+      // duration overshot its actual scheduled end, falsely overlapping the
+      // next item even though nothing about the real timeline collided.
+      const duration =
+        item.category === "practical"
+          ? Math.max(item.estimatedDurationMinutes ?? 30, 5)
+          : resolveVisitDurationMinutes(item, classifyVisitScale(item));
       return { start, end: start + Math.max(duration, 1) };
     })
     .filter((entry): entry is { start: number; end: number } => entry != null)
@@ -342,8 +530,90 @@ export function countDayTimeOverlaps(day: Pick<AiGeneratedDay, "items">): number
   return overlaps;
 }
 
+const MEAL_MINIMUM_GAP_MINUTES = 30;
+// Same typical clock ranges as slotForClockTime's lunch/dinner buckets
+// (country-itinerary-generation.ts) — a meal outside its usual hours isn't
+// really "that meal" even if the day happens to have a free block there.
+export const LUNCH_WINDOW_MINUTES: [number, number] = [11 * 60, 15 * 60];
+export const DINNER_WINDOW_MINUTES: [number, number] = [18 * 60, 20 * 60];
+
+/**
+ * Is there genuinely enough slack left in an arrival/departure day's real
+ * window to fit this meal (lunch or dinner, by its usual clock range),
+ * given what's already scheduled that day? Used by missingMeals (see
+ * collectPlanDiagnostics) to decide whether a missing lunch/dinner on day
+ * 1 or the last day is a real gap or an unavoidable consequence of the
+ * flight schedule.
+ *
+ * Deliberately checks the day's OWN remaining slack rather than trusting a
+ * single fixed reference clock time in isolation — a real bug found
+ * during end-to-end QA generation: a fixed "12:30 is fine" reference said
+ * lunch was feasible in principle, but the day's OTHER activities pushed
+ * the meal's actual scheduled time past the real departure cutoff, so
+ * repair's own enforceArrivalDepartureWindow kept stripping it right back
+ * out on every pass and missingMeals could never converge, even though
+ * the validator thought the meal was fine.
+ */
+export function hasUsableGapForMeal(
+  day: AiGeneratedDay,
+  mealWindow: [number, number],
+  isArrivalDay: boolean,
+  isDepartureDay: boolean,
+  window: ArrivalDepartureWindow | null | undefined
+): boolean {
+  if (!window || (!isArrivalDay && !isDepartureDay)) return true;
+
+  const otherItems = day.items.filter(
+    (item) => !NON_ACTIVITY_CATEGORIES.has(item.category) && !isFoodCategory(item.category)
+  );
+  const [mealEarliest, mealLatest] = mealWindow;
+
+  if (isDepartureDay && window.latestUsableTimeOnDepartureDay) {
+    const { date, time } = window.latestUsableTimeOnDepartureDay;
+    if (date < day.date) return false;
+    if (date === day.date) {
+      const cutoffMinutes = parseTimeToMinutes(time);
+      if (cutoffMinutes != null) {
+        if (cutoffMinutes <= mealEarliest) return false;
+        const lastEndMinutes = otherItems.reduce((max, item) => {
+          const end =
+            (item.endTime ? parseTimeToMinutes(item.endTime) : null) ??
+            (parseTimeToMinutes(item.plannedStartTime) ?? 0) + (item.estimatedDurationMinutes ?? 0);
+          return Math.max(max, end);
+        }, 0);
+        const gapStart = Math.max(lastEndMinutes, mealEarliest);
+        const gapEnd = Math.min(cutoffMinutes, mealLatest);
+        if (gapEnd - gapStart < MEAL_MINIMUM_GAP_MINUTES) return false;
+      }
+    }
+  }
+
+  if (isArrivalDay && window.earliestUsableTimeOnArrivalDay) {
+    const { date, time } = window.earliestUsableTimeOnArrivalDay;
+    if (date > day.date) return false;
+    if (date === day.date) {
+      const earliestMinutes = parseTimeToMinutes(time);
+      if (earliestMinutes != null) {
+        if (earliestMinutes >= mealLatest) return false;
+        const firstStartMinutes = otherItems.reduce(
+          (min, item) => Math.min(min, parseTimeToMinutes(item.plannedStartTime) ?? min),
+          24 * 60
+        );
+        const gapStart = Math.max(earliestMinutes, mealEarliest);
+        const gapEnd = Math.min(firstStartMinutes, mealLatest);
+        if (gapEnd - gapStart < MEAL_MINIMUM_GAP_MINUTES) return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 export const IDEAL_LOCAL_TRAVEL_MINUTES = 15;
 export const MAX_LOCAL_TRAVEL_MINUTES = 25;
+/** Food-specific hard caps from the last place before the meal — tighter than the general MAX_LOCAL_TRAVEL_MINUTES, and mode-aware (a restaurant reached on foot must be much closer than one reached by transit/car/taxi). */
+export const MEAL_MAX_WALKING_MINUTES = 20;
+export const MEAL_MAX_TRAVEL_MINUTES = 45;
 export const TARGET_NORMAL_DAY_TRAVEL_MINUTES = 90;
 export const MAX_NORMAL_DAY_TRAVEL_MINUTES = 120;
 export const DISTANT_CITY_DISTANCE_KM = 80;
@@ -377,7 +647,16 @@ function isFoodCategory(category: RecommendationCategory) {
 }
 
 function isAnchorCategory(category: RecommendationCategory) {
-  return !isFoodCategory(category) && category !== "transportation" && category !== "hotel";
+  // Real bug found during end-to-end QA generation: this was a separate,
+  // drifted-apart copy of the same "is this a real anchor" check as
+  // country-itinerary-generation.ts's isAnchorDayItem, missing the same
+  // "practical" exclusion (NON_ACTIVITY_CATEGORIES, defined further below
+  // in this file, already treats "practical" as a non-activity category
+  // everywhere else). A "practical" item is a free-time/logistics filler,
+  // never a genuine anchor — left in, it could make missingAnchorDays too
+  // lenient (a day with only a filler item reads as "has an anchor") and
+  // skew foodDominant's anchor count.
+  return !isFoodCategory(category) && !NON_ACTIVITY_CATEGORIES.has(category);
 }
 
 function inferPaceFromProfile(profile: TripPreferenceProfile): TripPreferences["tripPace"] {
@@ -691,22 +970,35 @@ export function analyzeDayGeography(
     const current = orderedItems[index];
     const normalizedPrevious = normalizeCoordinatePair(previous.lat, previous.lon);
     const normalizedCurrent = normalizeCoordinatePair(current.lat, current.lon);
-    const segmentMinutes =
-      current.travelMinutes ??
-      estimateTravelMinutes(
-        normalizedPrevious.lat,
-        normalizedPrevious.lon,
-        normalizedCurrent.lat,
-        normalizedCurrent.lon,
-        pace,
-        current.transportation || day.transportation || "תחבורה מקומית"
-      );
+    const transportationLabel = current.transportation || day.transportation || "תחבורה מקומית";
     const distanceKm = haversineKm(
       normalizedPrevious.lat,
       normalizedPrevious.lon,
       normalizedCurrent.lat,
       normalizedCurrent.lon
     );
+    const estimatedMinutes = estimateTravelMinutes(
+      normalizedPrevious.lat,
+      normalizedPrevious.lon,
+      normalizedCurrent.lat,
+      normalizedCurrent.lon,
+      pace,
+      transportationLabel
+    );
+    // An AI-stated travelMinutes is trusted only when it's realistically
+    // achievable by whatever mode this hop is actually assigned to (spec
+    // test 83 — "do not display ~20 minutes if [the] selected mode cannot
+    // achieve it"); an implausibly fast claim falls back to the real
+    // distance-based estimate instead of being displayed verbatim.
+    const segmentMinutes =
+      current.travelMinutes != null &&
+      !isImplausiblyFastTravelTime(
+        distanceKm,
+        current.travelMinutes,
+        resolveTransportModeFromLabel(transportationLabel, distanceKm)
+      )
+        ? current.travelMinutes
+        : estimatedMinutes;
 
     totalTravelMinutes += segmentMinutes ?? 0;
 
@@ -760,7 +1052,10 @@ export function analyzeDayGeography(
     const closestAnchor = findClosestAnchor(meal, anchorCandidates, profile);
     if (!closestAnchor) continue;
 
-    if (closestAnchor.travelMinutes > MAX_LOCAL_TRAVEL_MINUTES) {
+    // findClosestAnchor always estimates on foot, so the walking-specific
+    // cap applies here, not the general MAX_LOCAL_TRAVEL_MINUTES (spec: a
+    // restaurant reached on foot must be within ~20 minutes, not 25).
+    if (closestAnchor.travelMinutes > MEAL_MAX_WALKING_MINUTES) {
       longMealDetours.push({
         fromName: closestAnchor.anchor.name,
         toName: meal.name,
@@ -795,6 +1090,78 @@ export function analyzeDayGeography(
   };
 }
 
+/**
+ * "למה היום מסודר כך" (spec item 96) — a short, content-derived sentence
+ * built only from signals already computed by analyzeDayGeography, never
+ * invented flavor text unrelated to the actual day.
+ */
+export function buildDayExplanation(
+  day: Pick<AiGeneratedDay, "items">,
+  geography: DayGeographyDiagnostics
+): string {
+  const parts: string[] = [];
+
+  if (geography.isTransferDay) {
+    parts.push("היום הוא יום מעבר בין בסיסים, ולכן מרבית הזמן מוקדש לנסיעה עצמה.");
+  } else if (geography.longTravelSegments.length === 0 && geography.crossCityItems.length === 0 && geography.clusterLabel) {
+    parts.push(`היום מרוכז באזור ${geography.clusterLabel} כדי לצמצם נסיעות מיותרות בין העצירות.`);
+  }
+
+  const hasEveningOutdoorActivity = day.items.some(
+    (item) =>
+      (item.slot === "evening" || item.slot === "night") &&
+      classifyWeatherSensitivity(item) === "outdoor"
+  );
+  if (hasEveningOutdoorActivity) {
+    parts.push("הפעילות החיצונית שובצה לקראת הערב כדי לתפוס אור ואווירה נעימה.");
+  }
+
+  if (parts.length === 0) {
+    parts.push("היום נבנה סביב האטרקציות המרכזיות שנבחרו למסלול.");
+  }
+
+  return parts.join(" ");
+}
+
+export interface RouteHealthIndicator {
+  label: string;
+  ok: true;
+}
+
+/**
+ * Small set of POSITIVE-only indicators (spec item 97 — "do not
+ * overwhelm... show small internal-friendly indicators", never a wall of
+ * warnings). Only genuinely-true signals are returned; anything wrong is
+ * already surfaced elsewhere (day.warnings, the validation engine) rather
+ * than duplicated here as a loud red flag. Any signal the caller doesn't
+ * actually know (omitted) simply produces no indicator for it, rather than
+ * guessing "ok".
+ */
+export function buildRouteHealthIndicators(input: {
+  longTravelSegments: number;
+  crossCityItems: number;
+  mealSpacingViolations?: number;
+  timeOverlaps?: number;
+  hotelAverageTravelMinutes?: number | null;
+}): RouteHealthIndicator[] {
+  const indicators: RouteHealthIndicator[] = [];
+
+  if (input.longTravelSegments === 0 && input.crossCityItems === 0) {
+    indicators.push({ label: "מסלול יעיל", ok: true });
+  }
+  if (input.mealSpacingViolations === 0) {
+    indicators.push({ label: "מרווח ארוחות תקין", ok: true });
+  }
+  if (input.timeOverlaps === 0) {
+    indicators.push({ label: "אין התנגשויות", ok: true });
+  }
+  if (input.hotelAverageTravelMinutes != null && input.hotelAverageTravelMinutes <= IDEAL_LOCAL_TRAVEL_MINUTES) {
+    indicators.push({ label: "לינה ממוקמת היטב", ok: true });
+  }
+
+  return indicators;
+}
+
 function isAvoidedByProfile(
   item: Pick<AiGeneratedItem, "name" | "location" | "shortDescription">,
   profile: TripPreferenceProfile
@@ -814,7 +1181,8 @@ export function buildBudgetAllocation(
     accommodation: 0.35,
     food: 0.2,
     transportation: 0.2,
-    attractions: 0.15,
+    attractions: 0.1,
+    shopping: 0.05,
     buffer: 0.1,
   };
 
@@ -822,19 +1190,22 @@ export function buildBudgetAllocation(
     allocation.accommodation = 0.32;
     allocation.food = 0.18;
     allocation.transportation = 0.18;
-    allocation.attractions = 0.12;
+    allocation.attractions = 0.08;
+    allocation.shopping = 0.04;
     allocation.buffer = 0.2;
   } else if (preferences.generationMode === "fastest") {
     allocation.transportation = 0.25;
     allocation.accommodation = 0.33;
     allocation.food = 0.18;
-    allocation.attractions = 0.14;
+    allocation.attractions = 0.09;
+    allocation.shopping = 0.05;
     allocation.buffer = 0.1;
   } else if (preferences.generationMode === "relaxed") {
     allocation.accommodation = 0.38;
     allocation.food = 0.2;
     allocation.transportation = 0.16;
-    allocation.attractions = 0.14;
+    allocation.attractions = 0.09;
+    allocation.shopping = 0.05;
     allocation.buffer = 0.12;
   }
 
@@ -854,6 +1225,11 @@ export function buildBudgetAllocation(
     allocation.attractions -= 0.02;
     allocation.buffer -= 0.02;
   }
+  if (includesAnyKeyword(interests, ["shopping", "market", "mall", "קניות", "שוק", "קניון"])) {
+    allocation.shopping += 0.03;
+    allocation.attractions -= 0.02;
+    allocation.buffer -= 0.01;
+  }
 
   if (dayCount >= 14) {
     allocation.buffer = Math.max(allocation.buffer, 0.12);
@@ -864,6 +1240,7 @@ export function buildBudgetAllocation(
     allocation.food +
     allocation.transportation +
     allocation.attractions +
+    allocation.shopping +
     allocation.buffer;
 
   return {
@@ -871,6 +1248,7 @@ export function buildBudgetAllocation(
     food: allocation.food / total,
     transportation: allocation.transportation / total,
     attractions: allocation.attractions / total,
+    shopping: allocation.shopping / total,
     buffer: allocation.buffer / total,
   };
 }
@@ -1056,7 +1434,7 @@ export function summarizeItemCosts(
   const categoryBreakdown = new Map<string, number>();
 
   for (const day of days) {
-    const derived = { accommodation: 0, food: 0, attractions: 0, transportation: 0 };
+    const derived = { accommodation: 0, food: 0, attractions: 0, transportation: 0, shopping: 0 };
     for (const item of day.items) {
       const price = item.approximatePrice ?? 0;
       if (item.category === "restaurant" || item.category === "cafe") {
@@ -1065,19 +1443,33 @@ export function summarizeItemCosts(
         derived.accommodation += price;
       } else if (item.category === "transportation") {
         derived.transportation += price;
+      } else if (item.category === "shopping") {
+        derived.shopping += price;
       } else {
         derived.attractions += price;
       }
     }
 
+    // day.activityCost (when present) is a pre-existing day-level total
+    // that already includes shopping items' own contribution — spec item
+    // 22 wants shopping broken out as its own line, so its share is
+    // subtracted back out here rather than double-counted, without
+    // needing a new day-level field of its own.
     const groups = {
       accommodation: day.accommodationCost ?? (derived.accommodation > 0 ? derived.accommodation : 0),
       food: day.foodCost ?? (derived.food > 0 ? derived.food : 0),
-      attractions: day.activityCost ?? (derived.attractions > 0 ? derived.attractions : 0),
+      attractions:
+        day.activityCost != null
+          ? Math.max(0, day.activityCost - derived.shopping)
+          : derived.attractions > 0
+            ? derived.attractions
+            : 0,
       transportation: day.transportCost ?? (derived.transportation > 0 ? derived.transportation : 0),
+      shopping: derived.shopping,
     };
 
-    const explicitTotal = groups.accommodation + groups.food + groups.attractions + groups.transportation;
+    const explicitTotal =
+      groups.accommodation + groups.food + groups.attractions + groups.transportation + groups.shopping;
     const dayBase = day.estimatedCost ?? explicitTotal;
 
     if (dayBase > explicitTotal && explicitTotal === 0) {
@@ -1139,6 +1531,20 @@ export function normalizeActionableMessages(messages: string[]) {
 
 export function calculateDayLoadMinutes(day: Pick<AiGeneratedDay, "items" | "restWindow">) {
   const itemMinutes = day.items.reduce((sum, item) => {
+    // Real root cause found while tracing overloadedDays in live QA: a
+    // "practical" item (buildFreeTimeItem, the arrival/departure logistics
+    // block, ...) is deliberately given a duration equal to whatever
+    // leftover window it fills — often several hours — representing
+    // UNSTRUCTURED, low-demand time, the opposite of real planned load.
+    // Counting it here meant a day with a few real, entirely reasonable
+    // activities plus a generous free-time block could get flagged as
+    // "overloaded" purely because the filler's own size was added on top
+    // — and fixOverloadedDays would then remove the filler to bring the
+    // (miscounted) total back down, only for the next resequencing pass
+    // to immediately add a fresh one back (scheduleDayItems always
+    // appends one for a genuinely large leftover window), repeating
+    // every attempt without ever actually resolving anything.
+    if (item.category === "practical") return sum;
     const duration = item.estimatedDurationMinutes ?? 90;
     const travel = item.travelMinutes ?? 0;
     const mealBuffer = item.slot === "lunch" || item.slot === "dinner" ? 15 : 0;
@@ -1164,41 +1570,13 @@ function buildPlaceKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" |
   return `generic:${crypto.randomUUID()}`;
 }
 
-const FUZZY_DUPLICATE_MAX_KM = 0.15; // ~150m
-
-// Strips parenthetical suffixes ("Mtatsminda Park (Funicular)" ->
-// "mtatsminda park") and punctuation so differently-worded mentions of the
-// same real place collapse to the same slug — buildPlaceKey's exact/coord
-// match alone misses this class of duplicate (spec item 52/56's "duplicate
-// Mtatsminda Park" symptom).
-export function normalizePlaceNameSlug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/\([^)]*\)/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-interface FuzzyPlaceRecord {
-  nameSlug: string;
-  lat: number | null;
-  lon: number | null;
-}
-
-function isFuzzyDuplicatePlace(a: FuzzyPlaceRecord, b: FuzzyPlaceRecord): boolean {
-  if (!a.nameSlug || !b.nameSlug) return false;
-  const namesMatch = a.nameSlug === b.nameSlug || a.nameSlug.startsWith(b.nameSlug) || b.nameSlug.startsWith(a.nameSlug);
-  if (!namesMatch) return false;
-  // Both slugs matched (one contains the other) — if we also have
-  // coordinates for both, only call it a duplicate when they're genuinely
-  // close together, so "Mtatsminda Park" in Tbilisi never collides with an
-  // unrelated same-named place elsewhere. Without coordinates for either
-  // side, the strict slug match alone is treated as sufficient (same trust
-  // level as buildPlaceKey's own name+location exact-match fallback).
-  if (a.lat == null || a.lon == null || b.lat == null || b.lon == null) return true;
-  return haversineKm(a.lat, a.lon, b.lat, b.lon) <= FUZZY_DUPLICATE_MAX_KM;
-}
+// normalizePlaceNameSlug/isFuzzyDuplicatePlace/FuzzyPlaceRecord moved to
+// trip-workspace.ts (imported above) so the fallback-template candidate
+// selection (selectFallbackCandidate, which lives there and cannot import
+// from this file — this file already imports FROM trip-workspace.ts) can
+// use the exact same fuzzy-duplicate identity this file's own duplicate
+// check uses, rather than a second, drifting definition.
+export { normalizePlaceNameSlug };
 
 /** Categories that represent arrival/transfer/logistics rather than a discretionary activity. */
 export const NON_ACTIVITY_CATEGORIES = new Set<RecommendationCategory>(["transportation", "hotel", "practical"]);
@@ -1218,7 +1596,16 @@ function countArrivalDepartureWindowViolations(
 
     for (const item of day.items) {
       if (NON_ACTIVITY_CATEGORIES.has(item.category)) continue;
-      if (violatesArrivalDepartureWindow(item.plannedStartTime, day.date, isArrivalDay, isDepartureDay, window)) {
+      if (
+        violatesArrivalDepartureWindow(
+          item.plannedStartTime,
+          day.date,
+          isArrivalDay,
+          isDepartureDay,
+          window,
+          resolveItemEffectiveEndTime(item)
+        )
+      ) {
         violations += 1;
       }
     }
@@ -1231,7 +1618,10 @@ export function collectPlanDiagnostics(
   plan: AiItineraryResponse,
   profile: TripPreferenceProfile,
   tripFrame?: TripFrame | null,
-  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null,
+  flights?: TripFlights | null,
+  protectedGeographicConflictDetails: ProtectedGeographicConflict[] = [],
+  impossibleStayTransitionDetails: ImpossibleStayTransition[] = []
 ): PlanDiagnostics {
   let missingMeals = 0;
   let duplicatePlaces = 0;
@@ -1248,6 +1638,14 @@ export function collectPlanDiagnostics(
   let longMealDetours = 0;
   let baseMismatchDays = 0;
   let timeOverlaps = 0;
+  let openingHoursViolations = 0;
+  let excessFoodStopsDays = 0;
+  let mealSpacingViolations = 0;
+  let duplicateRestaurants = 0;
+  const invalidFlightLegDetails = detectInvalidFlightLegs(flights);
+  const airportBaseMismatchDetails: AirportBaseMismatchDiagnostic[] = [];
+  const fixedTimeConflicts: Array<FixedTimeConflict & { dayId: number }> = [];
+  const seenMealNames = new Set<string>();
   let currentHighEnergyStreak = 0;
   let maxConsecutiveHighEnergyDays = 0;
   const seenPlaces = new Set<string>();
@@ -1258,6 +1656,8 @@ export function collectPlanDiagnostics(
   const tierCounts = new Map<ActivityTier, number>();
   let totalTierStops = 0;
 
+  const dayCount = plan.days.length;
+
   for (const day of plan.days) {
     const hasLunch = day.items.some(
       (item) => item.slot === "lunch" && isFoodCategory(item.category)
@@ -1265,8 +1665,102 @@ export function collectPlanDiagnostics(
     const hasDinner = day.items.some(
       (item) => item.slot === "dinner" && isFoodCategory(item.category)
     );
-    if (!hasLunch) missingMeals += 1;
-    if (!hasDinner) missingMeals += 1;
+
+    // Real bug found during end-to-end QA generation: a real departure day
+    // (breakfast + checkout + airport transfer, flying home that
+    // afternoon) has no realistic dinner — the traveler is in the air or
+    // already home by 19:00. This check used to demand both meals on
+    // EVERY day unconditionally, so a perfectly realistic departure day
+    // kept failing validation on both real Gemini attempts, forcing a
+    // fallback to the generic template on essentially every normal-length
+    // trip. A meal is only required when the arrival/departure window
+    // itself doesn't already rule it out — reusing the exact same
+    // violatesArrivalDepartureWindow check the repair/routing side uses,
+    // so "is this meal even feasible" never drifts out of sync between
+    // validation and repair.
+    const isArrivalDay = day.dayNumber === 1;
+    const isDepartureDay = day.dayNumber === dayCount;
+
+    if (isArrivalDay && flights?.outbound?.arrivalAirport) {
+      const mismatch = detectAirportBaseMismatch("arrival", flights.outbound.arrivalAirport, day.items);
+      if (mismatch) airportBaseMismatchDetails.push(mismatch);
+    }
+    if (isDepartureDay && flights?.return?.departureAirport) {
+      const mismatch = detectAirportBaseMismatch("departure", flights.return.departureAirport, day.items);
+      if (mismatch) airportBaseMismatchDetails.push(mismatch);
+    }
+
+    // Real bug found during end-to-end QA generation (a live France trip):
+    // checking a FIXED reference clock time (12:30/19:00) against the
+    // window said lunch was feasible in principle, but the day's OTHER
+    // activities pushed the meal's actual scheduled time past the real
+    // cutoff — repair's own enforceArrivalDepartureWindow then (correctly)
+    // stripped it again on every pass, so missingMeals could never
+    // converge even though the validator thought the meal was fine. This
+    // checks the day's REAL remaining slack against the window instead of
+    // a generic reference time — the same question repair itself is
+    // implicitly answering when it strips (or keeps) an inserted meal.
+    const windowAllowsLunch = hasUsableGapForMeal(day, LUNCH_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+    const windowAllowsDinner = hasUsableGapForMeal(day, DINNER_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+
+    // Real bug found during end-to-end QA generation (a live France trip
+    // with Disneyland Paris): resequenceDayItems deliberately drops both
+    // meals from a day with a genuine full-day anchor (Disneyland, a
+    // national park, ...) — spec item 12: "Do not add Louvre or Eiffel
+    // Tower afterward" applies to meals too, since a full-day attraction
+    // already includes food on-site. This check had no matching exemption,
+    // so repair's intentional omission kept getting immediately re-flagged
+    // as missingMeals, and — because the same repair step re-runs
+    // resequenceDayItems on its own output — any freshly re-inserted meal
+    // placeholder got silently dropped again on the next pass, leaving
+    // missingMeals permanently non-zero and forcing a fallback to the
+    // generic template on any trip with a real full-day attraction.
+    const hasFullDayAnchor = day.items.some(
+      (item) => isAnchorCategory(item.category) && classifyVisitScale(item) === "full_day"
+    );
+    const lunchIsFeasible = windowAllowsLunch && !hasFullDayAnchor;
+    const dinnerIsFeasible = windowAllowsDinner && !hasFullDayAnchor;
+
+    if (!hasLunch && lunchIsFeasible) missingMeals += 1;
+    if (!hasDinner && dinnerIsFeasible) missingMeals += 1;
+
+    // At most two dedicated food stops per day (spec item 37) — breakfast
+    // is assumed near the hotel and never scheduled as its own item (this
+    // app's DayPart has no "breakfast" slot), so any food-category item
+    // beyond the normal lunch+dinner pair is an extra.
+    const dayFoodItems = day.items.filter((item) => isFoodCategory(item.category));
+    if (dayFoodItems.length > 2) {
+      excessFoodStopsDays += 1;
+    }
+
+    // Minimum spacing between consecutive food stops (spec item 39) —
+    // lunch→dinner needs 4h+, anything else (e.g. an extra cafe) needs 3h+.
+    const orderedFoodItems = sortItemsBySchedule(dayFoodItems);
+    for (let index = 1; index < orderedFoodItems.length; index += 1) {
+      const previousMeal = orderedFoodItems[index - 1];
+      const currentMeal = orderedFoodItems[index];
+      const previousMinutes = parseTimeToMinutes(previousMeal.plannedStartTime);
+      const currentMinutes = parseTimeToMinutes(currentMeal.plannedStartTime);
+      if (previousMinutes == null || currentMinutes == null) continue;
+      const minimumGap = previousMeal.slot === "lunch" && currentMeal.slot === "dinner" ? 240 : 180;
+      if (currentMinutes - previousMinutes < minimumGap) {
+        mealSpacingViolations += 1;
+      }
+    }
+
+    // Trip-wide repeated restaurant/cafe name (spec item 42) — a defensive
+    // backstop counted here regardless of how the name got repeated,
+    // separate from pickNearbyMealRecommendation's own hard exclusion at
+    // generation time.
+    for (const item of dayFoodItems) {
+      const nameKey = item.name.trim().toLowerCase();
+      if (!nameKey) continue;
+      if (seenMealNames.has(nameKey)) {
+        duplicateRestaurants += 1;
+      } else {
+        seenMealNames.add(nameKey);
+      }
+    }
 
     const normalizedWarnings = normalizeActionableMessages(day.warnings);
     duplicateWarnings += Math.max(day.warnings.length - normalizedWarnings.length, 0);
@@ -1288,12 +1782,25 @@ export function collectPlanDiagnostics(
 
     const geography = analyzeDayGeography(day, profile);
     timeOverlaps += countDayTimeOverlaps(day);
+    for (const conflict of findFixedTimeConflicts(day.items)) {
+      fixedTimeConflicts.push({ ...conflict, dayId: day.dayNumber });
+    }
     invalidCoordinates += geography.invalidCoordinateItems.length;
     if (geography.crossCityItems.length > 0) {
       crossCityDays += 1;
     }
+    // Section J: a transfer day's intercity travel is expected and already
+    // modeled elsewhere (stay transitions); a genuine day trip's long
+    // outbound/return travel is equally intentional — same reasoning
+    // analyzeDayGeography's own skipCrossCityChecks already applies to
+    // longTravelSegments/crossCityItems, but this NORMAL-day-only rule had
+    // drifted to only exclude transfer days, not day trips too. A real bug:
+    // a genuine day trip (e.g. a mountain excursion with several hours of
+    // real round-trip travel) was flagged exactly like an unexpected long
+    // detour on an ordinary day, the one distinction spec §J requires.
     if (
       !geography.isTransferDay &&
+      !isDayTripDay(day) &&
       (geography.totalTravelMinutes > MAX_NORMAL_DAY_TRAVEL_MINUTES ||
         geography.longTravelSegments.some((segment) => segment.minutes > 45))
     ) {
@@ -1302,7 +1809,17 @@ export function collectPlanDiagnostics(
     if (geography.foodDominant) {
       foodDominantDays += 1;
     }
-    if (!geography.isTransferDay && geography.anchorStopCount === 0) {
+    // Real bug found during end-to-end QA generation (a live Greece trip
+    // with a 10:40 departure): a severely flight-constrained arrival/
+    // departure day can legitimately have nothing but checkout/transfer
+    // logistics — no real sightseeing anchor AND no meal either — same
+    // reasoning as the meal exemption above. Narrowly targeted at exactly
+    // that "purely logistics, nothing else fits" composition (not every
+    // arrival/departure day) so a normal arrival/departure day with real
+    // time to spare still correctly requires an anchor.
+    const isPureLogisticsArrivalOrDeparture =
+      (isArrivalDay || isDepartureDay) && geography.foodStopCount === 0;
+    if (!geography.isTransferDay && !isPureLogisticsArrivalOrDeparture && geography.anchorStopCount === 0) {
       missingAnchorDays += 1;
     }
     longMealDetours += geography.longMealDetours.length;
@@ -1349,9 +1866,21 @@ export function collectPlanDiagnostics(
       // compare, and relies solely on its own always-unique key above.
       const isRealPlace = Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
       const fuzzyRecord: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon };
-      const isDuplicate =
-        seenPlaces.has(key) || (isRealPlace && seenFuzzyPlaces.some((seen) => isFuzzyDuplicatePlace(seen, fuzzyRecord)));
+      const exactMatch = seenPlaces.has(key);
+      const fuzzyMatch = isRealPlace ? seenFuzzyPlaces.find((seen) => isFuzzyDuplicatePlace(seen, fuzzyRecord)) : undefined;
+      const isDuplicate = exactMatch || Boolean(fuzzyMatch);
       if (isDuplicate) {
+        // Dev-only — real evidence for whichever specific pair is still
+        // slipping through, since this can't be reproduced against real
+        // production-scale candidate data in a synthetic test.
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[collectPlanDiagnostics] duplicatePlaces", {
+            day: day.dayNumber,
+            matchType: exactMatch ? "exact-key" : "fuzzy-name-coords",
+            item: { name: item.name, category: item.category, recommendationId: item.recommendationId, lat: item.lat, lon: item.lon, key },
+            matchedAgainst: fuzzyMatch ?? null,
+          });
+        }
         duplicatePlaces += 1;
       } else {
         seenPlaces.add(key);
@@ -1360,6 +1889,10 @@ export function collectPlanDiagnostics(
 
        if (isAvoidedByProfile(item, profile)) {
         avoidConflicts += 1;
+      }
+
+      if (violatesOpeningHours(item)) {
+        openingHoursViolations += 1;
       }
 
       if (
@@ -1447,8 +1980,66 @@ export function collectPlanDiagnostics(
     baseMismatchDays,
     activityMixSkew,
     arrivalDepartureWindowViolations: countArrivalDepartureWindowViolations(plan, arrivalDepartureWindow),
+    fixedTimeConflicts,
     timeOverlaps,
+    openingHoursViolations,
+    excessFoodStopsDays,
+    mealSpacingViolations,
+    duplicateRestaurants,
+    invalidFlightLegs: invalidFlightLegDetails.length,
+    invalidFlightLegDetails,
+    airportBaseMismatches: airportBaseMismatchDetails.length,
+    airportBaseMismatchDetails,
+    protectedGeographicConflicts: protectedGeographicConflictDetails.length,
+    protectedGeographicConflictDetails,
+    impossibleStayTransitions: impossibleStayTransitionDetails.length,
+    impossibleStayTransitionDetails,
   };
+}
+
+/**
+ * A single 0-100 internal quality score (spec item 81) — no such number
+ * exists anywhere in the codebase today; everything below repairPlan's own
+ * pass/fail gate (passesValidation) is a plain boolean AND. Deducts a fixed
+ * weight per non-zero diagnostic, grouped the way the spec itself groups
+ * them (geography / timing / budget / variety / duplicates), floored at 0.
+ * A plan can pass passesValidation (every hard gate at zero) yet still
+ * score under 100 on the advisory-only signals (activityMixSkew,
+ * dominantCategoryShare) — this score exists specifically to catch that
+ * gap and push one more diversify pass when there's still an attempt left
+ * (see repairPlan).
+ */
+export function computeQualityScore(diagnostics: PlanDiagnostics): number {
+  let score = 100;
+
+  // Geography.
+  score -= diagnostics.crossCityDays * 8;
+  score -= diagnostics.longTravelDays * 5;
+  score -= diagnostics.longMealDetours * 4;
+  score -= diagnostics.foodDominantDays * 4;
+  score -= diagnostics.missingAnchorDays * 4;
+  score -= diagnostics.baseMismatchDays * 5;
+
+  // Timing.
+  score -= diagnostics.arrivalDepartureWindowViolations * 6;
+  score -= diagnostics.timeOverlaps * 6;
+  score -= diagnostics.openingHoursViolations * 8;
+  score -= diagnostics.mealSpacingViolations * 3;
+
+  // Budget.
+  if (diagnostics.outOfBudget) score -= 15;
+  if (diagnostics.overSoftBudget) score -= 6;
+
+  // Variety / nature balance.
+  if (diagnostics.diversityRisk) score -= 12;
+  score -= diagnostics.activityMixSkew.length * 3;
+
+  // Duplicates.
+  score -= diagnostics.duplicatePlaces * 6;
+  score -= diagnostics.duplicateRestaurants * 4;
+  score -= diagnostics.excessFoodStopsDays * 3;
+
+  return Math.max(0, Math.round(score));
 }
 
 function countUniqueRegions(days: AiGeneratedDay[]) {

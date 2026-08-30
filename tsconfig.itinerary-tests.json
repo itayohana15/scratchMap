@@ -43,6 +43,14 @@
     "src/lib/facts/airports-data.ts",
     "src/lib/facts/jewish-holidays.ts",
     "src/lib/itinerary-explain-placement.ts",
+    "src/lib/server/opening-hours.ts",
+    "src/lib/transport-mode.ts",
+    "src/lib/hotels.ts",
+    "src/lib/hotel-ui-helpers.ts",
+    "src/lib/places/overpass.ts",
+    "src/lib/provider-status.ts",
+    "src/lib/stay-routing.ts",
+    "scripts/qa-generate-trip.ts",
     "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
     "tests/itinerary-planning-principles.test.ts",
@@ -62,7 +70,15 @@
     "tests/airports-data.test.ts",
     "tests/jewish-holidays.test.ts",
     "tests/itinerary-explain-placement.test.ts",
-    "tests/itinerary-scheduler.test.ts"
+    "tests/itinerary-scheduler.test.ts",
+    "tests/opening-hours.test.ts",
+    "tests/transport-mode.test.ts",
+    "tests/itinerary-regression-scenarios.test.ts",
+    "tests/hotels.test.ts",
+    "tests/hotel-ui-helpers.test.ts",
+    "tests/geographic-compatibility.test.ts",
+    "tests/provider-status.test.ts",
+    "tests/stay-routing.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

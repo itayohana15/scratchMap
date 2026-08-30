@@ -2,13 +2,13 @@
 
 import { formatCurrency } from "@/lib/format";
 import type { CountryItineraryRecord } from "@/lib/itineraries";
-import { buildUpgradeSuggestion, computeTripBudgetSummary } from "@/lib/trip-budget";
+import { buildUpgradeSuggestions, computeTripBudgetSummary } from "@/lib/trip-budget";
 import { EXPENSE_CATEGORY_LABELS, type ExpenseCategory } from "@/lib/trip-workspace";
 import { cn } from "@/lib/utils";
 
 export function TripBudgetTab({ itinerary }: { itinerary: CountryItineraryRecord }) {
   const summary = computeTripBudgetSummary(itinerary);
-  const upgradeSuggestion = buildUpgradeSuggestion(summary);
+  const upgradeSuggestions = buildUpgradeSuggestions(summary);
   const breakdownEntries = Object.entries(summary.categoryBreakdown) as Array<[string, number]>;
   const breakdownTotal = breakdownEntries.reduce((sum, [, value]) => sum + value, 0) || 1;
 
@@ -60,8 +60,15 @@ export function TripBudgetTab({ itinerary }: { itinerary: CountryItineraryRecord
         </div>
       ) : null}
 
-      {upgradeSuggestion ? (
-        <p className="section-card p-3 text-sm text-muted-foreground">{upgradeSuggestion}</p>
+      {upgradeSuggestions.length > 0 ? (
+        <div className="section-card space-y-2 p-3 text-sm text-muted-foreground">
+          <p>נותר תקציב משמעותי — אפשר לשקול:</p>
+          <ul className="list-inside list-disc space-y-1">
+            {upgradeSuggestions.map((suggestion) => (
+              <li key={suggestion}>{suggestion}</li>
+            ))}
+          </ul>
+        </div>
       ) : null}
 
       {breakdownEntries.length > 0 ? (

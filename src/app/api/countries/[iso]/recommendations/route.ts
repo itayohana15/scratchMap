@@ -372,9 +372,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ iso:
   const englishCountryName = isoCountries.getName(isoA2, "en") ?? isoA2;
   const openSourceAvailable = categoryHasOpenDataSource(category);
 
-  const overpassPlaces = openSourceAvailable
+  // Section B2: the real request outcome, kept apart from "does this
+  // category even have a data source" (openSourceAvailable, a static
+  // per-category fact) and from "how many places came back" — a category
+  // with no source at all is neither available nor unavailable as a
+  // PROVIDER signal, it's simply not queried.
+  const overpassOutcome = openSourceAvailable
     ? await queryOverpassPlaces(isoA2, category, count)
-    : [];
+    : null;
+  const overpassPlaces = overpassOutcome?.places ?? [];
 
   const openSourceRecommendations: TripRecommendation[] = overpassPlaces.map((place, index) => ({
     id: `api-${category}-${index}-${place.name}`,
@@ -448,6 +454,12 @@ export async function GET(request: Request, { params }: { params: Promise<{ iso:
       source,
       sourceUrl,
       retrievedAt,
+      // Section B2 — the REAL Overpass request outcome for this category,
+      // never inferred from places.length: null when this category has no
+      // open-data source at all (nothing was ever queried), true when the
+      // request itself succeeded (even with zero legitimate results),
+      // false only on a genuine network/provider failure.
+      overpassSucceeded: overpassOutcome?.succeeded ?? null,
     },
   });
 }

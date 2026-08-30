@@ -60,6 +60,13 @@ export interface CategoryRecommendationsMeta {
   source: string | null;
   sourceUrl: string | null;
   retrievedAt: string;
+  // Section B2 — the REAL Overpass request outcome for this category
+  // (null when the category has no open-data source at all, so nothing
+  // was ever queried). Distinct from `available` above, which is about
+  // whether real PLACES came back, not whether the provider request itself
+  // succeeded — a legitimate zero-result query is `overpassSucceeded: true,
+  // available: false`.
+  overpassSucceeded: boolean | null;
 }
 
 export interface CategoryRecommendationsResult {

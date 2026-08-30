@@ -27,6 +27,7 @@ export class ItineraryGenerationInfeasibleError extends Error {
 }
 
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
+import { estimateMinutesForMode, selectTransportMode, type TransportMode } from "@/lib/transport-mode";
 import countryFactsData from "@/lib/facts/country-facts-data.json";
 import {
   computeArrivalDepartureWindow,
@@ -41,12 +42,18 @@ import {
   buildTripPreferenceProfile,
   calculateDayLoadMinutes,
   collectPlanDiagnostics,
+  computeQualityScore,
+  DINNER_WINDOW_MINUTES,
   findFramePhaseForDay,
+  hasUsableGapForMeal,
   IDEAL_LOCAL_TRAVEL_MINUTES,
   isIntercityTransferDay,
   getBudgetCapForItem,
+  LUNCH_WINDOW_MINUTES,
   MAX_LOCAL_TRAVEL_MINUTES,
   MAX_NORMAL_DAY_TRAVEL_MINUTES,
+  MEAL_MAX_TRAVEL_MINUTES,
+  MEAL_MAX_WALKING_MINUTES,
   isDayTripDay,
   isPremiumVenue,
   NON_ACTIVITY_CATEGORIES,
@@ -58,7 +65,9 @@ import {
   summarizeItemCosts,
   withNormalizedRecommendationPrice,
   type ExchangeRateContext,
+  type ImpossibleStayTransition,
   type PlanDiagnostics,
+  type ProtectedGeographicConflict,
   type TripFrame,
   type TripFramePhase,
   type TripPreferenceProfile,
@@ -68,17 +77,27 @@ import {
   classifyActivityTier,
   classifyItemEnergy,
   classifyVisitScale,
+  classifyWeatherSensitivity,
   getTripLengthBucket,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
+  MAX_STAY_STRUCTURE_REPAIR_PASSES,
   describeActivityMixTargets,
+  buildStayTransitions,
+  repairImpossibleStayTransition,
+  reorderAreasForDepartureFeasibility,
+  resolveItemEffectiveEndTime,
+  type StayTransition,
 } from "@/lib/server/itinerary-planning-principles";
 import {
   clockToMinutes,
   DEFAULT_DAY_WINDOW,
+  minutesToClock,
   scheduleDayItems,
+  type FixedTimeConflict,
 } from "@/lib/server/itinerary-scheduler";
 import { describeHolidayContext } from "@/lib/facts/jewish-holidays";
 import { fetchDrivingRouteBestEffort } from "@/lib/routing/osrm-server";
+import { violatesOpeningHours } from "./opening-hours";
 import {
   buildFallbackAiItinerary,
   buildMapLink,
@@ -86,8 +105,11 @@ import {
   createEmptyItineraryItem,
   dateForDayNumber,
   estimateTravelMinutes,
+  CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM,
   getTripDayCount,
   haversineKm,
+  isCandidateGeographicallyCompatibleWithDay,
+  isFuzzyDuplicatePlace,
   ITINERARY_GENERATION_MODE_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
   type AiGeneratedDay,
@@ -95,6 +117,7 @@ import {
   type AiItineraryRequest,
   type AiItineraryResponse,
   type DayPart,
+  type FuzzyPlaceRecord,
   type ItemPriority,
   type RecommendationCategory,
   type TripItineraryDay,
@@ -118,9 +141,12 @@ export interface RawGeneratedItem {
   slot: string;
   plannedStartTime: string;
   estimatedDurationMinutes?: number;
+  /** Price PER PERSON, in local currency — resolveItemPriceFields multiplies by traveler count to get the group total. Never a pre-multiplied total. */
   approximatePrice?: number;
   travelMinutes?: number;
   openingHours?: string;
+  /** Last entry time in HH:mm, only when known and distinct from the closing time — never fabricated from openingHours. */
+  lastEntryTime?: string;
   reservationRequired?: boolean;
   transportation?: string;
   bookingWarning?: string;
@@ -161,9 +187,47 @@ export interface RawGeneratedPlan {
   days: RawGeneratedDay[];
 }
 
+// Phase 11/26 (generic worldwide architecture): a real, explicit answer to
+// "which path actually produced this plan" — never inferred by the caller
+// from usedFallback alone. "gemini_repaired" (not plain "gemini") is
+// deliberate: repairPlan's normalization/repair machinery always runs on
+// real Gemini output before it's accepted, so there is no "raw, untouched
+// Gemini" path to report separately from it.
+export type ItineraryGenerationSource = "gemini_repaired" | "fallback_template";
+
+/**
+ * Distinguishes "the candidate provider was unreachable" from "the plan is
+ * genuinely infeasible" (spec §H) — never exposes the raw fetch error, just
+ * whether real candidates came back. "partial" is intentionally unused for
+ * now (no honest signal distinguishes it from "available" with this
+ * pipeline's current data) rather than guessed.
+ */
+export interface CandidateProviderStatus {
+  overpass: "available" | "unavailable" | "partial";
+  gemini: "used" | "not_used";
+}
+
 export interface GeneratedCountryItineraryPlan extends AiItineraryResponse {
   model: string;
   usedFallback: boolean;
+  generationSource: ItineraryGenerationSource;
+  candidateProviderStatus: CandidateProviderStatus;
+}
+
+/**
+ * Section H — prefers the REAL provider result when the caller supplied one
+ * (payload.overpassAvailable, from its own fetch or
+ * places/overpass.ts's checkOverpassAvailability), never inferring success
+ * from candidate count alone: a manually-injected candidate (e.g. this
+ * app's own QA harness, or a future "add a place manually" feature) would
+ * otherwise make Overpass look "available" even when the real request
+ * failed. Falls back to the candidate-count heuristic only when the caller
+ * genuinely doesn't know — disclosed as an imprecise fallback, not a fix.
+ */
+export function resolveCandidateProviderStatus(payload: AiItineraryRequest): CandidateProviderStatus {
+  const overpass: CandidateProviderStatus["overpass"] =
+    payload.overpassAvailable ?? (payload.recommendations.length > 0 ? "available" : "unavailable");
+  return { overpass, gemini: "used" };
 }
 
 const CATEGORY_VALUES = new Set<RecommendationCategory>([
@@ -276,9 +340,10 @@ const ITINERARY_SCHEMA = {
                 slot: stringField("morning, lunch, afternoon, dinner, evening, or night."),
                 plannedStartTime: stringField("Suggested start time in HH:mm."),
                 estimatedDurationMinutes: numberField("Estimated duration in minutes."),
-                approximatePrice: numberField("Estimated price."),
+                approximatePrice: numberField("Estimated price PER PERSON (not the total for the whole group), in local currency."),
                 travelMinutes: numberField("Travel time from previous stop in minutes."),
                 openingHours: stringField("Opening hours if known, otherwise state unavailable."),
+                lastEntryTime: stringField("Last entry time in HH:mm, only if known and different from the closing time, otherwise leave empty."),
                 reservationRequired: { type: Type.BOOLEAN, description: "Whether booking is recommended." },
                 transportation: stringField("Transport used to reach this stop."),
                 bookingWarning: stringField("Booking, timing, or practical warning such as ticketing, luggage, or check-in."),
@@ -583,6 +648,33 @@ const TRIP_FRAME_INTENT_VALUES = new Set<TripFramePhase["intent"]>(["city", "nat
  * BEFORE any day-level content is generated. This is what lets the main
  * generation prompt lock geography instead of deciding it inline per day.
  */
+/**
+ * Real coordinate centroid per normalized area label, from the same
+ * candidate pool the trip frame itself is built from (spec §B1/§C1) — one
+ * shared source of area geography for departure-feasibility reordering
+ * AND stay-transition distance/time, rather than two separately-computed
+ * versions drifting apart.
+ */
+function computeAreaAnchors(payload: AiItineraryRequest): Map<string, { lat: number; lon: number } | null> {
+  const sums = new Map<string, { latSum: number; lonSum: number; count: number }>();
+
+  for (const recommendation of [...payload.recommendations, ...payload.selectedPlaces]) {
+    const area = normalizeAreaLabel(recommendation.location);
+    if (!area || recommendation.lat == null || recommendation.lon == null) continue;
+    const entry = sums.get(area) ?? { latSum: 0, lonSum: 0, count: 0 };
+    entry.latSum += recommendation.lat;
+    entry.lonSum += recommendation.lon;
+    entry.count += 1;
+    sums.set(area, entry);
+  }
+
+  const anchors = new Map<string, { lat: number; lon: number } | null>();
+  for (const [area, entry] of sums) {
+    anchors.set(area, entry.count > 0 ? { lat: entry.latSum / entry.count, lon: entry.lonSum / entry.count } : null);
+  }
+  return anchors;
+}
+
 function buildDeterministicTripFrame(payload: AiItineraryRequest, dayCount: number): TripFrame {
   const bucket = getTripLengthBucket(dayCount);
   const areaCounts = new Map<string, number>();
@@ -600,6 +692,16 @@ function buildDeterministicTripFrame(payload: AiItineraryRequest, dayCount: numb
   let rankedAreas = [...areaCounts.entries()].sort((left, right) => right[1] - left[1]).map(([area]) => area);
   if (rankedAreas.length === 0) {
     rankedAreas = [normalizeAreaLabel(payload.countryName) || payload.countryName];
+  }
+
+  if (!pinnedArea) {
+    const areaAnchors = computeAreaAnchors(payload);
+    rankedAreas = reorderAreasForDepartureFeasibility(
+      rankedAreas,
+      areaAnchors,
+      payload.preferences.flights?.return?.departureAirport || null,
+      payload.preferences.flights?.return?.departureTime || null
+    );
   }
 
   const phases = buildTripFramePhases(rankedAreas, areaCounts, dayCount, bucket, pinnedArea || null);
@@ -855,7 +957,7 @@ function buildPrompt(
         ]
       : []),
     `Daily capacity limit in minutes including travel and meals: ${profile.dailyCapacityMinutes}.`,
-    `Budget allocation in percent: accommodation ${Math.round(profile.budgetAllocation.accommodation * 100)}%, food ${Math.round(profile.budgetAllocation.food * 100)}%, transportation ${Math.round(profile.budgetAllocation.transportation * 100)}%, attractions ${Math.round(profile.budgetAllocation.attractions * 100)}%, buffer ${Math.round(profile.budgetAllocation.buffer * 100)}%.`,
+    `Budget allocation in percent: accommodation ${Math.round(profile.budgetAllocation.accommodation * 100)}%, food ${Math.round(profile.budgetAllocation.food * 100)}%, transportation ${Math.round(profile.budgetAllocation.transportation * 100)}%, attractions ${Math.round(profile.budgetAllocation.attractions * 100)}%, shopping ${Math.round(profile.budgetAllocation.shopping * 100)}%, buffer ${Math.round(profile.budgetAllocation.buffer * 100)}%.`,
     `Budget caps in ILS: per day ${profile.perDayBudget ?? "unknown"}, lunch ${profile.mealBudgetLunch ?? "unknown"}, dinner ${profile.mealBudgetDinner ?? "unknown"}, activity stop ${profile.activityBudgetPerStop ?? "unknown"}, transport day ${profile.transportBudgetPerDay ?? "unknown"}, accommodation day ${profile.accommodationBudgetPerDay ?? "unknown"}.`,
     `Candidate prices were normalized to ILS${exchangeRateContext ? ` from ${exchangeRateContext.sourceCurrency} using rate ${exchangeRateContext.rateToTarget} updated ${exchangeRateContext.updatedAt}` : ""}.`,
     exchangeRateContext && exchangeRateContext.sourceCurrency !== exchangeRateContext.targetCurrency
@@ -870,7 +972,7 @@ function buildPrompt(
     "restWindow should be explicit on lighter days, buffer days, laundry/planning days, or recovery mornings.",
     "notes should explain the planning logic of the day, not just repeat the stop names.",
     "transportSegments should be specific and practical, for example: origin -> destination · mode · duration · cost estimate.",
-    "Every item's approximatePrice must be a realistic estimate in the destination's local currency (not ILS) — do not attempt to convert it yourself. The system converts every price to ILS and enforces the budget automatically after generation, using the local-currency estimate you provide.",
+    "Every item's approximatePrice must be a realistic estimate PER PERSON, in the destination's local currency (not ILS) — never the total for the whole group. Do not attempt to convert currency or multiply by traveler count yourself. The system converts every price to ILS and multiplies by traveler count automatically after generation, using the per-person local-currency estimate you provide.",
     "Include realistic accommodationCost, foodCost, transportCost, and activityCost (also in local currency) so the total trip cost includes accommodation, food, local transport, intercity transport, and paid attractions.",
     "Output categoryBreakdown numbers so they sum roughly to the total estimated cost.",
     `Candidate categories JSON: ${JSON.stringify(candidateCategorySummary, null, 2)}`,
@@ -1003,7 +1105,74 @@ function isDietaryConflict(
 function isAnchorDayItem(
   item: Pick<AiGeneratedItem, "category">
 ): item is Pick<AiGeneratedItem, "category"> {
-  return !isFoodItem(item.category) && item.category !== "transportation" && item.category !== "hotel";
+  // Real bug found during end-to-end QA generation: a "practical" item is a
+  // free-time/logistics filler (see buildFreeTimeItem), never a genuine
+  // sightseeing/dining stop — the rest of the codebase already treats it as
+  // a non-activity category (see NON_ACTIVITY_CATEGORIES), but this anchor
+  // check didn't exclude it. Left in, a filler item's own
+  // estimatedDurationMinutes (deliberately set to whatever leftover window
+  // it fills, often several hours) gets fed into classifyVisitScale, which
+  // has no "practical" branch and so falls through to duration-based
+  // inference — misclassifying the filler as a "full_day" anchor. Once
+  // resequenceDayItems is re-run on an already-resequenced day (as
+  // repairDayGeography does), that fake full-day anchor causes every real
+  // anchor AND every meal item to be dropped from the day entirely.
+  return !isFoodItem(item.category) && !NON_ACTIVITY_CATEGORIES.has(item.category);
+}
+
+// Thread 1 (locked/fixed-time hard requirement): "locked" means the
+// activity itself may never be removed/replaced by automatic
+// planning/repair; "fixedTime" means its start time may never be shifted
+// automatically. Both are treated together here wherever a repair step
+// decides what's droppable — a real, previously-reported bug: several
+// places (the full-day-anchor branch below, among others) dropped
+// non-selected anchors/meals unconditionally, with no exemption for a
+// locked or fixed-time item the user (or an earlier repair pass) had
+// pinned in place.
+function isProtectedItem(item: Pick<AiGeneratedItem, "locked" | "fixedTime">): boolean {
+  return item.locked === true || item.fixedTime === true;
+}
+
+// Rough clock-time stand-ins for each slot, used only to decide where a
+// FLEXIBLE item's neighbors should land relative to a fixed-time item —
+// the flexible item's own real time still comes from scheduleDayItems
+// afterward. Broad, deliberately approximate ranges are fine here.
+const SLOT_APPROX_MINUTES: Record<DayPart, number> = {
+  morning: 9 * 60,
+  lunch: 12 * 60 + 30,
+  afternoon: 15 * 60,
+  dinner: 19 * 60,
+  evening: 20 * 60 + 30,
+  night: 22 * 60,
+};
+
+function effectiveOrderMinutes(item: AiGeneratedItem): number {
+  if (item.fixedTime) {
+    const parsed = clockToMinutes(item.plannedStartTime);
+    if (parsed != null) return parsed;
+  }
+  return SLOT_APPROX_MINUTES[item.slot] ?? 12 * 60;
+}
+
+/**
+ * A fixed-time item's own real clock time always wins scheduleDayItems's
+ * anchor placement regardless of list position, but the FLEXIBLE items
+ * around it still get sorted into segments purely by their position in
+ * this array — so a fixed-time item needs to sit roughly where it
+ * chronologically belongs, not wherever the heuristic anchor/meal
+ * ordering above happened to put it, or a flexible item that should
+ * really come "after" it could end up in the "before" segment instead.
+ * A stable sort keeps every other item's relative order intact (ties
+ * broken by original index) — only fixed-time items actually move.
+ */
+function interleaveFixedTimeItems(items: AiGeneratedItem[]): AiGeneratedItem[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const delta = effectiveOrderMinutes(left.item) - effectiveOrderMinutes(right.item);
+      return delta !== 0 ? delta : left.index - right.index;
+    })
+    .map((entry) => entry.item);
 }
 
 function hasValidCoordinates(value: { lat: number | null; lon: number | null }) {
@@ -1099,17 +1268,43 @@ function slotForClockTime(minutes: number): DayPart {
   return "night";
 }
 
-function resequenceDayItems(day: AiGeneratedDay) {
+export function resequenceDayItems(day: AiGeneratedDay) {
   const normalizedItems = sortItems(day.items.map(normalizeGeneratedItemCoordinates));
   const transferDay = isIntercityTransferDay(day);
 
   if (transferDay) {
-    const ordered = normalizedItems.map((item, index) => ({
-      ...item,
-      slot: item.category === "transportation" ? (index === 0 ? ("morning" as DayPart) : ("afternoon" as DayPart)) : item.slot,
-    }));
-    const { items: scheduled } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
-    return { ...day, items: scheduled.map((item) => ({ ...item, slot: slotForClockTime((clockToMinutes(item.plannedStartTime) ?? 9 * 60)) })) };
+    const ordered = interleaveFixedTimeItems(
+      normalizedItems.map((item, index) => ({
+        ...item,
+        slot:
+          item.category === "transportation" && !item.fixedTime
+            ? index === 0
+              ? ("morning" as DayPart)
+              : ("afternoon" as DayPart)
+            : item.slot,
+      }))
+    );
+    const { items: scheduled, overflowItems, fixedTimeConflicts } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
+    return {
+      ...day,
+      items: scheduled.map((item) => ({
+        ...item,
+        // A meal item's slot (lunch/dinner) is what collectPlanDiagnostics's
+        // missingMeals check actually keys off — real, semantic, must
+        // survive scheduling regardless of what clock time the day's
+        // timeline happens to push it to (same protection transportation
+        // already gets on the line above; a real bug from a live
+        // generation run: a lunch/dinner placeholder drifting to a
+        // clock-derived "night" slot made missingMeals impossible to ever
+        // close to 0 for a sparsely-filled day).
+        slot:
+          item.category === "transportation" || isFoodItem(item.category) || item.fixedTime
+            ? item.slot
+            : slotForClockTime(clockToMinutes(item.plannedStartTime) ?? 9 * 60),
+      })),
+      warnings: buildFixedTimeConflictWarnings(day, fixedTimeConflicts),
+      alternatives: appendOverflowAlternatives(day.alternatives, overflowItems),
+    };
   }
 
   const transportationItems = normalizedItems.filter((item) => item.category === "transportation");
@@ -1128,10 +1323,18 @@ function resequenceDayItems(day: AiGeneratedDay) {
   // A full-day anchor (Disneyland, a national park, ...) consumes the day's
   // entire planning capacity — spec item 12 explicitly: "Do not add Louvre
   // or Eiffel Tower afterward." Any other anchor that day moves to
-  // alternatives instead of silently disappearing.
+  // alternatives instead of silently disappearing — UNLESS it's locked or
+  // fixed-time (Thread 1: locked/fixed-time items may never be
+  // automatically removed), in which case it's kept alongside the
+  // full-day anchor no matter what the general heuristic would prefer.
   const fullDayAnchor = anchorCandidates.find((item) => classifyVisitScale(item) === "full_day");
-  const anchorItems = fullDayAnchor ? [fullDayAnchor] : anchorCandidates;
-  const droppedAnchors = fullDayAnchor ? anchorCandidates.filter((item) => item !== fullDayAnchor) : [];
+  const protectedOtherAnchors = fullDayAnchor
+    ? anchorCandidates.filter((item) => item !== fullDayAnchor && isProtectedItem(item))
+    : [];
+  const anchorItems = fullDayAnchor ? [fullDayAnchor, ...protectedOtherAnchors] : anchorCandidates;
+  const droppedAnchors = fullDayAnchor
+    ? anchorCandidates.filter((item) => item !== fullDayAnchor && !isProtectedItem(item))
+    : [];
 
   const lunch =
     mealItems.find((item) => item.slot === "lunch") ??
@@ -1142,56 +1345,122 @@ function resequenceDayItems(day: AiGeneratedDay) {
     mealItems.find((item) => item.slot === "dinner") ??
     mealItems.find((item) => item !== lunch) ??
     null;
-  const leftoverMeals = fullDayAnchor ? [] : mealItems.filter((item) => item !== lunch && item !== dinner);
+  // Thread 1: a locked/fixed-time meal survives even on a full-day-anchor
+  // day, where meals are normally omitted entirely (spec item 12's "do not
+  // add [more]" applies to auto-added content, not to something the user
+  // or an earlier repair pass explicitly pinned).
+  const keepLunch = !fullDayAnchor || (lunch && isProtectedItem(lunch));
+  const keepDinner = !fullDayAnchor || (dinner && isProtectedItem(dinner) && dinner !== lunch);
+  const leftoverMeals = fullDayAnchor
+    ? mealItems.filter((item) => item !== lunch && item !== dinner && isProtectedItem(item))
+    : mealItems.filter((item) => item !== lunch && item !== dinner);
+  const protectedSupportingItems = fullDayAnchor
+    ? nonAnchorSupportingItems.filter((item) => isProtectedItem(item))
+    : nonAnchorSupportingItems;
   const firstHalfCount = anchorItems.length >= 3 ? 2 : Math.min(anchorItems.length, 1);
   const firstHalfAnchors = anchorItems.slice(0, firstHalfCount);
   const secondHalfAnchors = anchorItems.slice(firstHalfCount);
-  const ordered = [
+  const preOrdered = [
     ...transportationItems.filter((item) => item.slot === "morning"),
     ...firstHalfAnchors,
-    ...(fullDayAnchor ? [] : lunch ? [lunch] : []),
+    ...(keepLunch && lunch ? [lunch] : []),
     ...secondHalfAnchors,
-    ...(fullDayAnchor ? [] : dinner && dinner !== lunch ? [dinner] : []),
+    ...(keepDinner && dinner ? [dinner] : []),
     ...leftoverMeals,
     ...transportationItems.filter((item) => item.slot !== "morning"),
-    ...(fullDayAnchor ? [] : nonAnchorSupportingItems),
+    ...protectedSupportingItems,
   ];
+  // A fixed-time item's real clock time always wins in scheduleDayItems
+  // regardless of list position, but the flexible items around it are
+  // still assigned to segments purely by position in this array — so it
+  // needs to sit roughly where it chronologically belongs first (Thread 1
+  // item 2: fixed-time items act as timeline anchors, with everything
+  // else filled in around them, never the other way around).
+  const ordered = interleaveFixedTimeItems(preOrdered);
 
-  const { items: scheduled, freeTimeItem } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
+  const { items: scheduled, freeTimeItem, overflowItems, fixedTimeConflicts } = scheduleDayItems(ordered, DEFAULT_DAY_WINDOW, day.cityRegion);
   const withSlots = scheduled.map((item) => ({
     ...item,
-    slot: item.category === "transportation" ? item.slot : slotForClockTime((clockToMinutes(item.plannedStartTime) ?? 9 * 60)),
+    // See the identical exemption + reasoning in this function's transfer-day
+    // branch above — a meal's lunch/dinner slot is semantic (collectPlanDiagnostics
+    // keys off it directly) and must survive scheduling drift. A fixed-time
+    // item's slot is likewise left untouched — it's frequently the only
+    // remaining signal (alongside the pinned time itself) of what kind of
+    // moment this was meant to be.
+    slot:
+      item.category === "transportation" || isFoodItem(item.category) || item.fixedTime
+        ? item.slot
+        : slotForClockTime(clockToMinutes(item.plannedStartTime) ?? 9 * 60),
   }));
 
   return {
     ...day,
     items: freeTimeItem ? [...withSlots, freeTimeItem] : withSlots,
-    alternatives: droppedAnchors.length > 0 ? normalizeActionableMessages([...day.alternatives, ...droppedAnchors.map((item) => item.name)]) : day.alternatives,
+    warnings: buildFixedTimeConflictWarnings(day, fixedTimeConflicts),
+    alternatives: appendOverflowAlternatives(
+      droppedAnchors.length > 0
+        ? normalizeActionableMessages([...day.alternatives, ...droppedAnchors.map((item) => item.name)])
+        : day.alternatives,
+      overflowItems
+    ),
   };
 }
 
-function findMissingMealSlots(items: AiGeneratedItem[]) {
+/**
+ * Thread 1 item 6/7: a non-fixed item that structurally can't fit around a
+ * fixed-time anchor is never silently overlapped or dropped without a
+ * trace — it moves to alternatives (the same "we'd have liked to include
+ * this" bucket droppedAnchors already uses) so a human can see it and
+ * decide, rather than the item just vanishing.
+ */
+function appendOverflowAlternatives(alternatives: string[], overflowItems: AiGeneratedItem[]): string[] {
+  if (overflowItems.length === 0) return alternatives;
+  return normalizeActionableMessages([
+    ...alternatives,
+    ...overflowItems.map((item) => `${item.name} (לא נכנס סביב פעילות בשעה קבועה)`),
+  ]);
+}
+
+/**
+ * Thread 1 item 7: two fixed-time items that genuinely cannot both be
+ * honored (their own times, plus real travel between them, overlap) is a
+ * legitimate hard failure — surfaced as a visible warning here (and as
+ * structured PlanDiagnostics.fixedTimeConflicts, see
+ * itinerary-generation-constraints.ts) rather than silently resolved by
+ * moving either one.
+ */
+function buildFixedTimeConflictWarnings(day: AiGeneratedDay, conflicts: FixedTimeConflict[]): string[] {
+  if (conflicts.length === 0) return day.warnings;
+  return normalizeActionableMessages([
+    ...day.warnings,
+    ...conflicts.map(
+      (conflict) =>
+        `התנגשות בין שתי פעילויות בשעה קבועה: "${conflict.activityA}" (${conflict.startA}–${conflict.endA}) ו"${conflict.activityB}" (מתחילה ${conflict.startB}, דורשת ${conflict.travelMinutesRequired} דק' נסיעה) — לא ניתן לקיים את שתיהן כמתוכנן.`
+    ),
+  ]);
+}
+
+/**
+ * Must match collectPlanDiagnostics's own missingMeals check
+ * (itinerary-generation-constraints.ts) exactly — that hard validation
+ * gate requires both lunch and dinner unconditionally, on every day, with
+ * no exemption for a light/transfer/arrival day. This function used to
+ * only insert a missing meal when the day already had a same-period
+ * activity (hasDaytimeActivity/hasEveningActivity) — a real bug: on a day
+ * whose raw AI output happened to have no daytime or evening activity at
+ * all (a real, observed case from a live generation run), repair would
+ * never insert the missing meal, missingMeals would stay non-zero
+ * forever, and the whole plan would repeatedly fail validation and fall
+ * back to the generic template. Always filling both slots keeps repair
+ * and validation in agreement, so the loop can actually converge.
+ */
+export function findMissingMealSlots(items: AiGeneratedItem[]) {
   const missingSlots: DayPart[] = [];
   const hasLunch = items.some((item) => item.slot === "lunch" && isFoodItem(item.category));
   const hasDinner = items.some((item) => item.slot === "dinner" && isFoodItem(item.category));
-  const hasDaytimeActivity = items.some(
-    (item) =>
-      !isFoodItem(item.category) &&
-      (item.slot === "morning" || item.slot === "afternoon" || item.slot === "lunch")
-  );
-  const hasEveningActivity = items.some(
-    (item) =>
-      !isFoodItem(item.category) &&
-      (item.slot === "afternoon" || item.slot === "evening" || item.slot === "night")
-  );
 
-  if (!hasLunch && hasDaytimeActivity) {
-    missingSlots.push("lunch");
-  }
-
-  if (!hasDinner && (hasEveningActivity || items.length >= 2)) {
-    missingSlots.push("dinner");
-  }
+  if (!hasLunch) missingSlots.push("lunch");
+  if (!hasDinner) missingSlots.push("dinner");
 
   return missingSlots;
 }
@@ -1207,17 +1476,23 @@ export function scoreMealCandidate(
   let score = 0;
   const { anchor, nextAnchor } = getRelevantMealAnchors(day, slot);
   const isExplicitMealRequest = payload.selectedPlaces.some((place) => place.id === recommendation.id);
+  const mealTransportation =
+    recommendation.category === "cafe"
+      ? "הליכה"
+      : payload.preferences.transportationPreferences ||
+        day.transportation ||
+        "תחבורה מקומית";
+  // A restaurant reached on foot must be much closer than one reached by
+  // transit/car/taxi from the last place — 20 minutes walking, 45 minutes
+  // otherwise (tighter than the general MAX_LOCAL_TRAVEL_MINUTES, which
+  // still applies to non-food replacements).
+  const mealHardLimit = mealTransportation.includes("הליכה") ? MEAL_MAX_WALKING_MINUTES : MEAL_MAX_TRAVEL_MINUTES;
   const proximity = scoreRouteProximity(recommendation, {
     anchor,
     nextStop: nextAnchor,
     pace: payload.preferences.tripPace,
-    transportation:
-      recommendation.category === "cafe"
-        ? "הליכה"
-        : payload.preferences.transportationPreferences ||
-          day.transportation ||
-          "תחבורה מקומית",
-    hardLimitMinutes: MAX_LOCAL_TRAVEL_MINUTES,
+    transportation: mealTransportation,
+    hardLimitMinutes: mealHardLimit,
     idealLimitMinutes: IDEAL_LOCAL_TRAVEL_MINUTES,
     explicitRequest: isExplicitMealRequest,
   });
@@ -1290,11 +1565,39 @@ export function pickNearbyMealRecommendation(
   usedMealNames: Set<string>
 ) {
   const usedNames = new Set(day.items.map((item) => item.name.trim().toLowerCase()));
-  const ranked = [...payload.recommendations, ...payload.selectedPlaces]
+  const baseCandidates = [...payload.recommendations, ...payload.selectedPlaces]
     .filter((recommendation) => isFoodItem(recommendation.category))
     .filter((recommendation) => !isAccessibilityConflict(recommendation, payload))
     .filter((recommendation) => !isDietaryConflict(recommendation, profile))
-    .filter((recommendation) => !usedNames.has(recommendation.name.trim().toLowerCase()))
+    .filter((recommendation) => !usedNames.has(recommendation.name.trim().toLowerCase()));
+
+  // A trip-wide repeat is excluded outright (spec item 42) whenever a real
+  // alternative exists — only falls back to allowing one when every
+  // remaining candidate has already been used elsewhere in the trip, so a
+  // sparse destination's candidate pool running out never leaves a day
+  // without a meal at all.
+  const neverUsedCandidates = baseCandidates.filter(
+    (recommendation) => !usedMealNames.has(recommendation.name.trim().toLowerCase())
+  );
+  const candidates = neverUsedCandidates.length > 0 ? neverUsedCandidates : baseCandidates;
+
+  // Generic worldwide architecture (Phase 5/16): a hard reject, not just a
+  // scoring penalty — real bug found in live QA: with the old unconditional
+  // "closeEnough ?? ranked[0]" fallback, if every real recommendation in
+  // the whole trip happened to score poorly here (e.g. the candidate pool
+  // skews toward a different city entirely), this still returned the
+  // least-bad one rather than admitting nothing real fits — inserting a
+  // restaurant from another city into the route. The caller already has a
+  // graceful synthetic placeholder for exactly this case
+  // (buildFallbackMealPlaceholder); this now returns null and lets it be
+  // used instead of ever placing a genuinely wrong-city meal.
+  const geographicallyCompatible = candidates.filter((recommendation) =>
+    isCandidateGeographicallyCompatibleWithDay(recommendation, day.items, {
+      isDayTripDay: isDayTripDay(day),
+    })
+  );
+
+  const ranked = geographicallyCompatible
     .map((recommendation) => ({
       recommendation,
       score: scoreMealCandidate(
@@ -1308,8 +1611,7 @@ export function pickNearbyMealRecommendation(
     }))
     .sort((left, right) => right.score - left.score);
 
-  const closeEnough = ranked.find((entry) => entry.score > -20)?.recommendation;
-  return closeEnough ?? ranked[0]?.recommendation ?? null;
+  return ranked.find((entry) => entry.score > -20)?.recommendation ?? null;
 }
 
 function buildSupplementalMealItem(
@@ -1354,9 +1656,11 @@ function buildSupplementalMealItem(
     plannedStartTime: defaultSlotTime(slot),
     estimatedDurationMinutes:
       recommendation.estimatedDurationMinutes ?? (slot === "lunch" ? 60 : 75),
-    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null),
+    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null, payload.preferences.travelers),
     travelMinutes,
     openingHours: recommendation.openingHours || "לא זמין",
+    lastEntryTime: "",
+    canonicalPlaceId: resolveCanonicalPlaceId({ recommendationId: recommendation.id, lat: coords.lat, lon: coords.lon }),
     reservationRequired: recommendation.reservationRequired,
     transportation:
       recommendation.category === "cafe"
@@ -1392,13 +1696,39 @@ const FALLBACK_DINNER_MEAL_PHRASES = [
 function buildFallbackMealPlaceholder(
   day: AiGeneratedDay,
   slot: DayPart,
-  payload: AiItineraryRequest
+  payload: AiItineraryRequest,
+  usedMealNames: Set<string> = new Set()
 ): AiGeneratedItem {
   const area = normalizeAreaLabel(day.cityRegion || day.items[0]?.location || payload.countryName);
   const isLunch = slot === "lunch";
   const phrases = isLunch ? FALLBACK_LUNCH_MEAL_PHRASES : FALLBACK_DINNER_MEAL_PHRASES;
+  const startIndex = day.dayNumber % phrases.length;
+  // Real bug found during end-to-end QA generation: a fixed 3-phrase
+  // rotation keyed only on dayNumber % phrases.length collides on every
+  // 3rd day for any trip long enough that the area label repeats (day 1
+  // and day 4 land on the exact same phrase+area string) —
+  // duplicateRestaurants is a hard validation gate, so this alone could
+  // fail an otherwise-good real Gemini plan and force a fallback to the
+  // generic template. Walk the rotation for a name not already used
+  // anywhere else in the trip, the same usedMealNames convention
+  // pickNearbyMealRecommendation already uses for real candidates.
+  let name = "";
+  for (let offset = 0; offset < phrases.length; offset += 1) {
+    const candidate = phrases[(startIndex + offset) % phrases.length](area);
+    if (!usedMealNames.has(candidate.trim().toLowerCase())) {
+      name = candidate;
+      break;
+    }
+  }
+  if (!name) {
+    // Every phrase variant for this area is already used somewhere in the
+    // trip (an unusually long, fully candidate-starved trip) — append the
+    // day number so the string stays genuinely unique instead of quietly
+    // duplicating and failing validation again.
+    name = `${phrases[startIndex](area)} (יום ${day.dayNumber})`;
+  }
   return {
-    name: phrases[day.dayNumber % phrases.length](area),
+    name,
     category: isLunch ? "cafe" : "restaurant",
     location: area,
     shortDescription: isLunch
@@ -1408,6 +1738,7 @@ function buildFallbackMealPlaceholder(
     plannedStartTime: defaultSlotTime(slot),
     estimatedDurationMinutes: isLunch ? 60 : 75,
     approximatePrice: null,
+    pricePerPerson: null,
     priceOriginalAmount: null,
     priceOriginalCurrency: null,
     priceConvertedAmount: null,
@@ -1417,6 +1748,8 @@ function buildFallbackMealPlaceholder(
     sourceType: null,
     travelMinutes: 10,
     openingHours: "לא זמין",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
     reservationRequired: false,
     transportation: "הליכה",
     mapLink: buildMapLink(area, null, null),
@@ -1431,7 +1764,7 @@ function buildFallbackMealPlaceholder(
   };
 }
 
-function fillDerivedDayFields(
+export function fillDerivedDayFields(
   day: AiGeneratedDay,
   payload: AiItineraryRequest,
   profile?: TripPreferenceProfile
@@ -1467,6 +1800,7 @@ function fillDerivedDayFields(
           "תחבורה מקומית",
         mapLink: item.mapLink || buildMapLink(item.name, item.lat, item.lon),
         approximatePrice: item.approximatePrice ?? item.priceConvertedAmount ?? null,
+        canonicalPlaceId: resolveCanonicalPlaceId(item),
       };
     });
 
@@ -1541,6 +1875,9 @@ function fillDerivedDayFields(
   return {
     ...day,
     items,
+    // Always content-derived (spec items 49/50), independent of whatever
+    // title the AI wrote — never left as freeform AI text.
+    theme: inferDayThemeLabel(items),
     // Same reasoning as activity/food/transport above: trust the freshly
     // computed total, including a genuine 0, rather than falling back to
     // the day's previous estimatedCost.
@@ -1700,16 +2037,17 @@ export function repairDayGeography(
           ...nextDay,
           items: nextDay.items.filter((item) => item !== mealToReplace),
         };
+        const dayMealNames = new Set(
+          dayWithoutMeal.items
+            .filter((item) => isFoodItem(item.category))
+            .map((item) => item.name.trim().toLowerCase())
+        );
         const replacement = pickNearbyMealRecommendation(
           payload,
           dayWithoutMeal,
           mealToReplace.slot === "dinner" ? "dinner" : "lunch",
           profile,
-          new Set(
-            dayWithoutMeal.items
-              .filter((item) => isFoodItem(item.category))
-              .map((item) => item.name.trim().toLowerCase())
-          )
+          dayMealNames
         );
         const nextMeal = replacement
           ? buildSupplementalMealItem(
@@ -1721,7 +2059,8 @@ export function repairDayGeography(
           : buildFallbackMealPlaceholder(
               dayWithoutMeal,
               mealToReplace.slot === "dinner" ? "dinner" : "lunch",
-              payload
+              payload,
+              dayMealNames
             );
 
         nextDay = fillDerivedDayFields(
@@ -1788,16 +2127,92 @@ export function repairDayGeography(
   return fillDerivedDayFields(resequenceDayItems(nextDay), payload, profile);
 }
 
-function repairDayStructure(
+/**
+ * Real code-level opening-hours enforcement (spec items 16/17, regression
+ * tests 84/85) — items are only ever swapped when `violatesOpeningHours`
+ * confidently says so (parsed both the hours and the planned start time;
+ * see opening-hours.ts's "never reject what we can't parse" rule), never
+ * guessed from ambiguous source text. Same substitution pattern as
+ * `repairDayGeography`: prefer a real matching candidate, fall back to a
+ * generic free-exploration replacement. Bounded per day so a day with
+ * several violations still converges without looping the whole plan.
+ */
+export function repairOpeningHoursViolations(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  return days.map((day) => {
+    let nextDay = day;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const violatingItem = nextDay.items.find(
+        (item) => !item.locked && !item.fixedTime && violatesOpeningHours(item)
+      );
+      if (!violatingItem) break;
+
+      const replacement = pickReplacementRecommendation({
+        payload,
+        day: nextDay,
+        item: violatingItem,
+        profile,
+        usedPlaceKeys: new Set(nextDay.items.map((item) => buildItemKey(item))),
+      });
+      const nextItem = replacement
+        ? buildReplacementItem(replacement, violatingItem, nextDay, payload)
+        : buildFreeExplorationReplacement(violatingItem, nextDay);
+      nextDay = fillDerivedDayFields(
+        resequenceDayItems(replaceItemInDay(nextDay, violatingItem, nextItem)),
+        payload,
+        profile
+      );
+    }
+    return nextDay;
+  });
+}
+
+/**
+ * Real bug found during end-to-end QA generation (a live France trip with
+ * Disneyland Paris): a day starting out as a genuine full-day-anchor day
+ * correctly has its meals omitted (spec item 12) — but if a LATER repair
+ * step inside repairDayGeography (crossCityItems/foodDominant/outlier
+ * replacement) swaps the full-day anchor itself out for a regular-scale
+ * substitute, the day is no longer a full-day-anchor day and DOES need
+ * meals again, yet nothing re-ran meal insertion since it only happened
+ * once, at the very top of repairDayStructure, before that anchor was
+ * replaced. The day was then stuck with no meals until an entirely new
+ * outer repairPlan attempt started repairDayStructure over from scratch —
+ * i.e. missingMeals could take several whole attempts to converge, or
+ * never converge within the attempt budget at all. Split out so it can be
+ * called both before AND after repairDayGeography in the same pass.
+ */
+export function insertMissingMeals(
   day: AiGeneratedDay,
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
-  dayIndex: number,
-  dayCount: number,
-  usedMealNames: Set<string>
-) {
-  let nextDay = resequenceDayItems({ ...day, items: sortItems(day.items.map(normalizeGeneratedItemCoordinates)) });
+  usedMealNames: Set<string>,
+  dayCount?: number,
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+): AiGeneratedDay {
+  let nextDay = day;
+  // Real bug found during end-to-end QA generation (a live Israel trip): a
+  // dinner correctly excluded from missingMeals on the departure day (see
+  // hasUsableGapForMeal — the window itself rules it out) still got
+  // inserted here regardless, since findMissingMealSlots never knew about
+  // window feasibility at all — only the VALIDATOR did. The inserted
+  // placeholder then got scheduled well past the real departure cutoff,
+  // and nothing re-ran enforceArrivalDepartureWindow afterward to catch
+  // it, so it survived straight into arrivalDepartureWindowViolations.
+  // Reusing the exact same feasibility check the validator uses keeps
+  // insertion and validation from ever disagreeing again — the same fix
+  // shape as findMissingMealSlots's own original bug.
+  const isArrivalDay = dayCount != null && day.dayNumber === 1;
+  const isDepartureDay = dayCount != null && day.dayNumber === dayCount;
+  const lunchIsFeasible = !arrivalDepartureWindow || hasUsableGapForMeal(nextDay, LUNCH_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+  const dinnerIsFeasible = !arrivalDepartureWindow || hasUsableGapForMeal(nextDay, DINNER_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+
   for (const missingMealSlot of findMissingMealSlots(nextDay.items)) {
+    if (missingMealSlot === "lunch" && !lunchIsFeasible) continue;
+    if (missingMealSlot === "dinner" && !dinnerIsFeasible) continue;
     const recommendation = pickNearbyMealRecommendation(
       payload,
       nextDay,
@@ -1808,7 +2223,7 @@ function repairDayStructure(
 
     const nextMealItem = recommendation
       ? buildSupplementalMealItem(recommendation, missingMealSlot, nextDay, payload)
-      : buildFallbackMealPlaceholder(nextDay, missingMealSlot, payload);
+      : buildFallbackMealPlaceholder(nextDay, missingMealSlot, payload, usedMealNames);
 
     if (nextMealItem && nextMealItem.name) {
       nextDay = {
@@ -1817,6 +2232,20 @@ function repairDayStructure(
       };
     }
   }
+  return nextDay;
+}
+
+export function repairDayStructure(
+  day: AiGeneratedDay,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  dayIndex: number,
+  dayCount: number,
+  usedMealNames: Set<string>,
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+) {
+  let nextDay = resequenceDayItems({ ...day, items: sortItems(day.items.map(normalizeGeneratedItemCoordinates)) });
+  nextDay = insertMissingMeals(nextDay, payload, profile, usedMealNames, dayCount, arrivalDepartureWindow);
 
   if (!nextDay.title || /^day\s+\d+$/i.test(nextDay.title.trim())) {
     const area = normalizeAreaLabel(nextDay.cityRegion || nextDay.items[0]?.location || payload.countryName);
@@ -1862,6 +2291,11 @@ function repairDayStructure(
   }
 
   nextDay = repairDayGeography(nextDay, payload, profile);
+  // See insertMissingMeals's own comment — repairDayGeography can change
+  // whether this is still a full-day-anchor day (e.g. by replacing the
+  // anchor itself), which can newly require meals that weren't needed (or
+  // weren't insertable) before it ran.
+  nextDay = insertMissingMeals(resequenceDayItems(nextDay), payload, profile, usedMealNames, dayCount, arrivalDepartureWindow);
 
   for (const meal of nextDay.items.filter((item) => isFoodItem(item.category))) {
     usedMealNames.add(meal.name.trim().toLowerCase());
@@ -1879,13 +2313,26 @@ function repairDayStructure(
  * currency and converts it deterministically rather than trusting any
  * in-model arithmetic (never confusing e.g. JPY for ILS).
  */
+/**
+ * `travelers` is only used on the freshly-AI-estimated path below — a
+ * matched real TripRecommendation candidate's own approximatePrice may
+ * already be a whole-group total from wherever it was sourced (its exact
+ * semantics haven't been audited), so it's passed through as-is rather
+ * than guessed at. For a fresh AI estimate, the prompt now explicitly asks
+ * for a PER-PERSON price (see buildPrompt's approximatePrice instruction),
+ * and the group total is computed here, once, deterministically — never
+ * trusted to the LLM's own multiplication (spec: totalActivityCost =
+ * pricePerPerson × travelers).
+ */
 export function resolveItemPriceFields(
   rawPrice: number | null | undefined,
   matchedRecommendation: TripRecommendation | null,
-  exchangeRateContext: ExchangeRateContext | null
+  exchangeRateContext: ExchangeRateContext | null,
+  travelers: number
 ): Pick<
   AiGeneratedItem,
   | "approximatePrice"
+  | "pricePerPerson"
   | "priceOriginalAmount"
   | "priceOriginalCurrency"
   | "priceConvertedAmount"
@@ -1897,6 +2344,7 @@ export function resolveItemPriceFields(
   if (matchedRecommendation?.priceOriginalCurrency && matchedRecommendation.priceConvertedAmount != null) {
     return {
       approximatePrice: matchedRecommendation.priceConvertedAmount,
+      pricePerPerson: null,
       priceOriginalAmount: matchedRecommendation.priceOriginalAmount ?? rawPrice ?? null,
       priceOriginalCurrency: matchedRecommendation.priceOriginalCurrency,
       priceConvertedAmount: matchedRecommendation.priceConvertedAmount,
@@ -1907,11 +2355,50 @@ export function resolveItemPriceFields(
     };
   }
 
-  const price = rawPrice ?? matchedRecommendation?.approximatePrice ?? null;
+  if (rawPrice != null) {
+    // A fresh AI-estimated price is per person by prompt contract — the
+    // group total is computed once, here, deterministically.
+    const travelerCount = Math.max(1, travelers || 1);
+    const totalPrice = rawPrice * travelerCount;
+    if (exchangeRateContext) {
+      const convertedAmount = Math.round(totalPrice * exchangeRateContext.rateToTarget * 100) / 100;
+      const convertedPerPerson = Math.round(rawPrice * exchangeRateContext.rateToTarget * 100) / 100;
+      return {
+        approximatePrice: convertedAmount,
+        pricePerPerson: convertedPerPerson,
+        priceOriginalAmount: totalPrice,
+        priceOriginalCurrency: exchangeRateContext.sourceCurrency,
+        priceConvertedAmount: convertedAmount,
+        priceExchangeRate: exchangeRateContext.rateToTarget,
+        priceRateTimestamp: exchangeRateContext.updatedAt,
+        convertedCurrency: exchangeRateContext.targetCurrency,
+        sourceType: "ai_estimate",
+      };
+    }
+    return {
+      approximatePrice: totalPrice,
+      pricePerPerson: rawPrice,
+      priceOriginalAmount: totalPrice,
+      priceOriginalCurrency: null,
+      priceConvertedAmount: totalPrice,
+      priceExchangeRate: null,
+      priceRateTimestamp: null,
+      convertedCurrency: null,
+      sourceType: "ai_estimate",
+    };
+  }
+
+  // No fresh AI price — fall back to a matched candidate's plain price.
+  // Its own per-person/total semantics aren't audited yet (see the
+  // interface comment on AiGeneratedItem.pricePerPerson), so it's treated
+  // as an already-resolved total, same as before this change — never
+  // multiplied a second time.
+  const price = matchedRecommendation?.approximatePrice ?? null;
   if (price != null && exchangeRateContext) {
     const convertedAmount = Math.round(price * exchangeRateContext.rateToTarget * 100) / 100;
     return {
       approximatePrice: convertedAmount,
+      pricePerPerson: null,
       priceOriginalAmount: price,
       priceOriginalCurrency: exchangeRateContext.sourceCurrency,
       priceConvertedAmount: convertedAmount,
@@ -1924,6 +2411,7 @@ export function resolveItemPriceFields(
 
   return {
     approximatePrice: price,
+    pricePerPerson: null,
     priceOriginalAmount: price,
     priceOriginalCurrency: null,
     priceConvertedAmount: price,
@@ -1972,7 +2460,12 @@ function enrichAiDay(
     const location = item.location || matchedRecommendation?.location || payload.countryName;
     const lat = matchedRecommendation?.lat ?? null;
     const lon = matchedRecommendation?.lon ?? null;
-    const priceFields = resolveItemPriceFields(item.approximatePrice, matchedRecommendation, exchangeRateContext);
+    const priceFields = resolveItemPriceFields(
+      item.approximatePrice,
+      matchedRecommendation,
+      exchangeRateContext,
+      payload.preferences.travelers
+    );
     const recommendationId = matchedRecommendation?.id ?? null;
     const existingFlags = findExistingItemFlags(payload, item.name, location, recommendationId);
 
@@ -1987,6 +2480,8 @@ function enrichAiDay(
       ...priceFields,
       travelMinutes: item.travelMinutes ?? null,
       openingHours: item.openingHours ?? matchedRecommendation?.openingHours ?? "לא זמין",
+      lastEntryTime: item.lastEntryTime ?? "",
+      canonicalPlaceId: resolveCanonicalPlaceId({ recommendationId, lat, lon }),
       reservationRequired: item.reservationRequired ?? matchedRecommendation?.reservationRequired ?? false,
       transportation: item.transportation ?? day.transportation,
       mapLink: matchedRecommendation?.mapLink || buildMapLink(item.name, lat, lon),
@@ -2005,6 +2500,9 @@ function enrichAiDay(
     dayNumber: day.dayNumber,
     date: day.date,
     title: day.title,
+    // Recomputed for real by fillDerivedDayFields once this day is merged
+    // into the pipeline (repairDayStructure always runs it through).
+    theme: "",
     cityRegion: day.cityRegion,
     accommodation: day.accommodation,
     notes: day.notes,
@@ -2054,6 +2552,27 @@ async function generateWithGemini(
   }
 
   return JSON.parse(raw) as RawGeneratedPlan;
+}
+
+/**
+ * A real, storable place identity (spec item 76) — `id:${recommendationId}`
+ * when known, else `coords:${lat}:${lon}` when the item has real
+ * coordinates, else "" (no fabricated name-only identity: two genuinely
+ * different places can share a generic name — see buildItemKey's own
+ * docstring below on why a name-only tier risks false-positive duplicate
+ * merges, a lesson already learned the hard way earlier this session).
+ * Deliberately separate from buildItemKey's own dedup-key computation
+ * (which additionally falls back to a random generic id for placeless
+ * filler) — this function only ever reports a real identity or none,
+ * stored on the item for UI/future consumers to key off directly instead
+ * of reaching for recommendationId themselves.
+ */
+export function resolveCanonicalPlaceId(item: Pick<AiGeneratedItem, "recommendationId" | "lat" | "lon">): string {
+  if (item.recommendationId) return `id:${item.recommendationId}`;
+  if (item.lat != null && item.lon != null) {
+    return `coords:${item.lat.toFixed(3)}:${item.lon.toFixed(3)}`;
+  }
+  return "";
 }
 
 export function buildItemKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
@@ -2163,17 +2682,39 @@ const FREE_EXPLORATION_PHRASES: Array<(area: string) => string> = [
 export function buildFreeExplorationReplacement(item: AiGeneratedItem, day: AiGeneratedDay): AiGeneratedItem {
   const area = normalizeAreaLabel(day.cityRegion || item.location || day.accommodation || "");
   const variantIndex = (day.dayNumber * 7 + SLOT_ORDER.indexOf(item.slot)) % FREE_EXPLORATION_PHRASES.length;
+  // Real bug found during end-to-end QA generation: a food item replaced
+  // here (no real candidate available) used to get demoted to category
+  // "hidden_gem" like any other replaced item — silently turning an
+  // already-inserted lunch/dinner stop back into a non-food item.
+  // collectPlanDiagnostics' missingMeals check (correctly) flagged the day
+  // as still missing that meal even though repairDayStructure had just
+  // inserted one earlier in the very same pass, so missingMeals could
+  // never converge to 0 and real Gemini plans kept failing validation. A
+  // food item being replaced must stay a food item — reusing the same
+  // lunch/dinner placeholder phrasing buildFallbackMealPlaceholder uses.
+  const isLunch = item.slot === "lunch" || (item.category === "cafe" && item.slot !== "dinner");
+  const isFood = isFoodItem(item.category);
+  const foodPhrases = isLunch ? FALLBACK_LUNCH_MEAL_PHRASES : FALLBACK_DINNER_MEAL_PHRASES;
   return {
     ...item,
-    name: area ? FREE_EXPLORATION_PHRASES[variantIndex](area) : "שיטוט חופשי וגמיש",
-    category:
-      item.category === "museum" || isFoodItem(item.category) || item.category === "transportation"
-        ? "hidden_gem"
-        : item.category,
+    name: isFood
+      ? area
+        ? foodPhrases[day.dayNumber % foodPhrases.length](area)
+        : isLunch
+          ? "שוק או אזור אוכל מקומי"
+          : "אזור אוכל מומלץ לערב"
+      : area
+        ? FREE_EXPLORATION_PHRASES[variantIndex](area)
+        : "שיטוט חופשי וגמיש",
+    category: isFood ? (isLunch ? "cafe" : "restaurant") : item.category === "museum" || item.category === "transportation" ? "hidden_gem" : item.category,
     location: area || item.location,
-    shortDescription: area
-      ? `חלופה גמישה וזולה באזור ${area} כדי לשמור על הקצב והתקציב בלי לנסוע רחוק.`
-      : "חלופה גמישה וזולה באותו אזור כדי לשמור על קצב ותקציב.",
+    shortDescription: isFood
+      ? area
+        ? `חלופה גמישה וזולה לארוחה באזור ${area} כדי לשמור על הקצב והתקציב בלי לנסוע רחוק.`
+        : "חלופה גמישה וזולה לארוחה כדי לשמור על קצב ותקציב."
+      : area
+        ? `חלופה גמישה וזולה באזור ${area} כדי לשמור על הקצב והתקציב בלי לנסוע רחוק.`
+        : "חלופה גמישה וזולה באותו אזור כדי לשמור על קצב ותקציב.",
     approximatePrice: 0,
     priceOriginalAmount: 0,
     priceOriginalCurrency: "ILS",
@@ -2253,9 +2794,11 @@ function buildInsertedRecommendationItem(
     slot,
     plannedStartTime: slot === "morning" ? "10:00" : slot === "afternoon" ? "15:30" : "19:30",
     estimatedDurationMinutes: recommendation.estimatedDurationMinutes ?? 90,
-    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null),
+    ...resolveItemPriceFields(recommendation.approximatePrice, recommendation, null, payload.preferences.travelers),
     travelMinutes,
     openingHours: recommendation.openingHours || "לא זמין",
+    lastEntryTime: "",
+    canonicalPlaceId: resolveCanonicalPlaceId({ recommendationId: recommendation.id, lat: coords.lat, lon: coords.lon }),
     reservationRequired: recommendation.reservationRequired,
     transportation:
       day.transportation || payload.preferences.transportationPreferences || "תחבורה מקומית",
@@ -2310,6 +2853,18 @@ export function pickReplacementRecommendation(args: {
     .filter((candidate) => !includesAnyKeyword(`${candidate.name} ${candidate.location}`, args.profile.avoidKeywords))
     .filter((candidate) => !isAccessibilityConflict(candidate, args.payload))
     .filter((candidate) => !isDietaryConflict(candidate, args.profile))
+    // Generic worldwide architecture (Phase 5/14): a HARD reject, not just
+    // a scoring penalty — a candidate that scoreRouteProximity would rank
+    // well on other dimensions could still be genuinely in a different
+    // city/region from everything already in this day. Judged against
+    // every existing item's real coordinates, not just the immediate
+    // anchor, so it still catches a mismatch even when the "anchor" happens
+    // to be the one out-of-place item itself.
+    .filter((candidate) =>
+      isCandidateGeographicallyCompatibleWithDay(candidate, args.day.items, {
+        isDayTripDay: isDayTripDay(args.day),
+      })
+    )
     .sort((left, right) => {
       const leftAreaScore =
         normalizeAreaLabel(left.location).toLowerCase() === area.toLowerCase() ? 18 : 0;
@@ -2416,7 +2971,7 @@ export function applyDeterministicReplacement(
   };
 }
 
-function chooseTargetDayIndexForRecommendation(
+export function chooseTargetDayIndexForRecommendation(
   days: AiGeneratedDay[],
   recommendation: AiItineraryRequest["recommendations"][number],
   profile: TripPreferenceProfile
@@ -2434,6 +2989,29 @@ function chooseTargetDayIndexForRecommendation(
       candidateArea && dayArea && (candidateArea.includes(dayArea) || dayArea.includes(candidateArea))
         ? 26
         : 0;
+    // Generic worldwide architecture (Phase 5): a must-visit place must not
+    // land on whichever day merely has the most free capacity when no
+    // text-based area label happens to match — real coordinates are the
+    // authoritative signal, weighted well above capacity, so a place 100km
+    // from every item on a spacious day no longer wins over a place 2km
+    // from every item on a fuller one.
+    const dayItemsWithCoordinates = day.items.filter((item) => item.lat != null && item.lon != null);
+    const nearestDistanceKm =
+      recommendation.lat != null && recommendation.lon != null && dayItemsWithCoordinates.length > 0
+        ? Math.min(
+            ...dayItemsWithCoordinates.map((item) => haversineKm(item.lat, item.lon, recommendation.lat, recommendation.lon))
+          )
+        : null;
+    const geographicScore =
+      nearestDistanceKm == null
+        ? 0
+        : nearestDistanceKm < 5
+          ? 40
+          : nearestDistanceKm < 15
+            ? 25
+            : nearestDistanceKm < CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM
+              ? 10
+              : -30;
     const preferredAreaScore =
       profile.preferredAreaKeywords.length > 0 &&
       includesAnyKeyword(`${day.cityRegion} ${day.accommodation}`, profile.preferredAreaKeywords)
@@ -2448,7 +3026,7 @@ function chooseTargetDayIndexForRecommendation(
     )
       ? -12
       : 0;
-    const score = areaScore + preferredAreaScore + capacityScore / 20 + transferPenalty;
+    const score = areaScore + geographicScore + preferredAreaScore + capacityScore / 20 + transferPenalty;
 
     if (score > bestScore) {
       bestScore = score;
@@ -2536,9 +3114,14 @@ function ensureMustVisitCoverage(
       continue;
     }
 
+    // Thread 1 (locked/fixed-time hard requirement): a locked or
+    // fixed-time item must never be sacrificed to make room for something
+    // else, must-visit coverage included — real bug found while auditing
+    // every repair pass for this guarantee, this filter had no exemption
+    // for either flag at all.
     const replaceableEntry = [...targetDay.items]
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => !isFoodItem(item.category))
+      .filter(({ item }) => !isFoodItem(item.category) && !isProtectedItem(item))
       .filter(
         ({ item }) =>
           !profile.mustVisitKeywords.some((mustVisitKeyword) =>
@@ -2647,6 +3230,16 @@ export function diversifyActivities(
             `${recommendation.name} ${recommendation.location}`,
             profile.avoidKeywords
           )
+      )
+      // Generic worldwide architecture (Phase 5/14/23): a diversity/quota
+      // repair must never import an otherwise-fitting candidate (e.g. the
+      // under-represented tier's best scorer) from a genuinely different
+      // city just to balance the activity mix — that used to be only a
+      // soft area-label bonus below, easily outweighed by the tier bonus.
+      .filter((recommendation) =>
+        isCandidateGeographicallyCompatibleWithDay(recommendation, day.items, {
+          isDayTripDay: isDayTripDay(day),
+        })
       )
       .sort((left, right) => {
         const leftAreaScore =
@@ -2840,6 +3433,163 @@ export function fixOverloadedDays(
   return mutableDays;
 }
 
+/**
+ * At most two dedicated food stops per day (spec item 37) — breakfast is
+ * assumed near the hotel and never scheduled as its own item, and a coffee
+ * stop is optional flavor, not a mandatory event. The lowest-priority,
+ * non-core (not lunch/dinner) items go first — same
+ * lowest-priority-removed-first rule as fixOverloadedDays/
+ * enforceBudgetOnDays, so a locked/must-priority food item is never the one
+ * dropped.
+ */
+export function enforceMealCountLimit(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  return days.map((day) => {
+    const foodItems = day.items.filter((item) => isFoodItem(item.category));
+    const excessCount = foodItems.length - 2;
+    if (excessCount <= 0) return day;
+
+    const removalOrder = foodItems
+      .filter((item) => !item.locked && !item.fixedTime)
+      .sort((left, right) => {
+        const priorityDelta = priorityRemovalWeight(left.priority) - priorityRemovalWeight(right.priority);
+        if (priorityDelta !== 0) return priorityDelta;
+        const leftIsCore = left.slot === "lunch" || left.slot === "dinner" ? 1 : 0;
+        const rightIsCore = right.slot === "lunch" || right.slot === "dinner" ? 1 : 0;
+        return leftIsCore - rightIsCore;
+      });
+
+    const toRemove = new Set(removalOrder.slice(0, excessCount));
+    if (toRemove.size === 0) return day;
+
+    return fillDerivedDayFields(
+      resequenceDayItems({ ...day, items: day.items.filter((item) => !toRemove.has(item)) }),
+      payload,
+      profile
+    );
+  });
+}
+
+/**
+ * Minimum spacing between consecutive food stops (spec item 39) —
+ * lunch→dinner needs 4h+, anything else (e.g. an extra cafe near a meal)
+ * needs 3h+. Nudges the later item's own start time forward rather than
+ * replacing it — same "reschedule before you replace" preference already
+ * used by the scheduler.
+ */
+export function enforceMealSpacing(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  return days.map((day) => {
+    const orderedFoodItems = [...day.items]
+      .filter((item) => isFoodItem(item.category))
+      .sort((left, right) => (clockToMinutes(left.plannedStartTime) ?? 0) - (clockToMinutes(right.plannedStartTime) ?? 0));
+
+    let changed = false;
+    // Real bug found during end-to-end QA generation: this used to store
+    // only the nudged start time, leaving endTime stale at
+    // originalStart+duration — once the start moved later than that stale
+    // endTime, the item ended up with endTime BEFORE plannedStartTime (a
+    // negative-duration item no real traveler could follow). Tracking both
+    // times and shifting endTime by the item's own real duration keeps the
+    // meal's length intact while only moving it later.
+    const adjustedTimes = new Map<AiGeneratedItem, { start: string; end: string }>();
+
+    for (let index = 1; index < orderedFoodItems.length; index += 1) {
+      const previousMeal = orderedFoodItems[index - 1];
+      const currentMeal = orderedFoodItems[index];
+      if (currentMeal.locked || currentMeal.fixedTime) continue;
+
+      const previousMinutes = clockToMinutes(adjustedTimes.get(previousMeal)?.start ?? previousMeal.plannedStartTime);
+      const currentMinutes = clockToMinutes(currentMeal.plannedStartTime);
+      if (previousMinutes == null || currentMinutes == null) continue;
+
+      const minimumGap = previousMeal.slot === "lunch" && currentMeal.slot === "dinner" ? 240 : 180;
+      if (currentMinutes - previousMinutes < minimumGap) {
+        const newStartMinutes = previousMinutes + minimumGap;
+        const currentEndMinutes = currentMeal.endTime ? clockToMinutes(currentMeal.endTime) : null;
+        const durationMinutes =
+          currentEndMinutes != null && currentEndMinutes > currentMinutes
+            ? currentEndMinutes - currentMinutes
+            : (currentMeal.estimatedDurationMinutes ?? 60);
+        adjustedTimes.set(currentMeal, {
+          start: minutesToClock(newStartMinutes),
+          end: minutesToClock(newStartMinutes + durationMinutes),
+        });
+        changed = true;
+      }
+    }
+
+    if (!changed) return day;
+
+    // Deliberately NOT run back through resequenceDayItems here — its
+    // underlying scheduleDayItems fully re-derives plannedStartTime from
+    // item order/duration and would silently discard the adjusted time
+    // this function just computed. fillDerivedDayFields only recomputes
+    // cost/travel/warning fields and leaves plannedStartTime/endTime
+    // untouched.
+    return fillDerivedDayFields(
+      {
+        ...day,
+        items: day.items.map((item) => {
+          const adjusted = adjustedTimes.get(item);
+          return adjusted ? { ...item, plannedStartTime: adjusted.start, endTime: adjusted.end } : item;
+        }),
+      },
+      payload,
+      profile
+    );
+  });
+}
+
+const WEATHER_BACKUP_OUTDOOR_SHARE_THRESHOLD = 0.6;
+
+/**
+ * Plan B (spec items 64/65) — an outdoor-heavy day gets ONE indoor backup
+ * suggestion appended to its existing `alternatives` list, never inserted
+ * into the main schedule (the spec's own "do not display unless needed").
+ * Advisory only, not a passesValidation gate — this app has no real
+ * weather forecast, so there's never a genuine "it will rain" signal to
+ * act on, only a sensible fallback to have on hand.
+ */
+export function ensureWeatherBackup(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest
+): AiGeneratedDay[] {
+  return days.map((day) => {
+    const anchorItems = day.items.filter((item) => isAnchorDayItem(item));
+    if (anchorItems.length === 0) return day;
+
+    const outdoorShare =
+      anchorItems.filter((item) => classifyWeatherSensitivity(item) === "outdoor").length / anchorItems.length;
+    if (outdoorShare <= WEATHER_BACKUP_OUTDOOR_SHARE_THRESHOLD) return day;
+
+    const usedNames = new Set(day.items.map((item) => item.name.trim().toLowerCase()));
+    const indoorBackup = [...payload.recommendations, ...payload.selectedPlaces].find(
+      (candidate) =>
+        classifyWeatherSensitivity(candidate) === "indoor" &&
+        !usedNames.has(candidate.name.trim().toLowerCase()) &&
+        // Generic worldwide architecture (Phase 14): a rain-backup
+        // suggestion is still surfaced to the traveler as part of this
+        // day's route — it must belong to the same area as everything
+        // else in the day, not just be the first indoor place anywhere in
+        // the whole country's candidate pool.
+        isCandidateGeographicallyCompatibleWithDay(candidate, day.items, { isDayTripDay: isDayTripDay(day) })
+    );
+    if (!indoorBackup) return day;
+
+    const backupNote = `חלופה למקרה של גשם: ${indoorBackup.name}`;
+    if (day.alternatives.includes(backupNote)) return day;
+
+    return { ...day, alternatives: normalizeActionableMessages([...day.alternatives, backupNote]) };
+  });
+}
+
 // Day-utilization targets (spec item 25) — expressed as a share of the
 // pace's own dailyCapacityMinutes (the same constant fixOverloadedDays
 // already treats as the max ceiling), so "underfilled" and "overloaded" are
@@ -2862,6 +3612,7 @@ function buildInsertionTemplateItem(day: AiGeneratedDay): AiGeneratedItem {
     plannedStartTime: "",
     estimatedDurationMinutes: null,
     approximatePrice: null,
+    pricePerPerson: null,
     priceOriginalAmount: null,
     priceOriginalCurrency: null,
     priceConvertedAmount: null,
@@ -2871,6 +3622,8 @@ function buildInsertionTemplateItem(day: AiGeneratedDay): AiGeneratedItem {
     sourceType: null,
     travelMinutes: null,
     openingHours: "",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
     reservationRequired: false,
     transportation: "",
     mapLink: "",
@@ -3013,6 +3766,319 @@ export function enforceBudgetOnDays(
   return mutableDays;
 }
 
+/**
+ * Active repair for content Gemini itself already returned wrong (spec §B).
+ * Note this is NOT starting from zero: `repairDayGeography` (called from
+ * inside `repairDayStructure`, which already runs at the top of every
+ * attempt below) already detects a day's own crossCityItems and replaces
+ * the worst offender in place, preferring a real matching candidate over a
+ * generic placeholder — so by the time this function runs, most real
+ * cross-region content is already gone. What this adds on top, genuinely
+ * new this pass:
+ *   1. A "move to another day" preference — if some OTHER day's own real
+ *      content already sits close to the outlier, relocating it there beats
+ *      replacing it with a placeholder (repairDayGeography has no
+ *      cross-day step at all; it can only ever act within one day).
+ *   2. Structured protectedGeographicConflict reporting — a locked/
+ *      fixed-time outlier was already silently left in place by
+ *      repairDayGeography's own `!item.locked && !item.fixedTime` guards;
+ *      this surfaces that instead of leaving it invisible (spec §B5).
+ * Runs before alignDaysToTripFrame so that by the time titles/cityRegion
+ * get synced to the TripFrame, the day's actual content already deserves
+ * that label (spec §C6).
+ */
+export function repairCrossRegionDayContent(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): { days: AiGeneratedDay[]; protectedGeographicConflicts: ProtectedGeographicConflict[] } {
+  const protectedGeographicConflicts: ProtectedGeographicConflict[] = [];
+  const workingDays = days.slice();
+
+  for (let dayIndex = 0; dayIndex < workingDays.length; dayIndex += 1) {
+    const day = workingDays[dayIndex];
+    const geography = analyzeDayGeography(day, profile);
+    if (geography.crossCityItems.length === 0) continue;
+    if (isIntercityTransferDay(day) || isDayTripDay(day)) continue;
+
+    const outlierNames = new Set(geography.crossCityItems);
+    let mutableDay = day;
+    let touched = false;
+
+    for (const outlierName of outlierNames) {
+      const outlier = mutableDay.items.find((item) => item.name === outlierName);
+      if (!outlier) continue;
+
+      if (isProtectedItem(outlier)) {
+        protectedGeographicConflicts.push({
+          dayNumber: mutableDay.dayNumber,
+          itemName: outlier.name,
+          lat: outlier.lat,
+          lon: outlier.lon,
+          reason: "locked/fixed-time item is geographically incompatible with this day's other content",
+        });
+        continue;
+      }
+
+      const targetIndex = findCompatibleDayIndexForOutlier(workingDays, dayIndex, outlier, profile);
+      if (targetIndex != null) {
+        workingDays[targetIndex] = {
+          ...workingDays[targetIndex],
+          items: [...workingDays[targetIndex].items, outlier],
+        };
+        mutableDay = { ...mutableDay, items: mutableDay.items.filter((item) => item !== outlier) };
+        touched = true;
+        continue;
+      }
+
+      // Same "real candidate first, generic placeholder second" order as
+      // repairDayGeography — this outlier already survived that pass, so a
+      // fresh lookup rarely finds anything new, but it's never skipped
+      // purely for that reason.
+      const replacement = pickReplacementRecommendation({
+        payload,
+        day: mutableDay,
+        item: outlier,
+        profile,
+        usedPlaceKeys: new Set(mutableDay.items.map((item) => buildItemKey(item))),
+      });
+      const nextItem = replacement
+        ? buildReplacementItem(replacement, outlier, mutableDay, payload)
+        : buildFreeExplorationReplacement(outlier, mutableDay);
+      mutableDay = {
+        ...mutableDay,
+        items: mutableDay.items.map((item) => (item === outlier ? nextItem : item)),
+      };
+      touched = true;
+    }
+
+    if (touched) {
+      workingDays[dayIndex] = fillDerivedDayFields(
+        resequenceDayItems(normalizeDayCollections(mutableDay)),
+        payload,
+        profile
+      );
+    }
+  }
+
+  return { days: workingDays, protectedGeographicConflicts };
+}
+
+/** Nearest OTHER day whose own items already sit close to the outlier, with room left under its own capacity — never a day already flagged as a transfer/day-trip, whose cross-region spread is expected. */
+function findCompatibleDayIndexForOutlier(
+  days: AiGeneratedDay[],
+  originIndex: number,
+  outlier: AiGeneratedItem,
+  profile: TripPreferenceProfile
+): number | null {
+  if (outlier.lat == null || outlier.lon == null) return null;
+
+  let bestIndex: number | null = null;
+  let bestDistanceKm = CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM;
+
+  for (let index = 0; index < days.length; index += 1) {
+    if (index === originIndex) continue;
+    const candidateDay = days[index];
+    if (isIntercityTransferDay(candidateDay) || isDayTripDay(candidateDay)) continue;
+    if (calculateDayLoadMinutes(candidateDay) >= profile.dailyCapacityMinutes) continue;
+
+    const anchorsWithCoordinates = candidateDay.items.filter((item) => item.lat != null && item.lon != null);
+    if (anchorsWithCoordinates.length === 0) continue;
+
+    const nearestDistanceKm = Math.min(
+      ...anchorsWithCoordinates.map((item) => haversineKm(item.lat as number, item.lon as number, outlier.lat as number, outlier.lon as number))
+    );
+    if (nearestDistanceKm < bestDistanceKm) {
+      bestDistanceKm = nearestDistanceKm;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+}
+
+const TRANSPORT_MODE_LABELS_HE: Record<TransportMode, string> = {
+  walking: "הליכה",
+  transit: "תחבורה ציבורית",
+  car: "נסיעה ברכב",
+  taxi: "מונית",
+  train: "רכבת",
+  bus: "אוטובוס",
+};
+
+/**
+ * Explicit stay-transition timeline item (spec §C7) — represents a base
+ * change as a real, visible item rather than leaving it implicit, so every
+ * later feasibility/capacity calculation (calculateDayLoadMinutes,
+ * scheduling, the overload repair pass) sees the real time it consumes,
+ * same as any other item.
+ */
+function buildStayTransitionItem(transition: StayTransition): AiGeneratedItem {
+  const modeLabel = TRANSPORT_MODE_LABELS_HE[transition.transportMode];
+  const duration = Math.max(transition.estimatedTravelMinutes ?? 60, 15);
+
+  return {
+    name: `${modeLabel}: ${transition.fromBase} → ${transition.toBase}`,
+    category: "transportation",
+    location: transition.toBase,
+    shortDescription: `מעבר בסיס לינה מ${transition.fromBase} ל${transition.toBase}.`,
+    slot: "morning",
+    plannedStartTime: "09:00",
+    estimatedDurationMinutes: duration,
+    approximatePrice: 0,
+    pricePerPerson: null,
+    priceOriginalAmount: 0,
+    priceOriginalCurrency: "ILS",
+    priceConvertedAmount: 0,
+    priceExchangeRate: 1,
+    priceRateTimestamp: new Date().toISOString(),
+    convertedCurrency: null,
+    sourceType: null,
+    travelMinutes: duration,
+    openingHours: "",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
+    reservationRequired: false,
+    transportation: modeLabel,
+    mapLink: buildMapLink(transition.toBase, transition.toCoordinates?.lat ?? null, transition.toCoordinates?.lon ?? null),
+    lat: transition.toCoordinates?.lat ?? null,
+    lon: transition.toCoordinates?.lon ?? null,
+    bookingWarning: "",
+    alternativeSuggestion: "",
+    recommendationId: null,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
+  };
+}
+
+/**
+ * No-teleportation enforcement (spec §C2/§C3/§E) — every stay transition
+ * genuinely consumes schedule time on the day it happens, visible to every
+ * later capacity/feasibility check because it's a real item, not a side
+ * channel. Idempotent across repair attempts: a transition already
+ * represented (any transportation item carrying most of its estimated
+ * minutes) is left alone rather than duplicated.
+ */
+export function enforceStayTransitions(
+  days: AiGeneratedDay[],
+  transitions: StayTransition[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): { days: AiGeneratedDay[]; impossibleStayTransitionDetails: ImpossibleStayTransition[] } {
+  const impossibleStayTransitionDetails: ImpossibleStayTransition[] = [];
+  const mutableDays = [...days];
+
+  for (const transition of transitions) {
+    const requiredMinutes = transition.estimatedTravelMinutes;
+    if (requiredMinutes == null || requiredMinutes <= 0) continue;
+
+    const dayIndex = mutableDays.findIndex((day) => day.dayNumber === transition.dayNumber);
+    if (dayIndex === -1) continue;
+    const day = mutableDays[dayIndex];
+
+    const alreadyRepresented = day.items.some(
+      (item) => item.category === "transportation" && (item.travelMinutes ?? 0) >= requiredMinutes * 0.7
+    );
+    if (alreadyRepresented) continue;
+
+    // Section E5: a transition whose own required time alone already
+    // exceeds the day's realistic capacity is genuinely impossible — no
+    // amount of trimming other content fixes that. Still represented (spec
+    // §D: "visible to feasibility calculations", never hidden) rather than
+    // silently dropped.
+    if (requiredMinutes >= profile.dailyCapacityMinutes) {
+      impossibleStayTransitionDetails.push({
+        fromStay: transition.fromBase,
+        toStay: transition.toBase,
+        dayNumber: transition.dayNumber,
+        requiredTravelMinutes: requiredMinutes,
+        availableMinutes: profile.dailyCapacityMinutes,
+        reason: "estimated transition travel time alone exceeds the day's realistic daily capacity",
+      });
+    }
+
+    const transitionItem = buildStayTransitionItem(transition);
+    const withTransition = fillDerivedDayFields(
+      resequenceDayItems({ ...day, items: [transitionItem, ...day.items] }),
+      payload,
+      profile
+    );
+
+    // Section E1-E2: shrink the day's OTHER optional content around the
+    // now-real transition time, same generic overload repair every other
+    // day already uses — never removes protected items. Skipped for an
+    // already-impossible transition (flagged above): fixOverloadedDays has
+    // no notion of "this specific item must never be trimmed away," and
+    // when the transition ALONE exceeds capacity it would otherwise be the
+    // very thing trimmed first — the one outcome spec §D explicitly rules
+    // out ("visible to feasibility calculations", never hidden).
+    mutableDays[dayIndex] =
+      requiredMinutes < profile.dailyCapacityMinutes && calculateDayLoadMinutes(withTransition) > profile.dailyCapacityMinutes
+        ? (fixOverloadedDays([withTransition], payload, profile)[0] ?? withTransition)
+        : withTransition;
+  }
+
+  return { days: mutableDays, impossibleStayTransitionDetails };
+}
+
+/**
+ * Section A1/A6/A7 — before accepting an impossible stay transition as a
+ * hard failure, attempt bounded generic structural repair on the TripFrame
+ * itself (repairImpossibleStayTransition — boundary shift, base
+ * reselection, merge). Each successful structural change immediately
+ * rebuilds the derived StayTransition list from the NEW frame (spec §A6 —
+ * never patches stale derived state) before checking whether any
+ * transition is still impossible. Bounded by
+ * MAX_STAY_STRUCTURE_REPAIR_PASSES (spec §A7) — never loops indefinitely,
+ * and gives up (returning the frame/transitions unchanged from that point)
+ * the moment a pass makes no progress.
+ */
+export function attemptStayStructureRepair(
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  candidateAreas: string[],
+  protectedDayNumbers: Set<number>,
+  profile: TripPreferenceProfile
+): { tripFrame: TripFrame; stayTransitions: StayTransition[]; changed: boolean } {
+  let frame = tripFrame;
+  let changed = false;
+
+  for (let pass = 0; pass < MAX_STAY_STRUCTURE_REPAIR_PASSES; pass += 1) {
+    const transitions = buildStayTransitions(frame, areaAnchors);
+    const impossible = transitions.find(
+      (transition) =>
+        transition.estimatedTravelMinutes != null && transition.estimatedTravelMinutes >= profile.dailyCapacityMinutes
+    );
+    if (!impossible) break;
+
+    const phaseIndex = frame.phases.findIndex(
+      (phase) => phase.areaLabel === impossible.toBase && phase.startDayNumber === impossible.dayNumber
+    );
+    if (phaseIndex <= 0) break;
+
+    const result = repairImpossibleStayTransition({
+      frame,
+      phaseIndex,
+      candidateAreas,
+      protectedDayNumbers,
+      isTransitionFeasible: (fromArea, toArea) => {
+        const fromCoordinates = areaAnchors.get(fromArea);
+        const toCoordinates = areaAnchors.get(toArea);
+        if (!fromCoordinates || !toCoordinates) return false;
+        const distanceKm = haversineKm(fromCoordinates.lat, fromCoordinates.lon, toCoordinates.lat, toCoordinates.lon);
+        const mode = selectTransportMode(distanceKm, { hasLuggage: true, isIntercity: true });
+        return estimateMinutesForMode(distanceKm, mode) < profile.dailyCapacityMinutes;
+      },
+    });
+    if (!result.changed) break;
+    frame = result.frame;
+    changed = true;
+  }
+
+  return { tripFrame: frame, stayTransitions: buildStayTransitions(frame, areaAnchors), changed };
+}
+
 function alignDaysToTripFrame(days: AiGeneratedDay[], tripFrame: TripFrame): AiGeneratedDay[] {
   return days.map((day) => {
     if (isIntercityTransferDay(day)) return day;
@@ -3020,8 +4086,15 @@ function alignDaysToTripFrame(days: AiGeneratedDay[], tripFrame: TripFrame): AiG
     if (!phase) return day;
     if (sharesDayArea(day.cityRegion || day.accommodation, phase.areaLabel)) return day;
 
+    // A genuine mismatch was just found — the AI's own title very likely
+    // still names the OLD (wrong) area (spec §C6: "title = Haifa, activities
+    // = Jerusalem" surviving even after the underlying content is fixed).
+    // Only rewritten in this branch, i.e. only when a real correction is
+    // happening — an untouched day keeps its original AI-written title
+    // exactly as-is.
     return {
       ...day,
+      title: `יום ${day.dayNumber} ב${phase.areaLabel}`,
       cityRegion: phase.areaLabel,
       accommodation:
         day.accommodation && day.accommodation.trim() ? day.accommodation : `לינה נוחה באזור ${phase.areaLabel}`,
@@ -3060,7 +4133,14 @@ function itemViolatesArrivalDepartureWindow(
   window: ArrivalDepartureWindow
 ): boolean {
   if (NON_ACTIVITY_CATEGORIES.has(item.category)) return false;
-  return violatesArrivalDepartureWindow(item.plannedStartTime, day.date, isArrivalDay, isDepartureDay, window);
+  return violatesArrivalDepartureWindow(
+    item.plannedStartTime,
+    day.date,
+    isArrivalDay,
+    isDepartureDay,
+    window,
+    resolveItemEffectiveEndTime(item)
+  );
 }
 
 /**
@@ -3072,7 +4152,67 @@ function itemViolatesArrivalDepartureWindow(
  * side, since there is no later day to move it to). Locked/fixed-time items
  * are never touched, matching every other repair pass in this file.
  */
-function enforceArrivalDepartureWindow(
+/**
+ * Section A4's repair cascade for a flexible item whose real interval
+ * crosses the arrival/departure cutoff — move earlier -> replace -> (the
+ * caller removes it if this returns null). "Shorten" is deliberately not
+ * attempted generically: arbitrarily cutting a real place's visit length is
+ * the one step the spec itself gates on "only if semantically valid", and
+ * this app has no per-place signal to judge that safely — removal (the
+ * pre-existing, unconditionally-safe fallback) is preferred over guessing.
+ * Never called for a locked/fixedTime item — those are filtered out by the
+ * caller before this runs.
+ */
+function repairArrivalDepartureWindowViolation(
+  day: AiGeneratedDay,
+  item: AiGeneratedItem,
+  isArrivalDay: boolean,
+  isDepartureDay: boolean,
+  window: ArrivalDepartureWindow,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay | null {
+  // 1. Move earlier within the day: put it first among the day's flexible
+  // items and reschedule — often enough on its own to pull its end back
+  // under a departure cutoff, or its start back after an arrival floor.
+  const reordered: AiGeneratedDay = { ...day, items: [item, ...day.items.filter((candidate) => candidate !== item)] };
+  const rescheduled = fillDerivedDayFields(resequenceDayItems(reordered), payload, profile);
+  const movedItem = rescheduled.items.find((candidate) => candidate.name === item.name);
+  if (movedItem && !itemViolatesArrivalDepartureWindow(movedItem, rescheduled, isArrivalDay, isDepartureDay, window)) {
+    return rescheduled;
+  }
+
+  // 2. Replace with a real, geographically-compatible nearby alternative —
+  // same candidate search the rest of the repair pipeline already uses;
+  // its own scheduling still has to end up window-safe, checked below.
+  const dayWithoutItem = { ...day, items: day.items.filter((candidate) => candidate !== item) };
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day: dayWithoutItem,
+    item,
+    profile,
+    usedPlaceKeys: new Set(day.items.map((candidate) => buildItemKey(candidate))),
+  });
+  if (replacement) {
+    const nextItem = buildReplacementItem(replacement, item, dayWithoutItem, payload);
+    const withReplacement = fillDerivedDayFields(
+      resequenceDayItems({ ...dayWithoutItem, items: [...dayWithoutItem.items, nextItem] }),
+      payload,
+      profile
+    );
+    const placedReplacement = withReplacement.items.find((candidate) => candidate.name === nextItem.name);
+    if (
+      placedReplacement &&
+      !itemViolatesArrivalDepartureWindow(placedReplacement, withReplacement, isArrivalDay, isDepartureDay, window)
+    ) {
+      return withReplacement;
+    }
+  }
+
+  return null;
+}
+
+export function enforceArrivalDepartureWindow(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
@@ -3084,7 +4224,7 @@ function enforceArrivalDepartureWindow(
   const mutableDays = [...days];
 
   for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
-    const day = mutableDays[dayIndex];
+    let day = mutableDays[dayIndex];
     const isArrivalDay = day.dayNumber === 1;
     const isDepartureDay = day.dayNumber === dayCount;
     if (!isArrivalDay && !isDepartureDay) continue;
@@ -3097,28 +4237,142 @@ function enforceArrivalDepartureWindow(
     );
     if (violating.length === 0) continue;
 
-    let remainingItems = day.items;
     let alternatives = day.alternatives;
 
     for (const item of violating) {
-      remainingItems = remainingItems.filter((candidate) => candidate !== item);
-      const moved = isArrivalDay ? moveOverflowItem(mutableDays, dayIndex, item, payload, profile) : false;
+      // Re-read the current item from `day` (name-matched) — an earlier
+      // iteration's repair may have already rescheduled/replaced content
+      // around it.
+      const currentItem = day.items.find((candidate) => candidate.name === item.name);
+      if (!currentItem) continue;
+
+      const repaired = repairArrivalDepartureWindowViolation(
+        day,
+        currentItem,
+        isArrivalDay,
+        isDepartureDay,
+        window,
+        payload,
+        profile
+      );
+      if (repaired) {
+        day = repaired;
+        continue;
+      }
+
+      const moved = isArrivalDay ? moveOverflowItem(mutableDays, dayIndex, currentItem, payload, profile) : false;
+      day = { ...day, items: day.items.filter((candidate) => candidate !== currentItem) };
       if (!moved) {
-        alternatives = normalizeActionableMessages([...alternatives, item.name]);
+        alternatives = normalizeActionableMessages([...alternatives, currentItem.name]);
       }
     }
 
-    mutableDays[dayIndex] = fillDerivedDayFields(
-      { ...day, items: remainingItems, alternatives },
-      payload,
-      profile
-    );
+    // Always resequence at the end, not just when an item was moved/
+    // replaced above — an item that was removed outright still leaves the
+    // rest of the day needing a fresh, consistent set of real end times.
+    mutableDays[dayIndex] = fillDerivedDayFields(resequenceDayItems({ ...day, alternatives }), payload, profile);
   }
 
   return mutableDays;
 }
 
-function lightenHighEnergyStreaks(
+/**
+ * Real bug found during end-to-end QA generation (a live Greece trip with
+ * a 10:40 departure): enforceArrivalDepartureWindow only ever REMOVES
+ * items that don't fit the real flight-driven window, with no guarantee
+ * anything is left afterward — a tight enough departure stripped every
+ * single item from the last day, leaving it completely empty. Two real
+ * travelers looking at "Day 5: (nothing)" would have no idea they still
+ * need to check out, pack, and get to the airport. This guarantees at
+ * least one minimal logistics item survives on an arrival/departure day
+ * that would otherwise end up with zero items.
+ *
+ * The item's own time is pinned directly from the real window (fixedTime,
+ * bypassing resequenceDayItems/scheduleDayItems entirely) rather than a
+ * generic "08:00" guess — a first version of this fix used a fixed guess
+ * and let the generic scheduler place it, which anchored it to the day's
+ * default 09:00 start regardless of the actual flight: for the 10:40
+ * departure this reproduced, that produced "checkout, ends 10:30" — ten
+ * minutes before the flight, actively unsafe advice.
+ */
+export function ensureArrivalDepartureDayHasContent(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  dayCount: number,
+  window?: ArrivalDepartureWindow | null
+): AiGeneratedDay[] {
+  return days.map((day) => {
+    const isArrivalDay = day.dayNumber === 1;
+    const isDepartureDay = day.dayNumber === dayCount;
+    if ((!isArrivalDay && !isDepartureDay) || day.items.length > 0) return day;
+
+    const area = normalizeAreaLabel(day.cityRegion || payload.countryName);
+    let plannedStartTime = isDepartureDay ? "08:00" : "20:00";
+    let endTime = isDepartureDay ? "09:30" : "21:30";
+
+    if (isDepartureDay && window?.latestUsableTimeOnDepartureDay?.date === day.date) {
+      const cutoff = window.latestUsableTimeOnDepartureDay.time;
+      const cutoffMinutes = clockToMinutes(cutoff) ?? 9 * 60 + 30;
+      endTime = cutoff;
+      plannedStartTime = minutesToClock(Math.max(cutoffMinutes - 90, 0));
+    } else if (isArrivalDay && window?.earliestUsableTimeOnArrivalDay?.date === day.date) {
+      const earliest = window.earliestUsableTimeOnArrivalDay.time;
+      const earliestMinutes = clockToMinutes(earliest) ?? 20 * 60;
+      plannedStartTime = earliest;
+      endTime = minutesToClock(Math.min(earliestMinutes + 90, 23 * 60 + 45));
+    }
+
+    const logisticsItem: AiGeneratedItem = {
+      name: isDepartureDay ? "צ'ק-אאוט ונסיעה לשדה התעופה" : "נחיתה, קליטת מזוודות והגעה ללינה",
+      category: "practical",
+      location: area,
+      shortDescription: isDepartureDay
+        ? "לוח הזמנים של הטיסה לא משאיר זמן לפעילות נוספת — הקדישו את היום לצ'ק-אאוט, סידור מזוודות והגעה נוחה לשדה התעופה."
+        : "לוח הזמנים של הטיסה לא משאיר זמן לפעילות בהגעה — התמקדו בקליטת מזוודות, מעבר גבולות והגעה ללינה.",
+      slot: isDepartureDay ? "morning" : "evening",
+      plannedStartTime,
+      endTime,
+      estimatedDurationMinutes: 90,
+      approximatePrice: null,
+      pricePerPerson: null,
+      priceOriginalAmount: null,
+      priceOriginalCurrency: null,
+      priceConvertedAmount: null,
+      priceExchangeRate: null,
+      priceRateTimestamp: null,
+      convertedCurrency: null,
+      sourceType: null,
+      travelMinutes: 0,
+      openingHours: "",
+      lastEntryTime: "",
+      canonicalPlaceId: "",
+      reservationRequired: false,
+      transportation: payload.preferences.transportationPreferences || "תחבורה מקומית",
+      mapLink: buildMapLink(area, null, null),
+      lat: null,
+      lon: null,
+      bookingWarning: isDepartureDay ? "בדקו את שעת הצ'ק-אאוט ואת זמן הנסיעה לשדה התעופה מראש." : "",
+      alternativeSuggestion: "",
+      recommendationId: null,
+      locked: false,
+      priority: "preferred",
+      // Pinned directly from the real flight window — must survive
+      // untouched through any later resequencing pass in the same
+      // outer iteration.
+      fixedTime: true,
+    };
+
+    // Deliberately NOT resequenceDayItems here — its scheduleDayItems
+    // fully re-derives plannedStartTime/endTime from a generic 09:00 day
+    // start, which is exactly the stale-scheduling bug this fix exists to
+    // avoid. fillDerivedDayFields alone recomputes cost/warnings without
+    // touching the times we just pinned.
+    return fillDerivedDayFields({ ...day, items: [logisticsItem] }, payload, profile);
+  });
+}
+
+export function lightenHighEnergyStreaks(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile
@@ -3139,7 +4393,11 @@ function lightenHighEnergyStreaks(
     if (streak <= MAX_CONSECUTIVE_HIGH_ENERGY_DAYS) continue;
 
     const anchors = getOrderedAnchorItems(day);
-    const highAnchor = anchors.find((item) => classifyItemEnergy(item) === "high");
+    // Thread 1 (locked/fixed-time hard requirement): found while auditing
+    // every repair pass for this guarantee — this used to pick ANY
+    // high-energy anchor to swap out, with no exemption for one the user
+    // (or an earlier pass) had locked or pinned to a fixed time.
+    const highAnchor = anchors.find((item) => classifyItemEnergy(item) === "high" && !isProtectedItem(item));
 
     if (highAnchor) {
       const replacement = pickReplacementRecommendation({
@@ -3244,6 +4502,95 @@ async function applyBestEffortRoutingValidation(
   };
 }
 
+/** Target internal quality score (spec item 81) — below this, a passing plan still gets one extra diversify attempt if one remains. */
+const QUALITY_SCORE_TARGET = 85;
+
+/**
+ * Guarantees an arrival/departure day never leaves this function with zero
+ * items, applied exactly once to whatever plan repairPlan is about to
+ * return (never mid-loop — see the comment at its removed in-loop call
+ * site for why: the next attempt's resequenceDayItems would silently
+ * undo it, since scheduleDayItems doesn't check locked/fixedTime at all).
+ */
+/**
+ * Final, whole-plan defense-in-depth pass — a real bug found in live
+ * production use: the same real place, fetched under two different
+ * candidate ids from two different category requests (e.g. an "attraction"
+ * fetch and a "day_trip" fetch both returning "Old Jaffa Grill" with
+ * different ids), could still slip past individual repair steps'
+ * "already used" tracking (rebalanceDayItems/pickReplacementRecommendation's
+ * usedPlaceKeys, buildFallbackAiItinerary's own selectFallbackCandidate
+ * exclusion), each of which checks by EXACT id/coordinate key only — the
+ * same gap already found and fixed for selectFallbackCandidate itself, but
+ * genuinely present at every OTHER insertion point too, and there wasn't
+ * time to migrate every one of them individually. Runs once, at the very
+ * end, on the plan actually about to be accepted (both the success path
+ * and the fallback path) — the first real occurrence of a place always
+ * wins; a later fuzzy-duplicate (the exact identity
+ * collectPlanDiagnostics' own duplicatePlaces check uses) is replaced with
+ * a generic, geographically-neutral placeholder
+ * (buildFreeExplorationReplacement, already used everywhere else in this
+ * file for "can't use this one, keep the day structurally real"). A
+ * locked/fixed-time item is never touched, even if it's a genuine
+ * duplicate — surfaced to the user via the existing duplicatePlaces
+ * diagnostic instead of silently dropped.
+ */
+export function removeFuzzyDuplicatePlaces(
+  days: AiGeneratedDay[],
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  const seen: FuzzyPlaceRecord[] = [];
+
+  return days.map((day) => {
+    let changed = false;
+    const nextItems = day.items.map((item) => {
+      const isRealPlace = Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
+      if (!isRealPlace || isProtectedItem(item)) return item;
+
+      const record: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon };
+      if (seen.some((existing) => isFuzzyDuplicatePlace(existing, record))) {
+        changed = true;
+        return buildFreeExplorationReplacement(item, day);
+      }
+      seen.push(record);
+      return item;
+    });
+
+    return changed ? fillDerivedDayFields(resequenceDayItems({ ...day, items: nextItems }), payload, profile) : day;
+  });
+}
+
+function finalizeArrivalDepartureContent(
+  plan: AiItineraryResponse,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  dayCount: number,
+  window: ArrivalDepartureWindow
+): AiItineraryResponse {
+  const finalizedDays = ensureArrivalDepartureDayHasContent(
+    removeFuzzyDuplicatePlaces(plan.days, payload, profile),
+    payload,
+    profile,
+    dayCount,
+    window
+  );
+  const computedCosts = buildCostsFromDays(finalizedDays, payload.preferences.travelers, payload.preferences.flights);
+  const costPerTraveler =
+    computedCosts.totalEstimatedCost != null && payload.preferences.travelers > 0
+      ? Math.round(computedCosts.totalEstimatedCost / payload.preferences.travelers)
+      : null;
+  return {
+    ...plan,
+    totalEstimatedCost: computedCosts.totalEstimatedCost,
+    estimatedTransportCost: computedCosts.estimatedTransportCost,
+    averageDailyCost: computedCosts.averageDailyCost,
+    costPerTraveler,
+    categoryBreakdown: computedCosts.categoryBreakdown,
+    days: finalizedDays,
+  };
+}
+
 export function repairPlan(
   raw: RawGeneratedPlan,
   payload: AiItineraryRequest,
@@ -3306,7 +4653,7 @@ export function repairPlan(
       items: enriched.items.length > 0 ? enriched.items : fallbackDay.items,
     };
 
-    days.push(repairDayStructure(normalizedDay, payload, profile, index, dayCount, usedMealNames));
+    days.push(repairDayStructure(normalizedDay, payload, profile, index, dayCount, usedMealNames, arrivalDepartureWindow));
   }
 
   let repairedDays = days;
@@ -3319,19 +4666,84 @@ export function repairPlan(
   // seeing each item's *first* occurrence as non-duplicate while it builds
   // that set up incrementally as it walks the days in order.)
   const iterationMealNames = new Set(usedMealNames);
+  // Reset per attempt (content moves around every attempt) and read back
+  // into that attempt's own collectPlanDiagnostics call below.
+  let protectedGeographicConflicts: ProtectedGeographicConflict[] = [];
+  let impossibleStayTransitionDetails: ImpossibleStayTransition[] = [];
+  // Real coordinate centroid per area — shared by the structural-repair
+  // feasibility check below and the initial StayTransition build, one
+  // geography source rather than two.
+  const areaAnchors = computeAreaAnchors(payload);
+  // The pool of areas real candidates exist in, beyond whatever the frame
+  // currently uses — spec §A3's "another candidate" for base reselection.
+  const candidateAreas = [
+    ...new Set(
+      [...payload.recommendations, ...payload.selectedPlaces]
+        .map((recommendation) => normalizeAreaLabel(recommendation.location))
+        .filter((area): area is string => Boolean(area))
+    ),
+  ];
+  // Mutable across attempts (spec §A6) — a successful structural repair
+  // replaces both; every other repair step below always reads the CURRENT
+  // value, never the original tripFrame parameter.
+  let currentTripFrame = tripFrame;
+  let stayTransitions = buildStayTransitions(currentTripFrame, areaAnchors);
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     repairedDays = repairedDays.map((day, index) =>
-      repairDayStructure(normalizeDayCollections(day), payload, profile, index, dayCount, iterationMealNames)
+      repairDayStructure(normalizeDayCollections(day), payload, profile, index, dayCount, iterationMealNames, arrivalDepartureWindow)
     );
     repairedDays = ensureMustVisitCoverage(repairedDays, payload, profile);
-    repairedDays = alignDaysToTripFrame(repairedDays, tripFrame);
+
+    // Repairs content Gemini itself already returned wrong BEFORE the
+    // title/cityRegion sync below — otherwise alignDaysToTripFrame would
+    // just relabel a day to match its base while the day still contains
+    // another region's activities (spec §B/§C6).
+    const crossRegionRepair = repairCrossRegionDayContent(repairedDays, payload, profile);
+    repairedDays = crossRegionRepair.days;
+    protectedGeographicConflicts = crossRegionRepair.protectedGeographicConflicts;
+
+    // Section A1 — before enforceStayTransitions can ever report an
+    // impossible transition, try generic structural repair on the frame
+    // itself (boundary shift / base reselection / merge), respecting
+    // whatever content is currently locked/fixedTime (spec §A5). A
+    // successful repair immediately rebuilds stayTransitions from the new
+    // frame (spec §A6) and the day/base alignment right below picks it up
+    // in the very same attempt.
+    const protectedDayNumbers = new Set(
+      repairedDays.filter((day) => day.items.some((item) => isProtectedItem(item))).map((day) => day.dayNumber)
+    );
+    const structureRepair = attemptStayStructureRepair(
+      currentTripFrame,
+      areaAnchors,
+      candidateAreas,
+      protectedDayNumbers,
+      profile
+    );
+    if (structureRepair.changed) {
+      currentTripFrame = structureRepair.tripFrame;
+      stayTransitions = structureRepair.stayTransitions;
+    }
+
+    repairedDays = alignDaysToTripFrame(repairedDays, currentTripFrame);
+
+    // Section C2/C3: no overnight teleportation — every base change gets a
+    // real, visible transition item reserving its own real time, before
+    // any later step (rebalance/overload/budget) decides how much
+    // optional content the day can still hold.
+    const transitionRepair = enforceStayTransitions(repairedDays, stayTransitions, payload, profile);
+    repairedDays = transitionRepair.days;
+    impossibleStayTransitionDetails = transitionRepair.impossibleStayTransitionDetails;
 
     const usedPlaceKeys = new Set<string>();
     repairedDays = repairedDays.map((day) =>
       rebalanceDayItems(normalizeDayCollections(day), payload, profile, usedPlaceKeys)
     );
     repairedDays = fixOverloadedDays(repairedDays, payload, profile);
+    repairedDays = repairOpeningHoursViolations(repairedDays, payload, profile);
+    repairedDays = enforceMealCountLimit(repairedDays, payload, profile);
+    repairedDays = enforceMealSpacing(repairedDays, payload, profile);
+    repairedDays = ensureWeatherBackup(repairedDays, payload);
 
     // Real fix, not just a diagnostic (spec item 23) — arrival/departure
     // days are skipped here since their window is intentionally narrower
@@ -3345,10 +4757,59 @@ export function repairPlan(
 
     repairedDays = capArrivalDepartureDays(repairedDays, payload, profile, dayCount);
     repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
+    // Deliberately NOT ensureArrivalDepartureDayHasContent here — this
+    // whole block sits inside the attempt loop below, and the NEXT
+    // attempt's repairDayStructure unconditionally re-runs
+    // resequenceDayItems at its very top, which re-derives every item's
+    // plannedStartTime/endTime from the generic day window regardless of
+    // locked/fixedTime (a real bug found during end-to-end QA generation:
+    // scheduleDayItems never actually checks either flag) — silently
+    // discarding the pinned, window-safe time this step would have just
+    // set. It's applied once, after the loop, to whatever plan is
+    // actually returned, so nothing later can undo it.
     repairedDays = lightenHighEnergyStreaks(repairedDays, payload, profile);
     repairedDays = enforceBudgetOnDays(repairedDays, payload, profile).map((day) =>
       fillDerivedDayFields(normalizeDayCollections(day), payload, profile)
     );
+
+    // Real bug found during end-to-end QA generation (a live France trip
+    // with Disneyland Paris): a day starting out with a genuine full-day
+    // anchor correctly has its meals omitted — but several of the repair
+    // steps above (rebalanceDayItems, diversifyActivities,
+    // enforceBudgetOnDays, lightenHighEnergyStreaks, ...) can replace an
+    // anchor item outright, including a full-day one, well after
+    // repairDayStructure already ran and decided meals weren't needed.
+    // Once that anchor is gone, the day is a normal day again and DOES
+    // need meals, but nothing re-checked — missingMeals stayed non-zero
+    // for the rest of this attempt (and often every attempt), since
+    // meal insertion otherwise only happens once, near the top of
+    // repairDayStructure. One final sweep here catches exactly that,
+    // regardless of which upstream step is what changed the day's shape.
+    //
+    // insertMissingMeals returns the SAME object reference when nothing
+    // was actually missing (findMissingMealSlots found nothing to insert)
+    // — deliberately checked here and skipped in that case. A second real
+    // bug found while tracing mealSpacingViolations: unconditionally
+    // wrapping every day in resequenceDayItems (even ones needing no meal
+    // insertion at all) re-scheduled every item from a plain sequential
+    // cursor, which has no notion of the 180/240-minute minimum meal gap
+    // enforceMealSpacing had already established a few steps above —
+    // silently undoing it on every single day, every attempt.
+    // enforceMealSpacing is re-run afterward for the same reason: a day
+    // that DID get a fresh meal inserted (or rescheduled) here needs its
+    // spacing re-checked, not just the one earlier pass.
+    repairedDays = repairedDays.map((day) => {
+      const withMeals = insertMissingMeals(day, payload, profile, iterationMealNames, dayCount, arrivalDepartureWindow);
+      return withMeals === day ? day : fillDerivedDayFields(resequenceDayItems(withMeals), payload, profile);
+    });
+    repairedDays = enforceMealSpacing(repairedDays, payload, profile);
+    // Defense in depth, same reasoning as enforceMealSpacing just above:
+    // insertMissingMeals is now window-aware and should never insert an
+    // infeasible meal in the first place, but re-running the window
+    // enforcement here catches anything else this whole block (or any
+    // earlier repair step not itself window-aware) could have pushed past
+    // the real arrival/departure cutoff.
+    repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
 
     let computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers, payload.preferences.flights);
     let totalEstimatedCost = computedCosts.totalEstimatedCost;
@@ -3370,8 +4831,19 @@ export function repairPlan(
       days: repairedDays,
     };
 
-    let diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame, arrivalDepartureWindow);
-    if (diagnostics.diversityRisk) {
+    let diagnostics = collectPlanDiagnostics(repairedPlan, profile, currentTripFrame, arrivalDepartureWindow, payload.preferences.flights, protectedGeographicConflicts, impossibleStayTransitionDetails);
+    // A plan can pass every hard gate yet still score under the quality
+    // target on advisory-only signals (spec item 81) — one extra
+    // diversify pass when an attempt remains, never more than that (this
+    // is a nudge, not a loop-until-perfect; the plan is still accepted
+    // below regardless of the score after this single extra try).
+    const qualifiesForQualityDiversify =
+      !diagnostics.diversityRisk &&
+      passesValidation(diagnostics) &&
+      computeQualityScore(diagnostics) < QUALITY_SCORE_TARGET &&
+      attempt < 3;
+
+    if (diagnostics.diversityRisk || qualifiesForQualityDiversify) {
       repairedDays = diversifyActivities(
         repairedDays,
         payload,
@@ -3398,21 +4870,23 @@ export function repairPlan(
         categoryBreakdown: computedCosts.categoryBreakdown,
         days: repairedDays,
       };
-      diagnostics = collectPlanDiagnostics(repairedPlan, profile, tripFrame, arrivalDepartureWindow);
+      diagnostics = collectPlanDiagnostics(repairedPlan, profile, currentTripFrame, arrivalDepartureWindow, payload.preferences.flights, protectedGeographicConflicts, impossibleStayTransitionDetails);
     }
 
     lastPlan = repairedPlan;
     if (passesValidation(diagnostics)) {
+      const finalPlan = finalizeArrivalDepartureContent(repairedPlan, payload, profile, dayCount, arrivalDepartureWindow);
       return {
-        ...repairedPlan,
-        summary: buildGenerationSummary(repairedPlan, profile),
+        ...finalPlan,
+        summary: buildGenerationSummary(finalPlan, profile),
       };
     }
   }
 
+  const finalFallbackPlan = finalizeArrivalDepartureContent(lastPlan ?? fallback, payload, profile, dayCount, arrivalDepartureWindow);
   return {
-    ...(lastPlan ?? fallback),
-    summary: buildGenerationSummary(lastPlan ?? fallback, profile),
+    ...finalFallbackPlan,
+    summary: buildGenerationSummary(finalFallbackPlan, profile),
   };
 }
 
@@ -3421,6 +4895,18 @@ function isPlanComplete(plan: RawGeneratedPlan, payload: AiItineraryRequest) {
   return dayCount > 0 && Array.isArray(plan.days) && plan.days.length === dayCount;
 }
 
+// Phase 10/12/24 (generic worldwide architecture): foodDominantDays and
+// diversityRisk are deliberately NOT in the hard gate below — real bug
+// found in live QA: with zero real candidates (or a genuinely
+// food-culture-heavy destination), a physically feasible, otherwise-sound
+// itinerary kept failing validation purely on category variety, forcing a
+// fallback to the generic template far more often than a real physical
+// problem warranted. They still cost real points in computeQualityScore
+// (a real repair target — qualifiesForQualityDiversify still triggers an
+// extra diversifyActivities attempt when the score is low), they simply
+// no longer block acceptance outright the way a genuine physical
+// impossibility (missing meals, overlapping times, an impossible
+// transfer) does.
 export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagnostics>) {
   return (
     diagnostics.missingMeals === 0 &&
@@ -3434,15 +4920,20 @@ export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagn
     diagnostics.invalidCoordinates === 0 &&
     diagnostics.crossCityDays === 0 &&
     diagnostics.longTravelDays === 0 &&
-    diagnostics.foodDominantDays === 0 &&
     diagnostics.missingAnchorDays === 0 &&
     diagnostics.longMealDetours === 0 &&
     diagnostics.baseMismatchDays === 0 &&
     !diagnostics.overSoftBudget &&
     !diagnostics.outOfBudget &&
-    !diagnostics.diversityRisk &&
     diagnostics.arrivalDepartureWindowViolations === 0 &&
-    diagnostics.timeOverlaps === 0
+    diagnostics.timeOverlaps === 0 &&
+    diagnostics.openingHoursViolations === 0 &&
+    diagnostics.excessFoodStopsDays === 0 &&
+    diagnostics.mealSpacingViolations === 0 &&
+    diagnostics.duplicateRestaurants === 0 &&
+    diagnostics.invalidFlightLegs === 0 &&
+    diagnostics.airportBaseMismatches === 0 &&
+    diagnostics.impossibleStayTransitions === 0
   );
 }
 
@@ -3466,6 +4957,14 @@ function describeFailingDiagnostics(diagnostics: PlanDiagnostics): Record<string
     "baseMismatchDays",
     "arrivalDepartureWindowViolations",
     "timeOverlaps",
+    "openingHoursViolations",
+    "excessFoodStopsDays",
+    "mealSpacingViolations",
+    "duplicateRestaurants",
+    "invalidFlightLegs",
+    "airportBaseMismatches",
+    "protectedGeographicConflicts",
+    "impossibleStayTransitions",
   ];
   for (const field of numericFields) {
     const value = diagnostics[field];
@@ -3578,14 +5077,20 @@ export async function generateCountryItineraryPlan(
       );
       logGenerationStage(`AI response parsing: received (attempt ${attempts})`);
       const repaired = repairPlan(raw, normalizedPayload, profile, tripFrame, exchangeRateContext, arrivalDepartureWindow);
-      const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame, arrivalDepartureWindow);
+      const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
         logGenerationStage(`schema validation: passed (attempt ${attempts})`);
         logGenerationStage(`AI generation parsed and validated (attempt ${attempts})`);
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
           () => repaired
         );
-        return { ...validated, model: ITINERARY_MODEL, usedFallback: false };
+        return {
+          ...validated,
+          model: ITINERARY_MODEL,
+          usedFallback: false,
+          generationSource: "gemini_repaired",
+          candidateProviderStatus: resolveCandidateProviderStatus(normalizedPayload),
+        };
       }
       logGenerationStage(`Gemini attempt ${attempts} produced an incomplete/invalid plan`, {
         isPlanComplete: isPlanComplete(raw, normalizedPayload),
@@ -3609,12 +5114,22 @@ export async function generateCountryItineraryPlan(
     exchangeRateContext,
     arrivalDepartureWindow
   );
-  const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame, arrivalDepartureWindow);
-  if (fallbackDiagnostics.outOfBudget || fallbackDiagnostics.duplicatePlaces > 0) {
+  const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
+  if (fallbackDiagnostics.outOfBudget || fallbackDiagnostics.duplicatePlaces > 0 || fallbackDiagnostics.crossCityDays > 0) {
     // The deterministic template is budget-driven by construction, so this
     // should be unreachable in practice — but per spec, a severely broken
     // plan must never be saved silently. Fail loudly with a clear reason
     // instead of returning something invalid.
+    //
+    // crossCityDays added here as a real fix, not just a stricter check
+    // (generic worldwide architecture pass): this fallback path used to be
+    // accepted purely on budget/duplicates, with no geographic check at
+    // all — real Gemini output already gets rejected for a cross-city day
+    // (passesValidation requires crossCityDays === 0), but the fallback
+    // template had no equivalent backstop. selectFallbackCandidate now
+    // hard-filters candidates geographically at the source, so this should
+    // be unreachable in practice too — but the same "never save it
+    // silently" principle applies here as it does to budget/duplicates.
     logGenerationStage("failed at fallback-template stage", {
       failingDiagnostics: describeFailingDiagnostics(fallbackDiagnostics),
     });
@@ -3622,7 +5137,9 @@ export async function generateCountryItineraryPlan(
       fallbackDiagnostics.outOfBudget ? "BUDGET_NOT_FEASIBLE" : "PLAN_NOT_FEASIBLE",
       fallbackDiagnostics.outOfBudget
         ? "לא הצלחנו לבנות מסלול בטווח התקציב שהוגדר, גם אחרי תיקון אוטומטי."
-        : "לא הצלחנו להסיר כפילויות מהמסלול, גם אחרי תיקון אוטומטי."
+        : fallbackDiagnostics.duplicatePlaces > 0
+          ? "לא הצלחנו להסיר כפילויות מהמסלול, גם אחרי תיקון אוטומטי."
+          : "לא הצלחנו לשמור על עקביות גאוגרפית במסלול, גם אחרי תיקון אוטומטי."
     );
   }
 
@@ -3633,5 +5150,7 @@ export async function generateCountryItineraryPlan(
     summary: buildGenerationSummary(fallback, profile),
     model: ITINERARY_MODEL,
     usedFallback: true,
+    generationSource: "fallback_template",
+    candidateProviderStatus: resolveCandidateProviderStatus(normalizedPayload),
   };
 }

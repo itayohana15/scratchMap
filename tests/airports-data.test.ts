@@ -5,7 +5,7 @@ import {
   findAirportByIata,
   findAirportsForCountry,
   findDefaultAirportForCountry,
-  getConnectionAirports,
+  getAvailableConnectionCountries,
   getIsraeliAirports,
   searchAirports,
   validateFlightAirportCountries,
@@ -64,11 +64,22 @@ test("searchAirports restricted to a pool never returns airports outside that po
   assert.equal(searchAirports("TLV", { pool: georgianPool }).length, 0);
 });
 
-test("getConnectionAirports excludes only the given leg endpoints, keeping every other country available", () => {
-  const pool = getConnectionAirports(["TLV", "TBS"]);
-  assert.equal(pool.some((airport) => airport.iata === "TLV"), false);
-  assert.equal(pool.some((airport) => airport.iata === "TBS"), false);
-  assert.ok(pool.some((airport) => airport.iata === "IST"), "a real third-country connection like IST must still be available");
+// A connection can be routed through ANY country (spec item 14), unlike the
+// fixed outbound/return endpoints — but only countries this dataset
+// actually has airports for, so the following airport combobox is never
+// left with an empty pool.
+test("getAvailableConnectionCountries returns only countries with at least one listed airport", () => {
+  const countries = getAvailableConnectionCountries();
+  assert.ok(countries.some((country) => country.iso === "TH"));
+  assert.ok(countries.every((country) => findAirportsForCountry(country.iso).length > 0));
+  // No duplicates.
+  assert.equal(new Set(countries.map((country) => country.iso)).size, countries.length);
+});
+
+test("getAvailableConnectionCountries carries a real Hebrew display name for each entry", () => {
+  const countries = getAvailableConnectionCountries();
+  const thailand = countries.find((country) => country.iso === "TH");
+  assert.equal(thailand?.nameHe, "תאילנד");
 });
 
 test("validateFlightAirportCountries accepts a correct Israel<->Georgia round trip", () => {
@@ -94,4 +105,56 @@ test("validateFlightAirportCountries rejects an outbound destination outside the
 test("validateFlightAirportCountries never rejects an airport missing from the curated dataset", () => {
   const flights = { outbound: { departureAirport: "TLV", arrivalAirport: "ZZZ" }, return: null };
   assert.equal(validateFlightAirportCountries(flights, "GE"), null);
+});
+
+test("validateFlightAirportCountries accepts a connection whose airport actually matches its own claimed country", () => {
+  const flights = {
+    outbound: {
+      departureAirport: "TLV",
+      arrivalAirport: "NRT",
+      connections: [{ countryIso: "TH", arrivalAirport: "BKK", departureAirport: "BKK", layoverMinutes: 100 }],
+    },
+    return: null,
+  };
+  assert.equal(validateFlightAirportCountries(flights, "JP"), null);
+});
+
+// The server-side backstop for the reported bug's underlying class of
+// error — a connection claiming one country while its airport actually
+// resolves to another must never pass silently (spec items 19-21).
+test("validateFlightAirportCountries rejects a connection whose airport is actually in a different country than it claims", () => {
+  const flights = {
+    outbound: {
+      departureAirport: "TLV",
+      arrivalAirport: "NRT",
+      connections: [{ countryIso: "TH", arrivalAirport: "IST", departureAirport: "IST", layoverMinutes: 100 }],
+    },
+    return: null,
+  };
+  const message = validateFlightAirportCountries(flights, "JP");
+  assert.ok(message != null && message.includes("IST"));
+});
+
+test("validateFlightAirportCountries rejects a connection whose airport-change departure airport is in the wrong country", () => {
+  const flights = {
+    outbound: {
+      departureAirport: "TLV",
+      arrivalAirport: "NRT",
+      connections: [{ countryIso: "TH", arrivalAirport: "BKK", departureAirport: "IST", layoverMinutes: 100 }],
+    },
+    return: null,
+  };
+  assert.ok(validateFlightAirportCountries(flights, "JP") != null);
+});
+
+test("validateFlightAirportCountries ignores a connection with no country chosen yet (still mid-selection)", () => {
+  const flights = {
+    outbound: {
+      departureAirport: "TLV",
+      arrivalAirport: "NRT",
+      connections: [{ countryIso: "", arrivalAirport: "", departureAirport: "", layoverMinutes: 90 }],
+    },
+    return: null,
+  };
+  assert.equal(validateFlightAirportCountries(flights, "JP"), null);
 });

@@ -255,7 +255,15 @@ export function TripPageClient({ tripId }: { tripId: string }) {
           />
         ) : null}
 
-        {activeTab === "accommodation" ? <TripAccommodationTab days={draft.itineraryDays} /> : null}
+        {activeTab === "accommodation" ? (
+          <TripAccommodationTab
+            days={draft.itineraryDays}
+            isoA2={draft.isoA2}
+            countryName={country.name}
+            flights={draft.preferencesSnapshot.flights}
+            onPatchDay={controller.patchDay}
+          />
+        ) : null}
         {activeTab === "transport" ? <TripTransportTab days={draft.itineraryDays} /> : null}
         {activeTab === "budget" ? <TripBudgetTab itinerary={draft} /> : null}
 

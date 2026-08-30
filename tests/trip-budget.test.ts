@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CountryItineraryRecord } from "../src/lib/itineraries";
-import { buildUpgradeSuggestion, computeTripBudgetSummary } from "../src/lib/trip-budget";
+import { buildUpgradeSuggestions, computeTripBudgetSummary } from "../src/lib/trip-budget";
 import { createDefaultWorkspace, createEmptyDay, createEmptyItineraryItem } from "../src/lib/trip-workspace";
 
 const BASE_PREFERENCES = createDefaultWorkspace("Georgia").preferences;
@@ -79,8 +79,8 @@ test("computeTripBudgetSummary returns null remaining when no budget was set", (
   assert.equal(summary.isOverBudget, false);
 });
 
-// 4. Upgrade suggestion only fires when remaining is meaningfully positive.
-test("buildUpgradeSuggestion returns null when remaining is a small fraction of the budget", () => {
+// 4. Upgrade suggestions only fire when remaining is meaningfully positive.
+test("buildUpgradeSuggestions returns an empty list when remaining is a small fraction of the budget", () => {
   const itinerary = buildItinerary({
     budget: 25000,
     costSummary: {
@@ -92,23 +92,38 @@ test("buildUpgradeSuggestion returns null when remaining is a small fraction of 
     },
   });
   const summary = computeTripBudgetSummary(itinerary);
-  assert.equal(buildUpgradeSuggestion(summary), null);
+  assert.deepEqual(buildUpgradeSuggestions(summary), []);
 });
 
-test("buildUpgradeSuggestion suggests an upgrade when remaining is at least 15% of budget", () => {
+test("buildUpgradeSuggestions suggests several concrete upgrades when remaining is at least 15% of budget", () => {
   const itinerary = buildItinerary({ budget: 25000 }); // planned 16580, remaining 8420 (~33.7%)
   const summary = computeTripBudgetSummary(itinerary);
-  const suggestion = buildUpgradeSuggestion(summary);
-  assert.notEqual(suggestion, null);
-  assert.match(suggestion ?? "", /8,420|8420/);
+  const suggestions = buildUpgradeSuggestions(summary);
+  assert.ok(suggestions.length >= 2, "expected several concrete suggestions, not one generic sentence");
 });
 
 // 5. Over budget never produces a negative "remaining" suggestion.
-test("buildUpgradeSuggestion returns null when over budget", () => {
+test("buildUpgradeSuggestions returns an empty list when over budget", () => {
   const completedItem = { ...createEmptyItineraryItem("morning"), id: "a1", completed: true, actualCost: 30000 };
   const itinerary = buildItinerary({
     itineraryDays: [{ ...createEmptyDay(1, "2026-09-05"), items: [completedItem] }],
   });
   const summary = computeTripBudgetSummary(itinerary);
-  assert.equal(buildUpgradeSuggestion(summary), null);
+  assert.deepEqual(buildUpgradeSuggestions(summary), []);
+});
+
+test("buildUpgradeSuggestions never suggests a rental car for a small remaining amount", () => {
+  const itinerary = buildItinerary({
+    budget: 3000,
+    costSummary: {
+      totalEstimatedCost: 2400,
+      estimatedTransportCost: null,
+      averageDailyCost: null,
+      costPerTraveler: null,
+      categoryBreakdown: {},
+    },
+  });
+  const summary = computeTripBudgetSummary(itinerary);
+  const suggestions = buildUpgradeSuggestions(summary);
+  assert.equal(suggestions.some((suggestion) => suggestion.includes("רכב")), false);
 });

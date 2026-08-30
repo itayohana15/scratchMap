@@ -994,7 +994,15 @@ function DayMapCanvas({
         markerNode.style.borderColor = activeStopKey === stop.key ? accent : border;
         markerNode.style.color = foreground;
         markerNode.style.setProperty("--tw-ring-color", accent);
-        markerNode.textContent = isLiveCompleted ? "✓" : isLiveSkipped ? "✕" : `${stop.order}`;
+        // "H" for a hotel/accommodation stop (spec: hotel map markers) —
+        // every other kind keeps its numbered stop order.
+        markerNode.textContent = isLiveCompleted
+          ? "✓"
+          : isLiveSkipped
+            ? "✕"
+            : stop.kind === "accommodation"
+              ? "H"
+              : `${stop.order}`;
         markerNode.setAttribute("aria-label", isLiveCompleted ? "הושלם" : isLiveSkipped ? "דולג" : `עצירה ${stop.order}`);
         markerNode.addEventListener("click", () => {
           onSelectStop(stop.key);

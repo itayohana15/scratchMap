@@ -22,10 +22,11 @@ import {
  * field when airport data exists (spec item 1/9). `pool` restricts both the
  * empty-query list AND the search itself to a specific, already-filtered
  * set of candidate airports (e.g. getIsraeliAirports(),
- * findAirportsForCountry(iso), getConnectionAirports(exclude)) — a
- * country-restricted field must never fall through to the global airport
- * list just because a search term happens to match something outside it.
- * Omit `pool` for an unrestricted field (used only for connections).
+ * findAirportsForCountry(iso)) — a country-restricted field must never fall
+ * through to the global airport list just because a search term happens to
+ * match something outside it. Every field in this app is now
+ * country-scoped this way, including connections (each scoped to its own
+ * segment's country) — `pool` is effectively always passed.
  */
 export function AirportCombobox({
   value,

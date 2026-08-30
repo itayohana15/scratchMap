@@ -1,9 +1,10 @@
 "use client";
 
 import { Pencil, Plus, RotateCcw, Trash2 } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { AirportCombobox } from "@/components/country/airport-combobox";
+import { CountryIsoCombobox } from "@/components/country/country-iso-combobox";
 import { PreferenceField } from "@/components/country/trip-preferences-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,15 +12,24 @@ import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/u
 import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
 import {
+  COUNTRY_NAMES_HE,
+  countryFlagEmoji,
   findAirportByIata,
   findAirportsForCountry,
   findDefaultAirportForCountry,
-  getConnectionAirports,
   getIsraeliAirports,
+  HOME_COUNTRY_ISO,
 } from "@/lib/facts/airports-data";
 import { getCountryTimezone } from "@/lib/facts/country-timezones";
 import { formatCurrency, formatDate } from "@/lib/format";
-import { computeMultiSegmentFlight, HOME_TIMEZONE, type FlightSegmentResult } from "@/lib/flight-planning";
+import {
+  computeMultiSegmentFlight,
+  estimateAirportTransferMinutes,
+  getJourneySegments,
+  validateJourneySegments,
+  HOME_TIMEZONE,
+  type FlightSegmentResult,
+} from "@/lib/flight-planning";
 import {
   createEmptyFlightLeg,
   type FlightBookingStatus,
@@ -28,6 +38,10 @@ import {
   type TripPreferences,
 } from "@/lib/trip-workspace";
 import type { TripCreationDraft } from "@/components/country/trip-wizard/trip-wizard-types";
+
+function countryNameHe(iso: string): string {
+  return COUNTRY_NAMES_HE[iso.toUpperCase()] ?? iso;
+}
 
 function formatHoursMinutes(minutes: number): string {
   return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}`;
@@ -113,8 +127,14 @@ function FlightLegCard({
     onChange({ ...fieldPatch, ...withRecomputedArrival(nextLeg) });
   }
 
+  // A brand-new connection starts with no country chosen — the country
+  // combobox is asked FIRST (spec item 4); its airport fields stay empty/
+  // disabled until a country is picked.
   function addConnection() {
-    const nextConnections: TripFlightConnection[] = [...leg.connections, { airport: "", layoverMinutes: 90 }];
+    const nextConnections: TripFlightConnection[] = [
+      ...leg.connections,
+      { countryIso: "", arrivalAirport: "", departureAirport: "", layoverMinutes: 90 },
+    ];
     patch({ connections: nextConnections });
   }
 
@@ -125,9 +145,51 @@ function FlightLegCard({
     patch({ connections: nextConnections });
   }
 
+  // Picking (or changing) a connection's country reseeds its airport(s) to
+  // that country's own default gateway — never left pointing at the
+  // previous country's airport (same "self-healing" rule as the outer
+  // fields, spec item 17).
+  function setConnectionCountry(index: number, countryIso: string) {
+    const defaultAirport = findDefaultAirportForCountry(countryIso)?.iata ?? "";
+    updateConnection(index, { countryIso, arrivalAirport: defaultAirport, departureAirport: defaultAirport });
+    setAirportChangeOpen((current) => ({ ...current, [index]: false }));
+  }
+
   function removeConnection(index: number) {
     patch({ connections: leg.connections.filter((_, i) => i !== index) });
+    setAirportChangeOpen((current) => {
+      const next = { ...current };
+      delete next[index];
+      return next;
+    });
   }
+
+  // Local, UI-only reveal state for the "airport change connection" toggle
+  // (spec item 6) — whether departureAirport is independently editable.
+  // Not derived purely from data because a freshly-toggled-on row still has
+  // arrivalAirport === departureAirport until the user actually picks a
+  // different one.
+  const [airportChangeOpen, setAirportChangeOpen] = useState<Record<number, boolean>>({});
+
+  function toggleAirportChange(index: number, open: boolean) {
+    setAirportChangeOpen((current) => ({ ...current, [index]: open }));
+    if (!open) {
+      // Reverting must cleanly resync departure to arrival, never leave a
+      // stale independent value behind.
+      const connection = leg.connections[index];
+      if (connection && connection.departureAirport !== connection.arrivalAirport) {
+        updateConnection(index, { departureAirport: connection.arrivalAirport });
+      }
+    }
+  }
+
+  // Country-aware route view, derived on demand (never stored separately)
+  // — drives the route summary, the per-segment field labels, and
+  // client-side validation (spec items 16/18/20/27).
+  const originCountryIso = isReturn ? destinationIsoA2 : HOME_COUNTRY_ISO;
+  const destinationCountryIso = isReturn ? HOME_COUNTRY_ISO : destinationIsoA2;
+  const journeySegments = getJourneySegments(leg, originCountryIso, destinationCountryIso);
+  const journeyValidationError = validateJourneySegments(journeySegments, originCountryIso, destinationCountryIso);
 
   // Per-segment breakdown for display only (spec item 21/37) — recomputed
   // from the current leg state rather than stored, so it always matches
@@ -161,6 +223,16 @@ function FlightLegCard({
   useEffect(() => {
     if (leg.departureAirport || leg.arrivalAirport) return;
     const destinationAirport = findDefaultAirportForCountry(destinationIsoA2)?.iata ?? "";
+    // A trip whose destination IS the home country (planning a domestic
+    // trip within Israel itself) has no real international flight — the
+    // default airport for both "home" and "destination" collapses to the
+    // same one (TLV), which would seed a same-airport leg that isn't a
+    // real flight at all (never a legitimate leg, generation's own
+    // detectInvalidFlightLegs correctly rejects it, and there's no repair
+    // for that — it fails deterministically on every attempt). Left blank
+    // instead of auto-seeded, so the user consciously fills in a real
+    // route (or leaves it empty for a domestic trip with no flights).
+    if (destinationAirport && destinationAirport === "TLV") return;
     onChange(
       isReturn
         ? { departureAirport: destinationAirport, arrivalAirport: "TLV" }
@@ -215,15 +287,35 @@ function FlightLegCard({
         </label>
       </div>
 
+      {/* Live route summary (spec item 18) — e.g. 🇮🇱 TLV → 🇹🇭 BKK → 🇯🇵 NRT. */}
+      {journeySegments.length > 0 ? (
+        <p dir="ltr" className="text-right font-medium">
+          {journeySegments.map((segment, index) => (
+            <span key={index}>
+              {index === 0 ? (
+                <>
+                  {countryFlagEmoji(segment.originCountry)} {segment.originAirport || "—"}
+                </>
+              ) : null}
+              {" → "}
+              {countryFlagEmoji(segment.destinationCountry)} {segment.destinationAirport || "—"}
+            </span>
+          ))}
+        </p>
+      ) : null}
+      {journeyValidationError ? (
+        <p className="rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{journeyValidationError}</p>
+      ) : null}
+
       <div className="grid grid-cols-2 gap-3">
-        <PreferenceField label={isReturn ? "יציאה ממדינת היעד" : "יציאה מישראל"}>
+        <PreferenceField label={`מקטע 1 — המראה מ${countryNameHe(originCountryIso)}`}>
           <AirportCombobox
             value={leg.departureAirport}
             onChange={(iata) => patch({ departureAirport: iata })}
             pool={isReturn ? findAirportsForCountry(destinationIsoA2) : getIsraeliAirports()}
           />
         </PreferenceField>
-        <PreferenceField label={isReturn ? "נחיתה בישראל" : "נחיתה במדינת היעד"}>
+        <PreferenceField label={`מקטע ${journeySegments.length || 1} — נחיתה ב${countryNameHe(destinationCountryIso)}`}>
           <AirportCombobox
             value={leg.arrivalAirport}
             onChange={(iata) => patch({ arrivalAirport: iata })}
@@ -268,34 +360,89 @@ function FlightLegCard({
           </Button>
         </div>
 
-        {leg.connections.map((connection, index) => (
-          <div key={index} className="grid grid-cols-[1fr_auto_auto] items-end gap-2 rounded-lg border border-border/70 p-2.5">
-            <PreferenceField label={`קונקשן ${index + 1}`}>
-              {/* The one field allowed to show any country (spec item 6) —
-                  only the leg's own endpoints are excluded, so a connection
-                  can never be set to the same airport as the departure or
-                  final destination. */}
-              <AirportCombobox
-                value={connection.airport}
-                onChange={(iata) => updateConnection(index, { airport: iata })}
-                pool={getConnectionAirports([leg.departureAirport, leg.arrivalAirport])}
-              />
-            </PreferenceField>
-            <div className="w-24">
-              <PreferenceField label="שהייה (דק')">
-                <Input
-                  type="number"
-                  min={0}
-                  value={connection.layoverMinutes}
-                  onChange={(event) => updateConnection(index, { layoverMinutes: Number(event.target.value) || 0 })}
-                />
-              </PreferenceField>
+        {leg.connections.map((connection, index) => {
+          // A connection can be ANY country (spec item 14) — only the
+          // leg's own two fixed ends are hard-coded to a role. Its own
+          // airport pool is scoped to whatever country it was just given,
+          // never the global list and never the leg's outer countries.
+          const connectionCountryPool = connection.countryIso ? findAirportsForCountry(connection.countryIso) : [];
+          const airportChanged = airportChangeOpen[index] ?? connection.arrivalAirport !== connection.departureAirport;
+          const transferMinutes =
+            airportChanged && connection.arrivalAirport && connection.departureAirport
+              ? estimateAirportTransferMinutes(connection.arrivalAirport, connection.departureAirport)
+              : null;
+
+          return (
+            <div key={index} className="space-y-2 rounded-lg border border-border/70 p-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <PreferenceField label={`מדינת קונקשן ${index + 1}`}>
+                  <CountryIsoCombobox value={connection.countryIso} onChange={(iso) => setConnectionCountry(index, iso)} />
+                </PreferenceField>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="mt-5 text-destructive"
+                  onClick={() => removeConnection(index)}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+
+              {connection.countryIso ? (
+                <div className="grid grid-cols-[1fr_auto] items-end gap-2">
+                  <PreferenceField label={`מקטע ${index + 1} — נחיתה ב${countryNameHe(connection.countryIso)}`}>
+                    <AirportCombobox
+                      value={connection.arrivalAirport}
+                      onChange={(iata) =>
+                        updateConnection(index, {
+                          arrivalAirport: iata,
+                          departureAirport: airportChanged ? connection.departureAirport : iata,
+                        })
+                      }
+                      pool={connectionCountryPool}
+                    />
+                  </PreferenceField>
+                  <div className="w-24">
+                    <PreferenceField label="שהייה (דק')">
+                      <Input
+                        type="number"
+                        min={0}
+                        value={connection.layoverMinutes}
+                        onChange={(event) => updateConnection(index, { layoverMinutes: Number(event.target.value) || 0 })}
+                      />
+                    </PreferenceField>
+                  </div>
+                </div>
+              ) : null}
+
+              {connection.countryIso ? (
+                <div className="space-y-1.5">
+                  <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Switch checked={airportChanged} onCheckedChange={(open) => toggleAirportChange(index, open)} />
+                    החלפת שדה תעופה בקונקשן
+                  </label>
+                  {airportChanged ? (
+                    <>
+                      <PreferenceField label={`מקטע ${index + 2} — המראה מ${countryNameHe(connection.countryIso)}`}>
+                        <AirportCombobox
+                          value={connection.departureAirport}
+                          onChange={(iata) => updateConnection(index, { departureAirport: iata })}
+                          pool={connectionCountryPool}
+                        />
+                      </PreferenceField>
+                      {transferMinutes != null ? (
+                        <p className="text-xs text-muted-foreground">
+                          זמן מעבר בין שדות התעופה: כ-{formatHoursMinutes(transferMinutes)} שעות
+                        </p>
+                      ) : null}
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-            <Button type="button" variant="ghost" size="icon" className="text-destructive" onClick={() => removeConnection(index)}>
-              <Trash2 className="size-4" />
-            </Button>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <div className="rounded-lg bg-muted/40 p-3 text-sm">

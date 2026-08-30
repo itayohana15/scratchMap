@@ -265,6 +265,72 @@ export function mergeLiveReplanResult(
   return { untouchable, items };
 }
 
+/**
+ * Thread 1 (locked/fixed-time hard requirement), item 10: "regenerate day"
+ * must preserve locked activities and fixed-time activities, generating
+ * the rest of the day around them. Before this fix, regenerating a single
+ * day (or the whole trip) replaced its items wholesale with whatever the
+ * AI returned — the generation prompt asks Gemini to leave locked/
+ * fixed-time items alone, but nothing in code actually guaranteed it; a
+ * locked or fixed-time activity could simply be dropped if the AI didn't
+ * comply. This is the same shape as mergeLiveReplanResult just above
+ * (real ids and full state preserved, never trusting prompt compliance
+ * alone), generalized to regenerate-day/regenerate-full rather than only
+ * the live-replan path.
+ *
+ * Deliberately does not re-flow times through the AI-generation-side
+ * scheduler (that operates on a distinct AiGeneratedItem type and would
+ * mint brand-new items with no stable id) — the caller is expected to
+ * recompute cost/travel totals (e.g. via recomputeDayEstimates) on the
+ * returned item list.
+ */
+export function mergeProtectedItemsIntoRegeneratedDay(
+  originalItems: TripItineraryItem[],
+  regeneratedItems: TripItineraryItem[]
+): TripItineraryItem[] {
+  const protectedItems = originalItems.filter((item) => item.locked || item.fixedTime);
+  if (protectedItems.length === 0) return regeneratedItems;
+
+  const protectedIds = new Set(protectedItems.map((item) => item.id));
+  // A regenerated item that happens to share a protected item's real
+  // clock time is dropped in its favor, rather than left to sit alongside
+  // it at (or near) the same moment — the protected item's time always
+  // wins (spec: "fixed-time items act as timeline anchors... fill
+  // compatible items around them").
+  const protectedTimes = new Set(protectedItems.filter((item) => item.fixedTime).map((item) => item.plannedStartTime));
+  const survivingRegeneratedItems = regeneratedItems.filter(
+    (item) => !protectedIds.has(item.id) && !protectedTimes.has(item.plannedStartTime)
+  );
+
+  return [...survivingRegeneratedItems, ...protectedItems].sort((left, right) =>
+    left.plannedStartTime.localeCompare(right.plannedStartTime)
+  );
+}
+
+/**
+ * Spec §D4 — a user-selected hotel is a strong constraint, never silently
+ * replaced by whatever a regenerated day happens to suggest. A real
+ * selection is identified the same way the rest of the accommodation UI
+ * already treats it (per-day accommodationLat/Lon set) — no new field.
+ * Regenerating a day is still allowed to update everything else about it
+ * (activities, notes, cost); only the accommodation fields themselves are
+ * carried over untouched.
+ */
+export function preserveUserSelectedHotel(
+  originalDay: Pick<TripItineraryDay, "accommodation" | "accommodationLat" | "accommodationLon" | "accommodationMapLink">,
+  regeneratedDay: TripItineraryDay
+): TripItineraryDay {
+  if (originalDay.accommodationLat == null || originalDay.accommodationLon == null) return regeneratedDay;
+
+  return {
+    ...regeneratedDay,
+    accommodation: originalDay.accommodation,
+    accommodationLat: originalDay.accommodationLat,
+    accommodationLon: originalDay.accommodationLon,
+    accommodationMapLink: originalDay.accommodationMapLink,
+  };
+}
+
 export function shiftRemainingDay(
   day: TripItineraryDay,
   delayMinutes: number,

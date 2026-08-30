@@ -368,15 +368,19 @@ export function getIsraeliAirports(): AirportInfo[] {
 }
 
 /**
- * Airports valid for a connection stop — deliberately the ONLY airport
- * field allowed to show any country (spec item 6), so this is just the
- * full dataset minus whichever airports are already used as this same
- * leg's own origin/destination (no point offering "connect through TLV"
- * when TLV is already the departure airport).
+ * Countries a connection can be routed through — any country this dataset
+ * actually has airports for (a connection can be any country, unlike the
+ * fixed outbound/return endpoints — spec items 14/23), sorted by Hebrew
+ * display name. A country with zero listed airports is never offered here,
+ * since choosing it would leave the following airport combobox with no
+ * options to show (spec item 5's grouped-results expectation implies a
+ * non-empty pool).
  */
-export function getConnectionAirports(exclude: Array<string | null | undefined> = []): AirportInfo[] {
-  const excluded = new Set(exclude.filter((iata): iata is string => Boolean(iata)).map((iata) => iata.toUpperCase()));
-  return AIRPORTS.filter((airport) => !excluded.has(airport.iata));
+export function getAvailableConnectionCountries(): Array<{ iso: string; nameHe: string }> {
+  const isoCodes = new Set(AIRPORTS.map((airport) => airport.countryIso));
+  return Array.from(isoCodes)
+    .map((iso) => ({ iso, nameHe: COUNTRY_NAMES_HE[iso] ?? iso }))
+    .sort((a, b) => a.nameHe.localeCompare(b.nameHe, "he"));
 }
 
 /**
@@ -422,10 +426,16 @@ export function searchAirports(query: string, options: { limit?: number; pool?: 
  * readable Hebrew message for the first violation found, or null when the
  * flights are consistent with the trip direction.
  */
+type ValidatedFlightLeg = {
+  departureAirport?: string | null;
+  arrivalAirport?: string | null;
+  connections?: Array<{ countryIso?: string | null; arrivalAirport?: string | null; departureAirport?: string | null }> | null;
+} | null;
+
 export function validateFlightAirportCountries(
   flights: {
-    outbound?: { departureAirport?: string | null; arrivalAirport?: string | null } | null;
-    return?: { departureAirport?: string | null; arrivalAirport?: string | null } | null;
+    outbound?: ValidatedFlightLeg;
+    return?: ValidatedFlightLeg;
   } | null | undefined,
   destinationCountryIso: string
 ): string | null {
@@ -439,6 +449,31 @@ export function validateFlightAirportCountries(
     return airport;
   }
 
+  /**
+   * Validates one leg's own connections (spec items 20/21): every
+   * connection airport must sit in the country the connection claims, and
+   * consecutive segments must chain (each connection's country must match
+   * the next segment's origin — enforced here without importing
+   * getJourneySegments/validateJourneySegments from flight-planning.ts,
+   * since that module already imports from this one).
+   */
+  function connectionsError(leg: ValidatedFlightLeg | undefined, legLabel: string): string | null {
+    const connections = leg?.connections ?? [];
+    for (const connection of connections) {
+      const expectedIso = (connection.countryIso ?? "").trim().toUpperCase();
+      if (!expectedIso) continue;
+      const arrival = airportInWrongCountry(connection.arrivalAirport, expectedIso);
+      if (arrival) {
+        return `שדה התעופה בקונקשן בטיסת ה${legLabel} (${arrival.iata}) נמצא ב${COUNTRY_NAMES_HE[arrival.countryIso] ?? arrival.countryIso}, אך הקונקשן מוגדר ב${COUNTRY_NAMES_HE[expectedIso] ?? expectedIso}.`;
+      }
+      const departure = airportInWrongCountry(connection.departureAirport, expectedIso);
+      if (departure) {
+        return `שדה התעופה בקונקשן בטיסת ה${legLabel} (${departure.iata}) נמצא ב${COUNTRY_NAMES_HE[departure.countryIso] ?? departure.countryIso}, אך הקונקשן מוגדר ב${COUNTRY_NAMES_HE[expectedIso] ?? expectedIso}.`;
+      }
+    }
+    return null;
+  }
+
   const outboundOrigin = airportInWrongCountry(flights.outbound?.departureAirport, HOME_COUNTRY_ISO);
   if (outboundOrigin) {
     return `שדה התעופה ליציאה בטיסת ההלוך (${outboundOrigin.iata}) נמצא ב${COUNTRY_NAMES_HE[outboundOrigin.countryIso] ?? outboundOrigin.countryIso}, אך על טיסת ההלוך לצאת מישראל.`;
@@ -447,6 +482,9 @@ export function validateFlightAirportCountries(
   if (outboundDestination) {
     return `שדה התעופה ביעד בטיסת ההלוך (${outboundDestination.iata}) נמצא ב${COUNTRY_NAMES_HE[outboundDestination.countryIso] ?? outboundDestination.countryIso}, אך על טיסת ההלוך לנחות במדינת היעד.`;
   }
+  const outboundConnections = connectionsError(flights.outbound, "הלוך");
+  if (outboundConnections) return outboundConnections;
+
   const returnOrigin = airportInWrongCountry(flights.return?.departureAirport, destIso);
   if (returnOrigin) {
     return `שדה התעופה ליציאה בטיסת החזור (${returnOrigin.iata}) נמצא ב${COUNTRY_NAMES_HE[returnOrigin.countryIso] ?? returnOrigin.countryIso}, אך על טיסת החזור לצאת ממדינת היעד.`;
@@ -455,6 +493,8 @@ export function validateFlightAirportCountries(
   if (returnDestination) {
     return `שדה התעופה בנחיתה בטיסת החזור (${returnDestination.iata}) נמצא ב${COUNTRY_NAMES_HE[returnDestination.countryIso] ?? returnDestination.countryIso}, אך על טיסת החזור לנחות בישראל.`;
   }
+  const returnConnections = connectionsError(flights.return, "חזור");
+  if (returnConnections) return returnConnections;
 
   return null;
 }

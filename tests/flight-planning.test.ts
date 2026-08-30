@@ -6,11 +6,19 @@ import {
   computeFlightDurationMinutes,
   computeMultiSegmentFlight,
   describeArrivalDepartureWindow,
+  detectAirportBaseMismatch,
+  detectInvalidFlightLegs,
+  estimateAirportTransferMinutes,
   estimateFlightArrival,
   estimateFlightDurationMinutesByDistance,
+  evaluateFinalBaseDepartureFeasibility,
+  getJourneySegments,
   resolveAirportTimeZone,
+  validateJourneySegments,
+  violatesArrivalDepartureWindow,
+  type ArrivalDepartureWindow,
 } from "../src/lib/flight-planning";
-import { createEmptyFlightLeg, type TripFlights } from "../src/lib/trip-workspace";
+import { createEmptyFlightLeg, type TripFlightConnection, type TripFlights } from "../src/lib/trip-workspace";
 
 // 1. Real tz-aware duration: TLV -> Tbilisi (Israel and Georgia share no DST
 // offset quirk on this date, but the zones are genuinely different — a naive
@@ -189,7 +197,7 @@ test("computeMultiSegmentFlight chains one connection, adds the layover, and sum
     "TBS",
     "2026-08-26",
     "18:30",
-    [{ airport: "IST", layoverMinutes: 130 }],
+    [{ countryIso: "TR", arrivalAirport: "IST", departureAirport: "IST", layoverMinutes: 130 }],
     "Asia/Jerusalem",
     "Asia/Tbilisi"
   );
@@ -215,7 +223,7 @@ test("computeMultiSegmentFlight returns null when any airport in the chain is un
       "TBS",
       "2026-08-26",
       "18:30",
-      [{ airport: "ZZZ", layoverMinutes: 90 }],
+      [{ countryIso: "ZZ", arrivalAirport: "ZZZ", departureAirport: "ZZZ", layoverMinutes: 90 }],
       "Asia/Jerusalem",
       "Asia/Tbilisi"
     ),
@@ -227,5 +235,246 @@ test("computeMultiSegmentFlight returns null when required top-level fields are 
   assert.equal(
     computeMultiSegmentFlight("", "TBS", "2026-08-26", "18:30", [], "Asia/Jerusalem", "Asia/Tbilisi"),
     null
+  );
+});
+
+test("estimateAirportTransferMinutes returns a positive ground-transfer estimate for two real, distinct airports", () => {
+  // Narita and Haneda are both in Tokyo but genuinely different airports —
+  // a real ground transfer, not zero.
+  const minutes = estimateAirportTransferMinutes("NRT", "HND");
+  assert.ok(minutes != null && minutes > 0);
+});
+
+test("estimateAirportTransferMinutes returns null for an unrecognized airport", () => {
+  assert.equal(estimateAirportTransferMinutes("ZZZ", "HND"), null);
+});
+
+test("computeMultiSegmentFlight adds a distance-based transfer time on top of the layover when a connection changes airports (spec item 6)", () => {
+  const layoverMinutes = 100;
+  const sameAirport = computeMultiSegmentFlight(
+    "TLV",
+    "NRT",
+    "2026-09-05",
+    "10:00",
+    [{ countryIso: "TH", arrivalAirport: "BKK", departureAirport: "BKK", layoverMinutes }],
+    "Asia/Jerusalem",
+    "Asia/Tokyo"
+  );
+  const changedAirport = computeMultiSegmentFlight(
+    "TLV",
+    "NRT",
+    "2026-09-05",
+    "10:00",
+    [{ countryIso: "TH", arrivalAirport: "DMK", departureAirport: "BKK", layoverMinutes }],
+    "Asia/Jerusalem",
+    "Asia/Tokyo"
+  );
+  assert.ok(sameAirport != null && changedAirport != null);
+  const expectedTransferMinutes = estimateAirportTransferMinutes("DMK", "BKK");
+  assert.ok(expectedTransferMinutes != null && expectedTransferMinutes > 0);
+  // Ground time = totalJourneyMinutes - totalAirborneMinutes. When the
+  // connection's arrival/departure airports are identical, ground time is
+  // exactly the layover; when they differ, the real distance-based transfer
+  // is added on top (segment flight durations themselves legitimately shift
+  // too, since BKK/DMK are genuinely different airports — this isolates the
+  // ground-time delta specifically, not the airborne totals).
+  assert.equal(sameAirport!.totalJourneyMinutes - sameAirport!.totalAirborneMinutes, layoverMinutes);
+  assert.equal(
+    changedAirport!.totalJourneyMinutes - changedAirport!.totalAirborneMinutes,
+    layoverMinutes + expectedTransferMinutes!
+  );
+});
+
+test("getJourneySegments derives one country-aware segment per hop for a 3-segment IL→TR→TH→JP route", () => {
+  const leg = {
+    departureAirport: "TLV",
+    arrivalAirport: "NRT",
+    connections: [
+      { countryIso: "TR", arrivalAirport: "IST", departureAirport: "IST", layoverMinutes: 100 } as TripFlightConnection,
+      { countryIso: "TH", arrivalAirport: "BKK", departureAirport: "BKK", layoverMinutes: 100 } as TripFlightConnection,
+    ],
+  };
+  const segments = getJourneySegments(leg, "IL", "JP");
+  assert.equal(segments.length, 3);
+  assert.deepEqual(
+    segments.map((segment) => [segment.originCountry, segment.originAirport, segment.destinationCountry, segment.destinationAirport]),
+    [
+      ["IL", "TLV", "TR", "IST"],
+      ["TR", "IST", "TH", "BKK"],
+      ["TH", "BKK", "JP", "NRT"],
+    ]
+  );
+  assert.equal(validateJourneySegments(segments, "IL", "JP"), null);
+});
+
+test("getJourneySegments flags a connection's airport-changed hop and its layover", () => {
+  const leg = {
+    departureAirport: "TLV",
+    arrivalAirport: "NRT",
+    connections: [
+      { countryIso: "TH", arrivalAirport: "DMK", departureAirport: "BKK", layoverMinutes: 100 } as TripFlightConnection,
+    ],
+  };
+  const segments = getJourneySegments(leg, "IL", "JP");
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0].airportChangedAfter, true);
+  assert.equal(segments[0].layoverMinutes, 100);
+  assert.equal(segments[1].airportChangedAfter, false);
+});
+
+test("validateJourneySegments rejects a segment whose airport doesn't match its claimed country", () => {
+  const segments = [
+    { originCountry: "IL", originAirport: "TLV", destinationCountry: "TH", destinationAirport: "TLV", layoverMinutes: 100, airportChangedAfter: false },
+    { originCountry: "TH", originAirport: "BKK", destinationCountry: "JP", destinationAirport: "NRT", layoverMinutes: null, airportChangedAfter: false },
+  ];
+  const error = validateJourneySegments(segments, "IL", "JP");
+  assert.ok(error != null && error.includes("TLV"));
+});
+
+test("validateJourneySegments rejects segments that don't chain (one segment's destination country doesn't match the next segment's origin country)", () => {
+  const segments = [
+    { originCountry: "IL", originAirport: "TLV", destinationCountry: "TR", destinationAirport: "IST", layoverMinutes: 100, airportChangedAfter: false },
+    { originCountry: "TH", originAirport: "BKK", destinationCountry: "JP", destinationAirport: "NRT", layoverMinutes: null, airportChangedAfter: false },
+  ];
+  const error = validateJourneySegments(segments, "IL", "JP");
+  assert.ok(error != null && error.includes("מחוברים"));
+});
+
+test("validateJourneySegments rejects a journey whose first segment doesn't start in the trip's true origin country", () => {
+  const segments = [
+    { originCountry: "TR", originAirport: "IST", destinationCountry: "JP", destinationAirport: "NRT", layoverMinutes: null, airportChangedAfter: false },
+  ];
+  assert.ok(validateJourneySegments(segments, "IL", "JP") != null);
+});
+
+// Section A2/I5-6: same-airport accidental default.
+test("detectInvalidFlightLegs flags an outbound leg whose departure and arrival airport are identical", () => {
+  const flights: TripFlights = {
+    outbound: { ...createEmptyFlightLeg(), departureAirport: "TLV", arrivalAirport: "TLV" },
+    return: null,
+  };
+  const findings = detectInvalidFlightLegs(flights);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].legId, "outbound");
+  assert.equal(findings[0].originAirport, "TLV");
+});
+
+test("detectInvalidFlightLegs flags a same-airport return leg independently of the outbound leg", () => {
+  const flights: TripFlights = {
+    outbound: { ...createEmptyFlightLeg(), departureAirport: "TLV", arrivalAirport: "CDG" },
+    return: { ...createEmptyFlightLeg(), departureAirport: "CDG", arrivalAirport: "CDG" },
+  };
+  const findings = detectInvalidFlightLegs(flights);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].legId, "return");
+});
+
+test("detectInvalidFlightLegs is case-insensitive and never flags a normal two-airport leg", () => {
+  const flights: TripFlights = {
+    outbound: { ...createEmptyFlightLeg(), departureAirport: "tlv", arrivalAirport: "TLV" },
+    return: { ...createEmptyFlightLeg(), departureAirport: "TLV", arrivalAirport: "CDG" },
+  };
+  const findings = detectInvalidFlightLegs(flights);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].legId, "outbound");
+});
+
+test("detectInvalidFlightLegs returns nothing when no flights are set", () => {
+  assert.deepEqual(detectInvalidFlightLegs(undefined), []);
+  assert.deepEqual(detectInvalidFlightLegs({ outbound: null, return: null }), []);
+});
+
+// Section A3-A5/I1-4: arrival/departure airport vs. the day's real base.
+test("detectAirportBaseMismatch returns null when the day's anchors are a normal distance from the airport", () => {
+  // CDG itself — a same-city hotel/activity cluster.
+  const mismatch = detectAirportBaseMismatch("arrival", "CDG", [{ lat: 48.86, lon: 2.35 }]);
+  assert.equal(mismatch, null);
+});
+
+test("detectAirportBaseMismatch flags a departure day whose real anchors sit far outside the airport's metro area", () => {
+  // Nice is ~680km from Paris CDG — clearly a different region reached by
+  // far more than the fixed ground-transfer assumption baked into the
+  // arrival/departure window, not a same-city commute.
+  const mismatch = detectAirportBaseMismatch("departure", "CDG", [{ lat: 43.6584, lon: 7.2159 }]);
+  assert.ok(mismatch != null);
+  assert.equal(mismatch?.direction, "departure");
+  assert.equal(mismatch?.airport, "CDG");
+  assert.ok(mismatch!.estimatedGroundMinutes > mismatch!.assumedGroundMinutes);
+});
+
+test("detectAirportBaseMismatch returns null for an unrecognized airport or when no anchor has coordinates", () => {
+  assert.equal(detectAirportBaseMismatch("arrival", "ZZZ", [{ lat: 48.86, lon: 2.35 }]), null);
+  assert.equal(detectAirportBaseMismatch("arrival", "CDG", [{ lat: null, lon: null }]), null);
+});
+
+// Section A1/A5: violatesArrivalDepartureWindow must validate the item's
+// whole occupied interval on a departure day, not merely its start.
+const DEPARTURE_WINDOW: ArrivalDepartureWindow = {
+  earliestUsableTimeOnArrivalDay: null,
+  latestUsableTimeOnDepartureDay: { date: "2026-09-16", time: "13:15" },
+};
+
+test("violatesArrivalDepartureWindow: starts before cutoff, ends before cutoff -> valid", () => {
+  assert.equal(
+    violatesArrivalDepartureWindow("10:18", "2026-09-16", false, true, DEPARTURE_WINDOW, "11:18"),
+    false
+  );
+});
+
+test("violatesArrivalDepartureWindow: starts before cutoff, ends after cutoff -> invalid (the real France bug)", () => {
+  assert.equal(
+    violatesArrivalDepartureWindow("10:18", "2026-09-16", false, true, DEPARTURE_WINDOW, "15:18"),
+    true
+  );
+});
+
+test("violatesArrivalDepartureWindow: starts after cutoff -> invalid", () => {
+  assert.equal(
+    violatesArrivalDepartureWindow("14:00", "2026-09-16", false, true, DEPARTURE_WINDOW, "14:30"),
+    true
+  );
+});
+
+test("violatesArrivalDepartureWindow: end exactly equal to the cutoff -> valid", () => {
+  assert.equal(
+    violatesArrivalDepartureWindow("12:15", "2026-09-16", false, true, DEPARTURE_WINDOW, "13:15"),
+    false
+  );
+});
+
+test("violatesArrivalDepartureWindow falls back to start time when no end time is supplied at all (never under-detects into a crash, but never over-detects either)", () => {
+  assert.equal(violatesArrivalDepartureWindow("10:18", "2026-09-16", false, true, DEPARTURE_WINDOW), false);
+  assert.equal(violatesArrivalDepartureWindow("14:00", "2026-09-16", false, true, DEPARTURE_WINDOW), true);
+});
+
+// Section B1-B4: evaluateFinalBaseDepartureFeasibility — real time budget,
+// never an arbitrary distance rule.
+test("evaluateFinalBaseDepartureFeasibility: a close base is feasible for a late flight", () => {
+  const result = evaluateFinalBaseDepartureFeasibility("CDG", "20:00", { lat: 48.86, lon: 2.35 });
+  assert.ok(result?.feasible);
+});
+
+test("evaluateFinalBaseDepartureFeasibility: an extremely distant base is infeasible even for a late flight", () => {
+  const result = evaluateFinalBaseDepartureFeasibility("CDG", "20:00", { lat: 10, lon: 10 });
+  assert.equal(result?.feasible, false);
+});
+
+test("evaluateFinalBaseDepartureFeasibility: the SAME mid-distance base is infeasible for an early flight but feasible for a late one — time budget, not a fixed distance rule", () => {
+  const midDistanceAnchor = { lat: 45.75, lon: 4.85 };
+  const early = evaluateFinalBaseDepartureFeasibility("CDG", "07:00", midDistanceAnchor);
+  const late = evaluateFinalBaseDepartureFeasibility("CDG", "20:00", midDistanceAnchor);
+  assert.equal(early?.feasible, false, "an early flight should not tolerate this distance");
+  assert.equal(late?.feasible, true, "a late flight should tolerate the exact same distance");
+});
+
+test("evaluateFinalBaseDepartureFeasibility returns null for an unrecognized airport or unparseable time", () => {
+  assert.equal(evaluateFinalBaseDepartureFeasibility("ZZZ", "20:00", { lat: 48.86, lon: 2.35 }), null);
+  assert.equal(evaluateFinalBaseDepartureFeasibility("CDG", "not-a-time", { lat: 48.86, lon: 2.35 }), null);
+});
+
+test("violatesArrivalDepartureWindow is unaffected on a day that isn't the departure day, regardless of end time", () => {
+  assert.equal(
+    violatesArrivalDepartureWindow("10:18", "2026-09-16", false, false, DEPARTURE_WINDOW, "20:00"),
+    false
   );
 });

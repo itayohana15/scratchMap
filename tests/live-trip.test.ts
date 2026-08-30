@@ -9,6 +9,8 @@ import {
   computeNextActivity,
   effectiveStartTime,
   mergeLiveReplanResult,
+  mergeProtectedItemsIntoRegeneratedDay,
+  preserveUserSelectedHotel,
   shiftRemainingDay,
 } from "../src/lib/live-trip-planner";
 import { getDestinationDateString, getTripDayForNow, isTripActiveNow } from "../src/lib/live-trip-time";
@@ -319,6 +321,90 @@ test("mergeLiveReplanResult keeps completed/skipped/locked/fixedTime items untou
     false,
     "an eligible (not-untouchable) item's regenerated replacement should take over its slot, not keep the stale one"
   );
+});
+
+// ===== Thread 1: locked/fixed-time hard requirement =====
+// Test H — regenerate-day preserves a locked item (real id and state,
+// not just re-created content that happens to share a name).
+test("mergeProtectedItemsIntoRegeneratedDay preserves a locked item through a full day regeneration", () => {
+  const original = [
+    item({ id: "locked-1", name: "Booked Cooking Class", locked: true, plannedStartTime: "12:00", bookingCompleted: true }),
+    item({ id: "open-1", name: "Old Town Walk", plannedStartTime: "09:00" }),
+  ];
+  const regenerated = [
+    item({ id: "regen-1", name: "Different Museum", plannedStartTime: "09:30" }),
+    item({ id: "regen-2", name: "Different Market", plannedStartTime: "15:00" }),
+  ];
+
+  const merged = mergeProtectedItemsIntoRegeneratedDay(original, regenerated);
+
+  const survivingLocked = merged.find((entry) => entry.id === "locked-1");
+  assert.ok(survivingLocked, "the locked item must survive a full day regeneration");
+  assert.equal(survivingLocked!.name, "Booked Cooking Class");
+  assert.equal(survivingLocked!.bookingCompleted, true, "the locked item's own state must be preserved exactly, not re-created");
+  assert.ok(merged.some((entry) => entry.id === "regen-1"), "genuinely new regenerated content is still accepted");
+  assert.ok(merged.some((entry) => entry.id === "regen-2"));
+});
+
+// Test I — regenerate-day preserves fixed time (the pinned clock time
+// itself survives, and any regenerated item colliding with that exact
+// time yields to it rather than sitting alongside it).
+test("mergeProtectedItemsIntoRegeneratedDay preserves a fixed-time item's exact time through regeneration, dropping a regenerated collision", () => {
+  const original = [item({ id: "fixed-1", name: "Timed Reservation", fixedTime: true, plannedStartTime: "14:30" })];
+  const regenerated = [
+    item({ id: "regen-1", name: "AI's Own Idea For 14:30", plannedStartTime: "14:30" }),
+    item({ id: "regen-2", name: "Unrelated Morning Stop", plannedStartTime: "09:00" }),
+  ];
+
+  const merged = mergeProtectedItemsIntoRegeneratedDay(original, regenerated);
+
+  const survivingFixed = merged.find((entry) => entry.id === "fixed-1");
+  assert.ok(survivingFixed);
+  assert.equal(survivingFixed!.plannedStartTime, "14:30", "the fixed-time item's own pinned time must survive exactly");
+  assert.equal(
+    merged.some((entry) => entry.id === "regen-1"),
+    false,
+    "a regenerated item colliding with the fixed item's own pinned time must yield to it, not sit alongside it"
+  );
+  assert.ok(merged.some((entry) => entry.id === "regen-2"), "a regenerated item at a different time is still accepted");
+});
+
+test("mergeProtectedItemsIntoRegeneratedDay returns the regenerated items unchanged when nothing is locked or fixed-time", () => {
+  const original = [item({ id: "open-1", name: "Old Town Walk" })];
+  const regenerated = [item({ id: "regen-1", name: "New Idea" })];
+  assert.equal(mergeProtectedItemsIntoRegeneratedDay(original, regenerated), regenerated);
+});
+
+// Section D4: a user-selected hotel must never be silently replaced by
+// whatever a day/trip regeneration happens to suggest instead.
+test("preserveUserSelectedHotel keeps the original hotel when the day had a real, explicit selection", () => {
+  const original = day({
+    accommodation: "Park Hyatt Tokyo",
+    accommodationLat: 35.6851,
+    accommodationLon: 139.6929,
+    accommodationMapLink: "https://maps.example/park-hyatt",
+  });
+  const regenerated = day({
+    accommodation: "Generic Shinjuku Hotel",
+    accommodationLat: 35.69,
+    accommodationLon: 139.7,
+    accommodationMapLink: "https://maps.example/generic",
+    notes: "regenerated content",
+  });
+
+  const merged = preserveUserSelectedHotel(original, regenerated);
+  assert.equal(merged.accommodation, "Park Hyatt Tokyo");
+  assert.equal(merged.accommodationLat, 35.6851);
+  assert.equal(merged.accommodationLon, 139.6929);
+  assert.equal(merged.accommodationMapLink, "https://maps.example/park-hyatt");
+  assert.equal(merged.notes, "regenerated content", "everything else about the regenerated day is still applied");
+});
+
+test("preserveUserSelectedHotel lets a regenerated hotel through when the original day never had a real selection", () => {
+  const original = day({ accommodation: "", accommodationLat: null, accommodationLon: null });
+  const regenerated = day({ accommodation: "AI-Suggested Hotel", accommodationLat: 35.69, accommodationLon: 139.7 });
+
+  assert.equal(preserveUserSelectedHotel(original, regenerated), regenerated);
 });
 
 // 15. Next-activity/leave-by computation works fully without any location

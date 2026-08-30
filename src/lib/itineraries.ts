@@ -2,6 +2,7 @@ import { format, isValid, parseISO } from "date-fns";
 import { he } from "date-fns/locale";
 
 import { formatTripDateRange } from "@/lib/format";
+import { findAirportByIata } from "@/lib/facts/airports-data";
 import { flightCostExpenses } from "@/lib/flight-planning";
 import { getDestinationDateString } from "@/lib/live-trip-time";
 import { summarizeItemCosts } from "@/lib/server/itinerary-generation-constraints";
@@ -113,8 +114,18 @@ function normalizeFlightConnections(value: unknown): TripFlightConnection[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter(isRecord)
-    .map((entry) => ({ airport: toText(entry.airport), layoverMinutes: toNumber(entry.layoverMinutes) ?? 0 }))
-    .filter((connection) => connection.airport);
+    .map((entry): TripFlightConnection => {
+      // Back-compat: older stored rows only had a single `airport` field
+      // shared for both arrival-into and departure-from the connection.
+      const arrivalAirport = toText(entry.arrivalAirport) || toText(entry.airport);
+      return {
+        countryIso: toText(entry.countryIso) || findAirportByIata(arrivalAirport)?.countryIso || "",
+        arrivalAirport,
+        departureAirport: toText(entry.departureAirport) || arrivalAirport,
+        layoverMinutes: toNumber(entry.layoverMinutes) ?? 0,
+      };
+    })
+    .filter((connection) => connection.arrivalAirport);
 }
 
 function normalizeFlightLeg(value: unknown): TripFlightLeg | null {
@@ -228,6 +239,7 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
             actualEndTime: toText(itemRecord.actualEndTime),
             estimatedDurationMinutes: toNumber(itemRecord.estimatedDurationMinutes),
             approximatePrice: toNumber(itemRecord.approximatePrice),
+            pricePerPerson: toNumber(itemRecord.pricePerPerson),
             priceOriginalAmount: toNumber(itemRecord.priceOriginalAmount),
             priceOriginalCurrency: toText(itemRecord.priceOriginalCurrency) || null,
             priceConvertedAmount: toNumber(itemRecord.priceConvertedAmount),
@@ -238,6 +250,8 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
             transportation: toText(itemRecord.transportation),
             actualTransportation: toText(itemRecord.actualTransportation),
             openingHours: toText(itemRecord.openingHours),
+            lastEntryTime: toText(itemRecord.lastEntryTime),
+            canonicalPlaceId: toText(itemRecord.canonicalPlaceId),
             mapLink: toText(itemRecord.mapLink),
             lat: toNumber(itemRecord.lat),
             lon: toNumber(itemRecord.lon),
@@ -270,6 +284,7 @@ function normalizeItineraryDays(value: unknown): TripItineraryDay[] {
       id: toText(dayRecord.id) || baseDay.id,
       dayNumber: toNumber(dayRecord.dayNumber) ?? index + 1,
       title: toText(dayRecord.title) || baseDay.title,
+      theme: toText(dayRecord.theme),
       date: toText(dayRecord.date),
       cityRegion: toText(dayRecord.cityRegion),
       accommodation: toText(dayRecord.accommodation),

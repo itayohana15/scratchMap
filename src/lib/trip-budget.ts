@@ -44,11 +44,28 @@ export function computeTripBudgetSummary(itinerary: CountryItineraryRecord): Tri
   };
 }
 
-/** Guidance only (spec §C6) — never auto-spends the remainder. Null unless remaining is meaningfully positive. */
-export function buildUpgradeSuggestion(summary: TripBudgetSummary): string | null {
-  if (summary.remaining == null || summary.originalBudget == null || summary.originalBudget <= 0) return null;
-  if (summary.remaining / summary.originalBudget < UPGRADE_SUGGESTION_THRESHOLD) return null;
+/**
+ * Guidance only (spec item 24 — "do not spend money just to spend it"),
+ * never an auto-spend action. Empty unless remaining is meaningfully
+ * positive. Returns several concrete options rather than one generic
+ * sentence, picked from which categories look like they have real
+ * headroom in the actual categoryBreakdown — still just suggestions, the
+ * traveler decides.
+ */
+export function buildUpgradeSuggestions(summary: TripBudgetSummary): string[] {
+  if (summary.remaining == null || summary.originalBudget == null || summary.originalBudget <= 0) return [];
+  if (summary.remaining / summary.originalBudget < UPGRADE_SUGGESTION_THRESHOLD) return [];
 
-  const amount = Math.round(summary.remaining).toLocaleString("he-IL");
-  return `נותרו ₪${amount} מהתקציב. אפשר לשקול שדרוג לינה או טיסות.`;
+  const breakdown = summary.categoryBreakdown;
+  const totalSpend = Object.values(breakdown).reduce((sum, value) => sum + value, 0);
+  const shareOf = (category: string) => (totalSpend > 0 ? (breakdown[category] ?? 0) / totalSpend : 0);
+
+  const suggestions: string[] = [];
+  if (shareOf("accommodation") < 0.3) suggestions.push("שדרוג לינה למיקום מרכזי יותר או לחדר גדול יותר");
+  if (breakdown.flights != null && shareOf("flights") < 0.25) suggestions.push("טיסה ישירה במקום עם קונקשן");
+  suggestions.push("ארוחת ערב מיוחדת באחד הימים במסלול");
+  suggestions.push("טיול פרטי או חוויה מודרכת ביום פנוי");
+  if (summary.remaining >= 3000) suggestions.push("שכירת רכב לחלק מהטיול, אם זה משרת את המסלול");
+
+  return suggestions;
 }

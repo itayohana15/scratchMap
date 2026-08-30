@@ -82,7 +82,12 @@ export type FlightBookingStatus = "not_booked" | "booked" | "paid";
  */
 /** One intermediate stop on a connecting flight (spec items 17-19) — airport + how long the layover is, in the connection airport's own local time. */
 export interface TripFlightConnection {
-  airport: string;
+  /** The connection's own country — e.g. "TH" for a Bangkok stop between Israel and Japan. */
+  countryIso: string;
+  /** The airport this segment lands at. */
+  arrivalAirport: string;
+  /** The airport the next segment departs from — usually the same as arrivalAirport; differs only when the traveler changes airports mid-connection (e.g. HND in, NRT out). */
+  departureAirport: string;
   layoverMinutes: number;
 }
 
@@ -251,6 +256,8 @@ export interface TripItineraryItem {
   actualEndTime: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
+  /** See AiGeneratedItem.pricePerPerson — the per-person figure approximatePrice's group total was derived from, when known. */
+  pricePerPerson: number | null;
   priceOriginalAmount: number | null;
   priceOriginalCurrency: string | null;
   priceConvertedAmount: number | null;
@@ -263,6 +270,8 @@ export interface TripItineraryItem {
   transportation: string;
   actualTransportation: string;
   openingHours: string;
+  /** See AiGeneratedItem.lastEntryTime. */
+  lastEntryTime: string;
   reservationRequired: boolean;
   bookingCompleted: boolean;
   optional: boolean;
@@ -297,12 +306,16 @@ export interface TripItineraryItem {
   // applyDeterministicReplacement/mergeLiveReplanResult still fully remove
   // the old item rather than flagging it — see Stage 5 plan's scope note).
   replaced: boolean;
+  /** See AiGeneratedItem.canonicalPlaceId. */
+  canonicalPlaceId: string;
 }
 
 export interface TripItineraryDay {
   id: string;
   dayNumber: number;
   title: string;
+  /** See AiGeneratedDay.theme. */
+  theme: string;
   date: string;
   cityRegion: string;
   // Coordinate-based canonical identity for cityRegion (e.g. "ge:41.69:44.80"),
@@ -314,6 +327,26 @@ export interface TripItineraryDay {
   accommodationMapLink: string;
   accommodationLat: number | null;
   accommodationLon: number | null;
+  // Set at selection time (buildHotelSelectionPatch, spec §F2/§G) when the
+  // chosen hotel is real-distance-incompatible with this stay's own
+  // activity clusters — the selection itself is still honored (spec §F3:
+  // "user selection is authoritative"), this only exposes the tradeoff.
+  // Optional/absent for every day generated before this existed, and for
+  // any day whose hotel was never explicitly selected at all.
+  accommodationBaseMismatch?: { nearestClusterKm: number; thresholdKm: number } | null;
+  // Section C/E/F — recomputed by stay-routing.ts's recalculateStayRouting
+  // whenever a hotel is selected/changed, using the real hotel coordinates
+  // as the stay's anchor (never the old area centroid). Inline shapes here
+  // rather than importing from stay-routing.ts, which itself imports
+  // haversineKm from this file — importing back would be circular.
+  // Absent/undefined for a day whose stay has no adjacent stay in that
+  // direction (first/last stay) or was never recalculated.
+  inboundTransitionMinutes?: number | null;
+  outboundTransitionMinutes?: number | null;
+  arrivalTransferMinutes?: number | null;
+  departureTransferMinutes?: number | null;
+  hotelCausedTransitionConflict?: { direction: "inbound" | "outbound"; estimatedMinutes: number } | null;
+  hotelCausedAirportConflict?: { direction: "arrival" | "departure"; estimatedGroundMinutes: number; assumedGroundMinutes: number } | null;
   notes: string;
   transportation: string;
   estimatedCost: number | null;
@@ -646,6 +679,15 @@ export interface AiItineraryRequest {
   // Optional user-entered trip name from the creation wizard's first step —
   // wins over the AI-generated title when present.
   userProvidedTitle?: string;
+  // Section B/H: the REAL Overpass provider outcome, aggregated by the
+  // caller from its own actual per-category recommendation requests (each
+  // request's real succeeded flag — never candidate count) — used verbatim
+  // for GeneratedCountryItineraryPlan.candidateProviderStatus.overpass.
+  // "partial" when some categories' real requests succeeded and others
+  // didn't. null/undefined means the caller doesn't know (e.g. a test),
+  // in which case a disclosed-imprecise candidate-count heuristic is the
+  // fallback.
+  overpassAvailable?: "available" | "unavailable" | "partial" | null;
 }
 
 export interface AiGeneratedItem {
@@ -659,6 +701,15 @@ export interface AiGeneratedItem {
   endTime?: string;
   estimatedDurationMinutes: number | null;
   approximatePrice: number | null;
+  /**
+   * The realistic price for ONE traveler, in the converted/target currency
+   * — `approximatePrice` stays the whole-group total everywhere downstream
+   * (unchanged), this is the per-person figure the total was derived from
+   * (spec: "totalActivityCost = pricePerPerson × travelers"). Null when the
+   * item's price came from a matched TripRecommendation candidate whose own
+   * per-person/total semantics aren't audited yet (see resolveItemPriceFields).
+   */
+  pricePerPerson: number | null;
   priceOriginalAmount: number | null;
   priceOriginalCurrency: string | null;
   priceConvertedAmount: number | null;
@@ -668,6 +719,8 @@ export interface AiGeneratedItem {
   sourceType: PriceSourceType | null;
   travelMinutes: number | null;
   openingHours: string;
+  /** Last time you can still enter, when known and distinct from the closing time (spec item 17) — empty string when unknown, never guessed from closingHours. */
+  lastEntryTime: string;
   reservationRequired: boolean;
   transportation: string;
   mapLink: string;
@@ -679,6 +732,17 @@ export interface AiGeneratedItem {
   locked: boolean;
   priority: ItemPriority;
   fixedTime: boolean;
+  /**
+   * A real place identity (spec item 76) — `id:${recommendationId}` when
+   * known, else `coords:${lat}:${lon}` when the item has real coordinates,
+   * else "" (never a name-only identity: two genuinely different places
+   * can share a generic name, and this app already learned the hard way —
+   * see buildItemKey's own docstring — that guessing identity from name
+   * alone risks false-positive duplicate merges). Derived in
+   * fillDerivedDayFields via resolveCanonicalPlaceId; every other
+   * construction site defaults it to "" and lets that pass fill it in.
+   */
+  canonicalPlaceId: string;
 }
 
 export interface AiGeneratedDay {
@@ -686,6 +750,8 @@ export interface AiGeneratedDay {
   date: string;
   title: string;
   cityRegion: string;
+  /** Content-derived, always computed regardless of the AI's own title (spec items 49/50) — see inferDayThemeLabel. */
+  theme: string;
   accommodation: string;
   notes: string;
   transportation: string;
@@ -934,6 +1000,7 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     actualEndTime: "",
     estimatedDurationMinutes: null,
     approximatePrice: null,
+    pricePerPerson: null,
     priceOriginalAmount: null,
     priceOriginalCurrency: null,
     priceConvertedAmount: null,
@@ -946,6 +1013,8 @@ export function createEmptyItineraryItem(slot: DayPart = "morning"): TripItinera
     transportation: "",
     actualTransportation: "",
     openingHours: "",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
     reservationRequired: false,
     bookingCompleted: false,
     optional: false,
@@ -1026,6 +1095,7 @@ export function recommendationToItineraryItem(recommendation: TripRecommendation
     mapLink: recommendation.mapLink,
     lat: recommendation.lat,
     lon: recommendation.lon,
+    canonicalPlaceId: deriveCanonicalPlaceId(recommendation.id, recommendation.lat, recommendation.lon),
   };
 }
 
@@ -1034,6 +1104,7 @@ export function createEmptyDay(dayNumber: number, date = ""): TripItineraryDay {
     id: createId("day"),
     dayNumber,
     title: `Day ${dayNumber}`,
+    theme: "",
     date,
     cityRegion: "",
     accommodation: "",
@@ -1240,6 +1311,21 @@ export function buildDirectionsLink(lat: number | null, lon: number | null, name
   return name ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(name)}` : "";
 }
 
+/**
+ * A real, storable place identity (spec item 76) — see the identical
+ * reasoning duplicated in country-itinerary-generation.ts's
+ * resolveCanonicalPlaceId (kept separate rather than imported: that file
+ * is server-only, this one is shared with the client). `id:${id}` when
+ * known, else `coords:${lat}:${lon}` when real coordinates exist, else ""
+ * — never a name-only identity (two genuinely different places can share
+ * a generic name).
+ */
+export function deriveCanonicalPlaceId(id: string | null, lat: number | null, lon: number | null): string {
+  if (id) return `id:${id}`;
+  if (lat != null && lon != null) return `coords:${lat.toFixed(3)}:${lon.toFixed(3)}`;
+  return "";
+}
+
 export function haversineKm(
   lat1: number | null,
   lon1: number | null,
@@ -1257,6 +1343,82 @@ export function haversineKm(
   return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+const FUZZY_DUPLICATE_MAX_KM = 0.15; // ~150m
+
+// Strips parenthetical suffixes ("Mtatsminda Park (Funicular)" ->
+// "mtatsminda park") and punctuation so differently-worded mentions of the
+// same real place collapse to the same slug — an exact name/coordinate
+// match alone misses this class of duplicate (spec item 52/56's "duplicate
+// Mtatsminda Park" symptom). Lives here (not itinerary-generation-
+// constraints.ts, which imports FROM this file) so both the Gemini-repair
+// pipeline's duplicate diagnostic AND the fallback template's own
+// candidate selection use exactly one fuzzy-identity definition.
+export function normalizePlaceNameSlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export interface FuzzyPlaceRecord {
+  nameSlug: string;
+  lat: number | null;
+  lon: number | null;
+}
+
+export function isFuzzyDuplicatePlace(a: FuzzyPlaceRecord, b: FuzzyPlaceRecord): boolean {
+  if (!a.nameSlug || !b.nameSlug) return false;
+  const namesMatch = a.nameSlug === b.nameSlug || a.nameSlug.startsWith(b.nameSlug) || b.nameSlug.startsWith(a.nameSlug);
+  if (!namesMatch) return false;
+  // Both slugs matched (one contains the other) — if we also have
+  // coordinates for both, only call it a duplicate when they're genuinely
+  // close together, so "Mtatsminda Park" in Tbilisi never collides with an
+  // unrelated same-named place elsewhere. Without coordinates for either
+  // side, the strict slug match alone is treated as sufficient.
+  if (a.lat == null || a.lon == null || b.lat == null || b.lon == null) return true;
+  return haversineKm(a.lat, a.lon, b.lat, b.lon) <= FUZZY_DUPLICATE_MAX_KM;
+}
+
+// A hotel more than this from EVERY one of the stay's own activity
+// clusters isn't "a bit further out" — it's a different area than the trip
+// actually plans to spend the stay in (spec §D3/§F). Deliberately generous
+// (hotels.ts's findHotelCandidates already scopes the search radius to
+// 2.5km around one cluster point, so a real candidate is normally well
+// under this) — meant to catch a hotel picked or kept from a completely
+// different part of the trip, not to penalize a normal multi-cluster stay.
+export const HOTEL_BASE_MISMATCH_KM = 15;
+
+export interface HotelBaseMismatch {
+  nearestClusterKm: number;
+  thresholdKm: number;
+}
+
+/**
+ * Detects a hotel (selected, recommended, or already booked) that is
+ * geographically incompatible with the stay's own activity clusters (spec
+ * §D3) — coordinates and real distance only, no city-name matching. Null
+ * when the hotel is close enough to at least one cluster, or when there's
+ * nothing real to compare against. Lives here (not hotels.ts) so the
+ * client-safe hotel-selection flow (hotel-ui-helpers.ts) can call it
+ * without pulling in hotels.ts's server-only Overpass dependency.
+ */
+export function detectHotelBaseMismatch(
+  hotel: { lat: number | null; lon: number | null },
+  activityClusters: Array<{ lat: number; lon: number }>,
+  thresholdKm: number = HOTEL_BASE_MISMATCH_KM
+): HotelBaseMismatch | null {
+  if (hotel.lat == null || hotel.lon == null || activityClusters.length === 0) return null;
+
+  const nearestClusterKm = Math.min(
+    ...activityClusters.map((cluster) => haversineKm(hotel.lat, hotel.lon, cluster.lat, cluster.lon))
+  );
+  if (nearestClusterKm <= thresholdKm) return null;
+
+  return { nearestClusterKm: Math.round(nearestClusterKm * 10) / 10, thresholdKm };
+}
+
 export function estimateTravelMinutes(
   fromLat: number | null,
   fromLon: number | null,
@@ -1270,6 +1432,57 @@ export function estimateTravelMinutes(
     transportation.includes("הליכה") ? 4 : transportation.includes("רכב") ? 35 : 22;
   const buffer = pace === "relaxed" ? 1.25 : pace === "fast" ? 0.9 : 1;
   return km > 0 ? Math.round((km / speed) * 60 * buffer) : 0;
+}
+
+/**
+ * Same distance basis as analyzeDayGeography's own cross-city detection
+ * (itinerary-generation-constraints.ts's DISTANT_CITY_DISTANCE_KM) —
+ * deliberately kept as one shared number rather than a second, possibly
+ * inconsistent threshold, so "is this candidate too far away" and "is
+ * this a cross-city day" never disagree with each other. Raw distance,
+ * not travel time, for the same reason the existing validator uses it:
+ * simple, mode-independent, and already proven not to misfire on real
+ * trips.
+ */
+export const CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM = 80;
+
+/**
+ * Generic worldwide architecture (Phase 5/14): a HARD geographic gate, not
+ * just a scoring signal. Real bug found in real-world QA: a day labeled
+ * for one city could end up containing activities from an entirely
+ * different city/region, because every candidate-selection/replacement
+ * function (pickReplacementRecommendation, selectFallbackCandidate,
+ * diversifyActivities, ensureMustVisitCoverage, ...) only ever scored
+ * geographic proximity as one signal among several (category fit, budget
+ * fit, "any" time-of-day, area-label text match) — a globally
+ * well-matching candidate from a genuinely different city could still win
+ * purely on those other factors, since nothing ever hard-rejected it for
+ * simply being too far away. Pure coordinates, no per-city/per-country
+ * special-casing — works identically for any destination.
+ *
+ * A day with no coordinate-bearing items yet (nothing established to
+ * compare against) or a candidate with no coordinates of its own can't be
+ * judged either way — this never blocks generation on missing geographic
+ * data, it only rejects a candidate that IS demonstrably far from
+ * everything already anchoring the day. A deliberate day-trip day is the
+ * one explicit exemption (isDayTripDay), since being far from the day's
+ * own base is the entire point of a day trip.
+ */
+export function isCandidateGeographicallyCompatibleWithDay(
+  candidate: { lat: number | null; lon: number | null },
+  existingAnchors: Array<{ lat: number | null; lon: number | null }>,
+  args: { maxDistanceKm?: number; isDayTripDay?: boolean }
+): boolean {
+  if (args.isDayTripDay) return true;
+  if (candidate.lat == null || candidate.lon == null) return true;
+
+  const anchorsWithCoordinates = existingAnchors.filter((anchor) => anchor.lat != null && anchor.lon != null);
+  if (anchorsWithCoordinates.length === 0) return true;
+
+  const maxDistanceKm = args.maxDistanceKm ?? CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM;
+  return anchorsWithCoordinates.some(
+    (anchor) => haversineKm(anchor.lat, anchor.lon, candidate.lat, candidate.lon) < maxDistanceKm
+  );
 }
 
 export type DayOptimizeMode = "fewer_transfers" | "less_walking";
@@ -1849,7 +2062,12 @@ function scoreFallbackCandidate(
   if (preferredKeywords.some((keyword) => haystack.includes(keyword))) score += 12;
   if (selectedIds.has(candidate.id) || candidate.source === "saved" || candidate.source === "manual") score += 12;
 
-  score -= usageCount * 18;
+  // usageCount is always 0 here now — selectFallbackCandidate hard-excludes
+  // any already-used real place before scoring ever runs (see its own
+  // comment). usageCount itself is kept as a parameter (still passed
+  // through, still computed) purely so a future soft-preference use isn't
+  // blocked by a signature change; it contributes nothing to the score.
+  void usageCount;
 
   if (previousItem) {
     const km = haversineKm(previousItem.lat, previousItem.lon, candidate.lat, candidate.lon);
@@ -1883,20 +2101,88 @@ function scoreFallbackCandidate(
   return score;
 }
 
-function selectFallbackCandidate(args: {
+export function selectFallbackCandidate(args: {
   pool: TripRecommendation[];
   slot: DayPart;
   template: FallbackDayTemplate;
   preferredArea: string;
   previousItem: AiGeneratedItem | null;
+  existingItems: AiGeneratedItem[];
   usedToday: Set<string>;
   usageCounts: Map<string, number>;
+  usedRealPlaces: FuzzyPlaceRecord[];
   selectedIds: Set<string>;
   preferredKeywords: string[];
   avoidKeywords: string[];
 }) {
+  // The day's FIRST pick has no existingItems to compare against yet —
+  // isCandidateGeographicallyCompatibleWithDay correctly declines to judge
+  // in that case (nothing established, don't block on missing data), which
+  // used to leave the very first activity of a day with literally zero
+  // geographic constraint (scoreFallbackCandidate's own km-based penalty
+  // only ever applies once there's a previousItem). The pool's own
+  // real-coordinate members that already share the day's assigned
+  // preferredArea label give an area-appropriate reference to judge
+  // against even before anything is actually placed yet.
+  const preferredAreaAnchors =
+    args.existingItems.length === 0 && args.preferredArea
+      ? args.pool.filter(
+          (candidate) => fallbackAreaLabel(candidate.location).toLowerCase() === args.preferredArea.toLowerCase()
+        )
+      : [];
+  const geographicAnchors: Array<{ lat: number | null; lon: number | null }> = [
+    ...args.existingItems,
+    ...preferredAreaAnchors,
+  ];
+
   const ranked = args.pool
     .filter((candidate) => !args.usedToday.has(candidate.id))
+    // Real bug found in live production use (a real 10-day Israel trip
+    // with a genuine, abundant Overpass candidate pool): usageCounts was
+    // only ever a soft scoring penalty (-18 per prior use, below) — a
+    // candidate that scored well on category/area/keyword match (routinely
+    // +50-100+) could still outrank every never-used alternative once the
+    // pool's best-fitting candidates for a slot were exhausted relative to
+    // trip length, so the SAME real restaurant/attraction got picked again
+    // on a later day. collectPlanDiagnostics correctly flagged this as a
+    // real cross-day duplicate — but that flagged the FALLBACK template
+    // itself, the last-resort path with no further repair step, so the
+    // whole generation hard-failed with PLAN_NOT_FEASIBLE instead of
+    // degrading to a placeholder. A real place already used anywhere in
+    // the trip is now hard-excluded, the same "never reuse a specific
+    // place, ever" rule the Gemini-repair pipeline's own
+    // pickReplacementRecommendation/pickNearbyMealRecommendation already
+    // enforce via usedPlaceKeys — ranked coming back empty here already
+    // falls through to a real, honest placeholder (createFallbackMealPlaceholder/
+    // createFallbackActivityPlaceholder), never a silent gap.
+    .filter((candidate) => (args.usageCounts.get(candidate.id) ?? 0) === 0)
+    // The SAME real place can appear under a different id (fetched
+    // independently per category — see usedRealPlaces' own comment at its
+    // declaration) — the id-only filter just above misses that. Uses the
+    // exact fuzzy name+coordinate identity collectPlanDiagnostics itself
+    // uses to flag a duplicate, so this can never disagree with it.
+    .filter((candidate) => {
+      const candidateRecord: FuzzyPlaceRecord = {
+        nameSlug: normalizePlaceNameSlug(candidate.name),
+        lat: candidate.lat,
+        lon: candidate.lon,
+      };
+      return !args.usedRealPlaces.some((used) => isFuzzyDuplicatePlace(used, candidateRecord));
+    })
+    // Generic worldwide architecture (Phase 5/14): same hard geographic
+    // gate as pickReplacementRecommendation — the fallback template's own
+    // area preference (preferredArea) was only ever a soft scoring bonus
+    // in scoreFallbackCandidate below, so a candidate that scored well on
+    // category/time-of-day/budget could still win from a genuinely
+    // different city. This is the deterministic template used whenever
+    // real Gemini generation fails validation, so it runs disproportionately
+    // often — real bug found in live QA: a "Tel Aviv" day containing
+    // Haifa's Bahá'í Gardens, among other cross-city leaks.
+    .filter((candidate) =>
+      isCandidateGeographicallyCompatibleWithDay(candidate, geographicAnchors, {
+        isDayTripDay: args.template.kind === "day_trip",
+      })
+    )
     .map((candidate) => ({
       candidate,
       score: scoreFallbackCandidate(
@@ -1932,6 +2218,76 @@ const FALLBACK_DINNER_PHRASES = [
   (area: string) => `ארוחת ערב גמישה ליד ${area}`,
 ];
 
+// Same phrase-rotation reasoning as FALLBACK_LUNCH_PHRASES/FALLBACK_DINNER_PHRASES
+// just above — a fixed name+area repeated across days with no id/coordinates
+// would otherwise read as a duplicate place to buildItemKey's fallback tier.
+const FALLBACK_ACTIVITY_PHRASES: Partial<Record<DayPart, ((area: string) => string)[]>> = {
+  morning: [
+    (area) => `שיטוט וגילוי באזור ${area}`,
+    (area) => `סיור רגלי בשכונות ${area}`,
+    (area) => `תצפית ונקודות עניין באזור ${area}`,
+  ],
+  afternoon: [
+    (area) => `המשך שיטוט ואתרים קרובים באזור ${area}`,
+    (area) => `זמן לגילוי ספונטני באזור ${area}`,
+    (area) => `שכונה מעניינת ליד ${area}`,
+  ],
+  evening: [
+    (area) => `טיול ערב קליל באזור ${area}`,
+    (area) => `שיטוט ערב וצפייה בחיים המקומיים ב${area}`,
+    (area) => `זמן פנוי לבחירה אישית באזור ${area}`,
+  ],
+  night: [
+    (area) => `המשך ערב באזור ${area}`,
+    (area) => `שיטוט לילי קליל ב${area}`,
+  ],
+};
+
+function createFallbackActivityPlaceholder(
+  slot: DayPart,
+  dayArea: string,
+  input: AiItineraryRequest,
+  dayNumber: number
+): AiGeneratedItem {
+  const phrases = FALLBACK_ACTIVITY_PHRASES[slot] ?? FALLBACK_ACTIVITY_PHRASES.afternoon!;
+  const name = dayArea ? phrases[dayNumber % phrases.length](dayArea) : `שיטוט וגילוי ב${input.countryName}`;
+
+  return {
+    name,
+    category: "attraction",
+    location: dayArea || input.countryName,
+    shortDescription:
+      "אם אין המלצה ספציפית זמינה, שוטטו באזור הפעילויות של אותו יום — רחובות מרכזיים, נקודות תצפית או שכונות סמוכות שוות גילוי.",
+    slot,
+    plannedStartTime: slotTime(slot),
+    estimatedDurationMinutes: slot === "evening" || slot === "night" ? 90 : 120,
+    approximatePrice: null,
+    pricePerPerson: null,
+    priceOriginalAmount: null,
+    priceOriginalCurrency: null,
+    priceConvertedAmount: null,
+    priceExchangeRate: null,
+    priceRateTimestamp: null,
+    convertedCurrency: null,
+    sourceType: null,
+    travelMinutes: 10,
+    openingHours: "",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
+    reservationRequired: false,
+    transportation: "הליכה",
+    mapLink: buildMapLink(dayArea || input.countryName, null, null),
+    lat: null,
+    lon: null,
+    bookingWarning: "",
+    alternativeSuggestion: "",
+    recommendationId: null,
+    locked: false,
+    priority: "preferred",
+    fixedTime: false,
+  };
+}
+
 function createFallbackMealPlaceholder(
   slot: DayPart,
   dayArea: string,
@@ -1955,6 +2311,7 @@ function createFallbackMealPlaceholder(
     plannedStartTime: slotTime(slot),
     estimatedDurationMinutes: slot === "lunch" ? 60 : 75,
     approximatePrice: null,
+    pricePerPerson: null,
     priceOriginalAmount: null,
     priceOriginalCurrency: null,
     priceConvertedAmount: null,
@@ -1964,6 +2321,8 @@ function createFallbackMealPlaceholder(
     sourceType: null,
     travelMinutes: 10,
     openingHours: "לא זמין",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
     reservationRequired: false,
     transportation: "הליכה",
     mapLink: buildMapLink(dayArea || input.countryName, null, null),
@@ -1993,6 +2352,7 @@ function createFallbackPracticalItem(
       plannedStartTime: "08:30",
       estimatedDurationMinutes: 90,
       approximatePrice: null,
+      pricePerPerson: null,
       priceOriginalAmount: null,
       priceOriginalCurrency: null,
       priceConvertedAmount: null,
@@ -2002,6 +2362,8 @@ function createFallbackPracticalItem(
       sourceType: null,
       travelMinutes: 0,
       openingHours: "לא זמין",
+      lastEntryTime: "",
+      canonicalPlaceId: "",
       reservationRequired: false,
       transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
       mapLink: buildMapLink(dayArea || input.countryName, null, null),
@@ -2026,6 +2388,7 @@ function createFallbackPracticalItem(
       plannedStartTime: "09:30",
       estimatedDurationMinutes: 75,
       approximatePrice: null,
+      pricePerPerson: null,
       priceOriginalAmount: null,
       priceOriginalCurrency: null,
       priceConvertedAmount: null,
@@ -2035,6 +2398,8 @@ function createFallbackPracticalItem(
       sourceType: null,
       travelMinutes: 0,
       openingHours: "לא זמין",
+      lastEntryTime: "",
+      canonicalPlaceId: "",
       reservationRequired: false,
       transportation: "הליכה",
       mapLink: buildMapLink(dayArea || input.countryName, null, null),
@@ -2084,6 +2449,14 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
   const days: AiGeneratedDay[] = [];
   const areaRankings = buildFallbackAreaRankings(recommendationPool);
   const usageCounts = new Map<string, number>();
+  // Real bug found in live production use: the SAME real place can appear
+  // under multiple different candidate ids (fetched once per category —
+  // e.g. "Old Jaffa" showing up as both an "attraction" and a "hidden_gem"
+  // entry with two distinct ids). usageCounts alone (keyed by id) doesn't
+  // catch that; this tracks the same fuzzy name+coordinate identity
+  // collectPlanDiagnostics itself uses to flag duplicates, so a place
+  // already used under ANY id is excluded, not just the exact same id.
+  const usedRealPlaces: FuzzyPlaceRecord[] = [];
   const selectedIds = new Set(input.selectedPlaces.map((place) => place.id));
   const preferredKeywords = parsePreferenceKeywords(
     [input.preferences.preferredRegions, input.preferences.mustVisitPlaces, input.preferences.interests].join(",")
@@ -2116,8 +2489,10 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         template,
         preferredArea,
         previousItem,
+        existingItems: items,
         usedToday,
         usageCounts,
+        usedRealPlaces,
         selectedIds,
         preferredKeywords,
         avoidKeywords,
@@ -2126,12 +2501,27 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       if (!next) {
         if (slot === "lunch" || slot === "dinner") {
           items.push(createFallbackMealPlaceholder(slot, preferredArea, input, dayNumber));
+        } else if (items.length < template.maxStops) {
+          // Real bug found during end-to-end QA generation: when the
+          // candidate pool has no real match for a non-meal slot (most
+          // starkly when the pool is empty entirely, e.g. every
+          // recommendation source failed), nothing at all used to be
+          // pushed here — meal slots always got a generic placeholder,
+          // but anchor slots silently stayed empty. A live 10-day Israel
+          // fallback run collapsed to just "lunch, dinner" on 7 of 10
+          // days: no anchor, no evening coverage, the day effectively
+          // ending at ~14:00. A generic exploration placeholder keeps the
+          // day structurally real (spec item 6's evening-coverage
+          // expectation, item 5's day-utilization floor) even with zero
+          // real candidates, instead of a silent gap.
+          items.push(createFallbackActivityPlaceholder(slot, preferredArea, input, dayNumber));
         }
         continue;
       }
 
       usedToday.add(next.id);
       usageCounts.set(next.id, (usageCounts.get(next.id) ?? 0) + 1);
+      usedRealPlaces.push({ nameSlug: normalizePlaceNameSlug(next.name), lat: next.lat, lon: next.lon });
 
       const transportation = resolveFallbackTransportation(previousItem, next, input);
       const travelMinutes = estimateFallbackTravelMinutes(previousItem, next, input, template, transportation);
@@ -2146,6 +2536,11 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         estimatedDurationMinutes:
           next.estimatedDurationMinutes ?? (slot === "lunch" || slot === "dinner" ? 75 : slot === "evening" ? 90 : 120),
         approximatePrice: next.approximatePrice,
+        // TripRecommendation doesn't carry a per-person/total distinction
+        // (its own price-source semantics aren't audited yet — see
+        // resolveItemPriceFields), so this is left unknown rather than
+        // guessed.
+        pricePerPerson: null,
         priceOriginalAmount: next.priceOriginalAmount ?? next.approximatePrice,
         priceOriginalCurrency: next.priceOriginalCurrency ?? null,
         priceConvertedAmount: next.priceConvertedAmount ?? next.approximatePrice,
@@ -2155,6 +2550,8 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         sourceType: next.sourceType ?? (next.approximatePrice != null ? "candidate" : null),
         travelMinutes,
         openingHours: next.openingHours || "לא זמין",
+        lastEntryTime: "",
+        canonicalPlaceId: deriveCanonicalPlaceId(next.id, next.lat, next.lon),
         reservationRequired: next.reservationRequired,
         transportation,
         mapLink: next.mapLink || buildMapLink(next.name, next.lat, next.lon),
@@ -2190,6 +2587,7 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         plannedStartTime: "10:00",
         estimatedDurationMinutes: 180,
         approximatePrice: null,
+        pricePerPerson: null,
         priceOriginalAmount: null,
         priceOriginalCurrency: null,
         priceConvertedAmount: null,
@@ -2199,6 +2597,8 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         sourceType: null,
         travelMinutes: 0,
         openingHours: "",
+        lastEntryTime: "",
+        canonicalPlaceId: "",
         reservationRequired: false,
         transportation: input.preferences.transportationPreferences || "תחבורה מקומית",
         mapLink: buildMapLink(input.countryName, null, null),
@@ -2272,6 +2672,10 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
       date:
         input.existingDays[dayNumber - 1]?.date || dateForDayNumber(input.preferences.startDate, dayNumber),
       title: `יום ${dayNumber} · ${template.titleHint}${cityRegion ? ` ב${cityRegion}` : ""}`,
+      // Left empty here — every path that reaches a saved itinerary passes
+      // fallback days through fillDerivedDayFields (country-itinerary-generation.ts),
+      // which always recomputes theme from the day's actual items.
+      theme: "",
       cityRegion,
       accommodation:
         input.preferences.accommodationArea ||
@@ -2373,6 +2777,7 @@ export function applyAiPlanToWorkspace(
     id: current.itineraryDays[day.dayNumber - 1]?.id ?? createId("day"),
     dayNumber: day.dayNumber,
     title: day.title,
+    theme: day.theme,
     date: day.date,
     cityRegion: day.cityRegion,
     accommodation: day.accommodation,
@@ -2407,6 +2812,7 @@ export function applyAiPlanToWorkspace(
         endTime: item.endTime,
         estimatedDurationMinutes: item.estimatedDurationMinutes,
         approximatePrice: item.approximatePrice,
+        pricePerPerson: item.pricePerPerson,
         priceOriginalAmount: item.priceOriginalAmount,
         priceOriginalCurrency: item.priceOriginalCurrency,
         priceConvertedAmount: item.priceConvertedAmount,
@@ -2417,6 +2823,8 @@ export function applyAiPlanToWorkspace(
         travelMinutes: item.travelMinutes,
         transportation: item.transportation,
         openingHours: item.openingHours,
+        lastEntryTime: item.lastEntryTime,
+        canonicalPlaceId: item.canonicalPlaceId,
         reservationRequired: item.reservationRequired,
         mapLink: item.mapLink,
         lat: item.lat,

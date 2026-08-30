@@ -26,6 +26,35 @@ export interface OverpassPlace {
   isFree: boolean | null;
 }
 
+/**
+ * Real provider-availability probe (spec §H) — a minimal, cheap query
+ * whose only purpose is "did Overpass actually respond", never "does it
+ * have data for X" (that's still queryOverpassPlaces/queryNearbyPlaces,
+ * unchanged). Distinguishes a genuine outage from "the query legitimately
+ * returned zero results" — the two currently look identical to every
+ * existing caller, since both silently resolve to []. Callers that already
+ * know the real result (having just run their own category queries) don't
+ * need this at all; it exists for a caller that wants the answer up front,
+ * without inferring it from candidate counts (spec §H's explicit "do not
+ * infer network/provider success from candidate count").
+ */
+export async function checkOverpassAvailability(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const res = await fetch(OVERPASS_ENDPOINT, {
+      method: "POST",
+      body: new URLSearchParams({ data: "[out:json][timeout:5];out count;" }),
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 type CountryBBox = [number, number, number, number];
 
 // Categories with no equivalent structured/open data source (they require
@@ -231,7 +260,20 @@ function normalizeOverpassElements(data: OverpassResponse, limit: number): Overp
     .map((entry) => entry.place);
 }
 
-async function executeOverpassQuery(query: string, limit: number): Promise<OverpassPlace[]> {
+/**
+ * Section B — the request's own real outcome, kept distinct from "how many
+ * places came back": a request that genuinely reached Overpass and got a
+ * valid response is `succeeded: true` even with zero results (spec §B2 —
+ * "zero results != provider failure"); a network error or non-OK status is
+ * `succeeded: false` regardless of how many places a LATER fallback query
+ * might still turn up.
+ */
+export interface OverpassQueryOutcome {
+  places: OverpassPlace[];
+  succeeded: boolean;
+}
+
+async function executeOverpassQuery(query: string, limit: number): Promise<OverpassQueryOutcome> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -243,25 +285,26 @@ async function executeOverpassQuery(query: string, limit: number): Promise<Overp
       next: { revalidate: 60 * 60 * 24 },
     });
     if (!res.ok) {
-      // Silently degrading to [] is intentional (categories with no data
-      // just come back as unavailable, spec-documented above) — but a
-      // non-OK status (rate limit, 5xx) is a real failure, not "no results",
-      // so it's worth surfacing in dev instead of looking identical to "empty".
+      // Degrading to [] is intentional (categories with no data just come
+      // back empty) — but a non-OK status (rate limit, 5xx) is a real
+      // provider failure, not "no results", so succeeded is false here even
+      // though the shape (empty array) looks identical to a legitimate
+      // zero-result query.
       if (process.env.NODE_ENV !== "production") {
         console.log("[Recommendations] Overpass request returned non-OK status", { status: res.status });
       }
-      return [];
+      return { places: [], succeeded: false };
     }
 
     const data = (await res.json()) as OverpassResponse;
-    return normalizeOverpassElements(data, limit);
+    return { places: normalizeOverpassElements(data, limit), succeeded: true };
   } catch (error) {
     if (process.env.NODE_ENV !== "production") {
       console.log("[Recommendations] Overpass request failed", {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    return [];
+    return { places: [], succeeded: false };
   } finally {
     clearTimeout(timeout);
   }
@@ -271,23 +314,28 @@ export async function queryOverpassPlaces(
   isoA2: string,
   category: RecommendationCategory,
   limit: number
-): Promise<OverpassPlace[]> {
+): Promise<OverpassQueryOutcome> {
   const normalizedIso = isoA2.toUpperCase();
   const areaQuery = buildAreaQuery(normalizedIso, category, limit);
-  if (!areaQuery) return [];
+  if (!areaQuery) return { places: [], succeeded: true };
 
-  const areaResults = await executeOverpassQuery(areaQuery, limit);
-  if (areaResults.length > 0) {
-    return areaResults;
+  const areaOutcome = await executeOverpassQuery(areaQuery, limit);
+  if (areaOutcome.places.length > 0) {
+    return areaOutcome;
   }
 
   const bbox = await getCountryBbox(normalizedIso);
-  if (!bbox) return [];
+  if (!bbox) return areaOutcome;
 
   const bboxQuery = buildBboxQuery(bbox, category, limit);
-  if (!bboxQuery) return [];
+  if (!bboxQuery) return areaOutcome;
 
-  return executeOverpassQuery(bboxQuery, limit);
+  const bboxOutcome = await executeOverpassQuery(bboxQuery, limit);
+  // The area query already told us the truth about provider reachability;
+  // a bbox fallback that also comes back empty must not silently overwrite
+  // a real area-query success with its own (still legitimate) succeeded
+  // value — both are ANDed so a genuine failure anywhere is never hidden.
+  return { places: bboxOutcome.places, succeeded: areaOutcome.succeeded && bboxOutcome.succeeded };
 }
 
 // --- Nearby places (radius search around a single point) -----------------

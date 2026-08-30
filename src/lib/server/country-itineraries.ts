@@ -18,7 +18,11 @@ import {
   ItineraryGenerationInfeasibleError,
 } from "@/lib/server/country-itinerary-generation";
 import { buildTripPreferenceProfile } from "@/lib/server/itinerary-generation-constraints";
-import { mergeLiveReplanResult } from "@/lib/live-trip-planner";
+import {
+  mergeLiveReplanResult,
+  mergeProtectedItemsIntoRegeneratedDay as mergeProtectedItems,
+  preserveUserSelectedHotel,
+} from "@/lib/live-trip-planner";
 import { buildPersonalizationSummary, computeBehaviorSignals, deriveInferredPreferences } from "@/lib/preference-learning";
 import type { Database, Tables } from "@/lib/supabase/types";
 import {
@@ -179,6 +183,33 @@ function recomputeDayEstimates(
     totalTravelMinutes: totalTravelMinutes > 0 ? totalTravelMinutes : null,
     transportSegments,
   };
+}
+
+/**
+ * Thread 1 (locked/fixed-time hard requirement), item 10: "regenerate day"
+ * must preserve locked activities and fixed-time activities, generating
+ * the rest of the day around them. Before this fix, "regenerate day"
+ * (regenerationScope "day") replaced the target day's items wholesale
+ * with whatever the AI returned — the prompt asked Gemini to leave
+ * locked/fixed-time items alone (see the "untouchableNames" guidance
+ * built in generateCountryItineraryPlan), but nothing in code actually
+ * guaranteed it; a locked or fixed-time activity could simply be dropped
+ * if the AI didn't comply. The actual merge logic
+ * (mergeProtectedItemsIntoRegeneratedDay) lives in live-trip-planner.ts,
+ * right next to the near-identical mergeLiveReplanResult — a pure
+ * function, unit-tested directly there, since this file's Supabase
+ * dependency keeps it out of the standalone test build. This wrapper just
+ * folds the result back through the existing recomputeDayEstimates.
+ */
+function mergeProtectedItemsIntoRegeneratedDay(
+  originalDay: TripItineraryDay,
+  regeneratedDay: TripItineraryDay,
+  preferences: CountryTripWorkspaceState["preferences"]
+): TripItineraryDay {
+  const dayWithHotelPreserved = preserveUserSelectedHotel(originalDay, regeneratedDay);
+  const mergedItems = mergeProtectedItems(originalDay.items, dayWithHotelPreserved.items);
+  if (mergedItems === dayWithHotelPreserved.items && dayWithHotelPreserved === regeneratedDay) return regeneratedDay;
+  return recomputeDayEstimates({ ...dayWithHotelPreserved, items: mergedItems }, preferences);
 }
 
 async function fetchItineraryRow(supabase: DbClient, itineraryId: string) {
@@ -714,8 +745,12 @@ export async function regenerateCountryItinerary(
     const regeneratedDay = regeneratedWorkspace.itineraryDays[dayIndex];
 
     const { items: nextItems } = mergeLiveReplanResult(originalDay.items, regeneratedDay.items, () => createId("item"));
+    const dayWithHotelPreserved = preserveUserSelectedHotel(originalDay, regeneratedDay);
     const mergedDays = [...workspace.itineraryDays];
-    mergedDays[dayIndex] = recomputeDayEstimates({ ...regeneratedDay, id: originalDay.id, items: nextItems }, workspace.preferences);
+    mergedDays[dayIndex] = recomputeDayEstimates(
+      { ...dayWithHotelPreserved, id: originalDay.id, items: nextItems },
+      workspace.preferences
+    );
     // Re-canonicalize the whole trip, not just the changed day — a single
     // regenerated day can otherwise cluster its city under a different
     // canonical id than the rest of the (already-canonicalized) trip.
@@ -734,11 +769,13 @@ export async function regenerateCountryItinerary(
   if (scope === "day" && targetDayId) {
     const existingDayIndex = workspace.itineraryDays.findIndex((day) => day.id === targetDayId);
     if (existingDayIndex === -1) throw new Error("Target day not found");
+    const originalDay = workspace.itineraryDays[existingDayIndex];
     const mergedDays = [...workspace.itineraryDays];
-    mergedDays[existingDayIndex] = {
-      ...regeneratedWorkspace.itineraryDays[existingDayIndex],
-      id: workspace.itineraryDays[existingDayIndex].id,
-    };
+    mergedDays[existingDayIndex] = mergeProtectedItemsIntoRegeneratedDay(
+      originalDay,
+      { ...regeneratedWorkspace.itineraryDays[existingDayIndex], id: originalDay.id },
+      workspace.preferences
+    );
     const nextDays = await canonicalizeItineraryCities(mergedDays, existing.isoA2).catch(() => mergedDays);
     return updateCountryItinerary(supabase, itineraryId, countryName, {
       itineraryDays: nextDays,
@@ -783,10 +820,19 @@ export async function regenerateCountryItinerary(
     });
   }
 
+  // Same guarantee as the "day" scope above, applied per day — a full-trip
+  // regenerate must not be the one path where a locked/fixed-time item
+  // can still quietly vanish.
+  const regeneratedWithProtectedItems = regeneratedWorkspace.itineraryDays.map((regeneratedDay, index) => {
+    const originalDay = workspace.itineraryDays[index];
+    if (!originalDay || originalDay.dayNumber !== regeneratedDay.dayNumber) return regeneratedDay;
+    return mergeProtectedItemsIntoRegeneratedDay(originalDay, regeneratedDay, workspace.preferences);
+  });
+
   const fullyRegeneratedDays = await canonicalizeItineraryCities(
-    regeneratedWorkspace.itineraryDays,
+    regeneratedWithProtectedItems,
     existing.isoA2
-  ).catch(() => regeneratedWorkspace.itineraryDays);
+  ).catch(() => regeneratedWithProtectedItems);
 
   return updateCountryItinerary(supabase, itineraryId, countryName, {
     title: generated.title,

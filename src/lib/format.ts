@@ -128,6 +128,14 @@ export function formatRating(value: number | null | undefined) {
   return value.toFixed(1);
 }
 
+/** A duration in minutes as "H:MM" (day-quality-summary style — e.g. 380 minutes -> "6:20"). Never negative. */
+export function formatHoursMinutes(totalMinutes: number): string {
+  const safeMinutes = Math.max(0, Math.round(totalMinutes));
+  const hours = Math.floor(safeMinutes / 60);
+  const minutes = safeMinutes % 60;
+  return `${hours}:${String(minutes).padStart(2, "0")}`;
+}
+
 /** Elapsed duration display (spec item 23) — MM:SS under an hour, HH:MM:SS from an hour on. Never negative. */
 export function formatElapsedDuration(milliseconds: number): string {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));

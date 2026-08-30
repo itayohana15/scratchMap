@@ -51,10 +51,15 @@ import {
   type CountryItineraryVersionRecord,
   type CountryItineraryVersionSource,
 } from "@/lib/itineraries";
-import { formatCurrency, formatDate, formatTripDateRange } from "@/lib/format";
+import { formatCurrency, formatDate, formatHoursMinutes, formatTripDateRange } from "@/lib/format";
 import type { Tables } from "@/lib/supabase/types";
 import {
+  analyzeDayGeography,
+  buildDayExplanation,
+  buildRouteHealthIndicators,
+  buildTripPreferenceProfile,
   computeDayIntensity,
+  countDayTimeOverlaps,
 } from "@/lib/server/itinerary-generation-constraints";
 import { bookings, createBookingLinkedToItem, upsertBooking } from "@/lib/trip-bookings";
 import { activityStateBadges, bookingStatusForItem, transportModeIcon } from "@/lib/trip-item-status";
@@ -539,6 +544,33 @@ export function CountryItineraryDetailsDialog({
     ? selectedDay.items.reduce((sum, item) => sum + (item.approximatePrice ?? 0), 0)
     : 0;
   const selectedDayIntensity = selectedDay ? computeDayIntensity(selectedDay.items) : null;
+  // Route-health badges (spec item 97) — only the signals cheaply knowable
+  // right here (no TripPreferenceProfile in this dialog, so the fuller
+  // geography-based indicators aren't computed) — real geography-clustering
+  // health is already reflected in day.warnings, so an empty warnings list
+  // is a real, honest proxy for "no known route problems this day."
+  const selectedDayRouteHealth = selectedDay
+    ? buildRouteHealthIndicators({
+        longTravelSegments: selectedDay.warnings.length,
+        crossCityItems: 0,
+        timeOverlaps: countDayTimeOverlaps(selectedDay),
+      })
+    : [];
+  // One trip-level profile (spec item 2) — the exact same function
+  // generation itself uses (buildTripPreferenceProfile), derived from the
+  // canonical preferencesSnapshot already flowing into this dialog. Never
+  // duplicated per day, never a separate preference store. Not a useMemo:
+  // this line sits after the early `if (!draft) return null` below like
+  // selectedDayIntensity/selectedDayRouteHealth right above it, so a hook
+  // here would violate rules-of-hooks the same way theirs would.
+  const tripPreferenceProfile = buildTripPreferenceProfile(
+    draft.preferencesSnapshot,
+    country.name,
+    draft.itineraryDays.length
+  );
+  const selectedDayExplanation = selectedDay
+    ? buildDayExplanation(selectedDay, analyzeDayGeography(selectedDay, tripPreferenceProfile))
+    : "";
   const tripBookings = bookings(draft);
   const readiness = isReadinessApplicable(draft.status) ? computeTripReadiness(draft) : null;
   const readinessIssues: ReadinessCategory[] =
@@ -1313,6 +1345,7 @@ export function CountryItineraryDetailsDialog({
                                 Day {selectedDay.dayNumber} · {selectedDay.title || `יום ${selectedDay.dayNumber}`}
                               </h4>
                               <Badge variant="secondary">נבחר</Badge>
+                              {selectedDay.theme ? <Badge variant="outline">{selectedDay.theme}</Badge> : null}
                               {selectedDay.warnings.length > 0 ? (
                                 <Badge variant="outline" className="gap-1">
                                   <TriangleAlert className="size-3.5" />
@@ -1362,14 +1395,23 @@ export function CountryItineraryDetailsDialog({
                           <div className="flex flex-wrap items-center gap-2 rounded-[18px] border border-border/60 bg-muted/20 p-3 text-xs">
                             <Badge variant="outline">{selectedDayIntensity.activityCount} פעילויות</Badge>
                             <Badge variant="outline" className="gap-1">
-                              <Footprints className="size-3.5" />
-                              {selectedDayIntensity.walkingKm.toFixed(1)} ק&quot;מ הליכה
+                              <Clock className="size-3.5" />
+                              {formatHoursMinutes(selectedDayIntensity.activeMinutes)} ש&apos; פעילות
                             </Badge>
                             <Badge variant="outline" className="gap-1">
                               <Route className="size-3.5" />
-                              {selectedDayIntensity.travelMinutes} דק׳ נסיעות
+                              {formatHoursMinutes(selectedDayIntensity.travelMinutes)} ש&apos; נסיעות
                             </Badge>
+                            {selectedDayIntensity.freeMinutes > 0 ? (
+                              <Badge variant="outline">
+                                {formatHoursMinutes(selectedDayIntensity.freeMinutes)} ש&apos; זמן חופשי
+                              </Badge>
+                            ) : null}
                             <Badge variant="outline">{formatCurrency(selectedDay.estimatedCost)}</Badge>
+                            <Badge variant="outline" className="gap-1">
+                              <Footprints className="size-3.5" />
+                              {selectedDayIntensity.walkingKm.toFixed(1)} ק&quot;מ הליכה
+                            </Badge>
                             <Badge
                               variant={selectedDayIntensity.level === "עמוס" ? "secondary" : "outline"}
                               className="gap-1"
@@ -1378,6 +1420,22 @@ export function CountryItineraryDetailsDialog({
                               עומס: {selectedDayIntensity.level}
                             </Badge>
                           </div>
+                        ) : null}
+                        {selectedDayRouteHealth.length > 0 ? (
+                          <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                            {selectedDayRouteHealth.map((indicator) => (
+                              <Badge key={indicator.label} variant="outline" className="gap-1 border-emerald-500/30 text-emerald-600 dark:text-emerald-400">
+                                <CheckCircle2 className="size-3" />
+                                {indicator.label}
+                              </Badge>
+                            ))}
+                          </div>
+                        ) : null}
+                        {selectedDayExplanation ? (
+                          <p className="text-sm leading-6 text-muted-foreground">
+                            <span className="font-medium text-foreground">למה היום מסודר כך: </span>
+                            {selectedDayExplanation}
+                          </p>
                         ) : null}
                         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                           <SummaryField

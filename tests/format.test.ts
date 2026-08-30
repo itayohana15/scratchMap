@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatElapsedDuration, formatTripDateRange, formatTripDateRangeExpanded } from "../src/lib/format";
+import { formatElapsedDuration, formatHoursMinutes, formatTripDateRange, formatTripDateRangeExpanded } from "../src/lib/format";
 
 test("same month + same year: 2026-10-05 -> 2026-10-27", () => {
   assert.equal(formatTripDateRange("2026-10-05", "2026-10-27"), "5-27 באוקטובר 2026");
@@ -56,6 +56,18 @@ test("expanded trip date range prefers readable month names across months", () =
 
 test("expanded trip date range keeps partial month-year dates readable", () => {
   assert.equal(formatTripDateRangeExpanded(null, null, "2023-06"), "יוני 2023");
+});
+
+// Day-quality-summary style duration display (spec item 10's own example: 380 minutes -> "6:20").
+test("formatHoursMinutes renders a minute count as H:MM", () => {
+  assert.equal(formatHoursMinutes(0), "0:00");
+  assert.equal(formatHoursMinutes(75), "1:15");
+  assert.equal(formatHoursMinutes(380), "6:20");
+  assert.equal(formatHoursMinutes(400), "6:40");
+});
+
+test("formatHoursMinutes never goes negative", () => {
+  assert.equal(formatHoursMinutes(-30), "0:00");
 });
 
 test("formatElapsedDuration uses MM:SS under an hour", () => {

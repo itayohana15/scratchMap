@@ -87,7 +87,7 @@ export function computeDayWindow(
   return { startMinutes: start, endMinutes: end };
 }
 
-function bufferMinutesFor(item: AiGeneratedItem, scale: VisitScale): number {
+function bufferMinutesFor(item: AiGeneratedItem, scale: VisitScale | null): number {
   if (item.reservationRequired) return BUFFER_RESERVATION_MINUTES;
   if (scale === "half_day" || scale === "full_day") return BUFFER_LARGE_ATTRACTION_MINUTES;
   return BUFFER_NORMAL_MINUTES;
@@ -116,6 +116,7 @@ export function buildFreeTimeItem(startMinutes: number, endMinutes: number, area
     endTime: minutesToClock(endMinutes),
     estimatedDurationMinutes: Math.max(endMinutes - startMinutes, 0),
     approximatePrice: null,
+    pricePerPerson: null,
     priceOriginalAmount: null,
     priceOriginalCurrency: null,
     priceConvertedAmount: null,
@@ -125,6 +126,8 @@ export function buildFreeTimeItem(startMinutes: number, endMinutes: number, area
     sourceType: null,
     travelMinutes: null,
     openingHours: "",
+    lastEntryTime: "",
+    canonicalPlaceId: "",
     reservationRequired: false,
     transportation: "",
     mapLink: "",
@@ -139,11 +142,87 @@ export function buildFreeTimeItem(startMinutes: number, endMinutes: number, area
   };
 }
 
+/**
+ * A user- or AI-fixed clock time (spec: "the activity start time may not be
+ * shifted automatically") — a hard scheduling anchor, never recomputed from
+ * the cursor. Requires a parseable plannedStartTime; a fixedTime item with
+ * unparseable/missing time defensively falls back to normal flexible
+ * scheduling rather than silently anchoring to a garbage time.
+ */
+function isFixedAnchor(item: AiGeneratedItem): boolean {
+  return item.fixedTime === true && clockToMinutes(item.plannedStartTime) != null;
+}
+
+function resolveFixedAnchorTimes(item: AiGeneratedItem): { start: number; end: number } {
+  const start = clockToMinutes(item.plannedStartTime)!;
+  const existingEnd = item.endTime ? clockToMinutes(item.endTime) : null;
+  const end =
+    existingEnd != null && existingEnd > start
+      ? existingEnd
+      : start + resolveVisitDurationMinutes(item, classifyVisitScale(item));
+  return { start, end };
+}
+
+/** A real, structural conflict between two fixed-time items themselves — spec item 7: a legitimate hard failure, never silently resolved by moving either one. */
+export interface FixedTimeConflict {
+  activityA: string;
+  activityB: string;
+  startA: string;
+  endA: string;
+  startB: string;
+  travelMinutesRequired: number;
+}
+
+/**
+ * Detects two fixed-time items on the same day whose own times (plus real
+ * travel between them) genuinely cannot both be honored — checked
+ * independently of scheduleDayItems's flexible-item placement, since this
+ * is a hard failure regardless of what else is on the day.
+ */
+export function findFixedTimeConflicts(items: AiGeneratedItem[]): FixedTimeConflict[] {
+  const fixedSorted = items
+    .filter(isFixedAnchor)
+    .map((item) => ({ item, ...resolveFixedAnchorTimes(item) }))
+    .sort((a, b) => a.start - b.start);
+
+  const conflicts: FixedTimeConflict[] = [];
+  for (let index = 1; index < fixedSorted.length; index += 1) {
+    const previous = fixedSorted[index - 1];
+    const current = fixedSorted[index];
+    const travelNeeded = Math.max(current.item.travelMinutes ?? 0, 0);
+    if (current.start < previous.end + travelNeeded) {
+      conflicts.push({
+        activityA: previous.item.name,
+        activityB: current.item.name,
+        startA: minutesToClock(previous.start),
+        endA: minutesToClock(previous.end),
+        startB: minutesToClock(current.start),
+        travelMinutesRequired: travelNeeded,
+      });
+    }
+  }
+  return conflicts;
+}
+
 export interface ScheduleResult {
   items: AiGeneratedItem[];
   /** Present only when the leftover window is worth a dedicated block (spec item 26). */
   freeTimeItem: AiGeneratedItem | null;
+  /**
+   * Flexible items that could not be placed without overlapping a
+   * fixed-time anchor (or running past the day's end) — never silently
+   * dropped and never allowed to overlap/shift the anchor (spec item 8).
+   * The caller decides what to do with these (move elsewhere, replace,
+   * or as a last resort drop to alternatives with a visible trace).
+   */
+  overflowItems: AiGeneratedItem[];
+  /** See findFixedTimeConflicts — surfaced here too since scheduleDayItems already walks the fixed anchors. */
+  fixedTimeConflicts: FixedTimeConflict[];
 }
+
+type ScheduleChunk =
+  | { kind: "fixed"; item: AiGeneratedItem; start: number; end: number }
+  | { kind: "flex"; items: AiGeneratedItem[] };
 
 /**
  * Walks an already-ordered item list and assigns real, non-overlapping
@@ -152,43 +231,112 @@ export interface ScheduleResult {
  * is responsible for not including a second anchor alongside one, same as
  * it already decides overall item order; this function only turns order
  * into real time.
+ *
+ * fixedTime items are the one exception to "turns order into time": their
+ * own plannedStartTime (and endTime, if already set) is preserved exactly,
+ * never recomputed from the cursor — a real, previously-reported bug: this
+ * function used to schedule every item purely from a running cursor with
+ * no awareness of fixedTime/locked at all, silently moving a 14:30 fixed
+ * reservation to whatever slot the cursor happened to reach.
  */
 export function scheduleDayItems(orderedItems: AiGeneratedItem[], window: DayTimeWindow, areaLabel: string): ScheduleResult {
-  let cursor = window.startMinutes;
-  const scheduled: AiGeneratedItem[] = [];
+  const fixedTimeConflicts = findFixedTimeConflicts(orderedItems);
 
+  // Group into runs of flexible items separated by fixed anchors — a
+  // flexible item never gets reassigned to a different position just
+  // because of clock time; the caller already decided relative sequencing
+  // (anchor, lunch, anchor, dinner, ...). Conflicting fixed anchors (see
+  // above) still each keep their own declared time; scheduleDayItems does
+  // not attempt to resolve the conflict itself, only reports it.
+  const chunks: ScheduleChunk[] = [];
   for (const item of orderedItems) {
-    if (item.category === "transportation") {
-      // Connective, not content — anchored to the cursor with its own real
-      // travel duration, no extra buffer stacked on top of it.
-      const duration = Math.max(item.travelMinutes ?? 15, 5);
-      const start = cursor;
-      const end = start + duration;
-      scheduled.push({ ...item, plannedStartTime: minutesToClock(start), endTime: minutesToClock(end) });
-      cursor = end;
+    if (isFixedAnchor(item)) {
+      const resolved = resolveFixedAnchorTimes(item);
+      chunks.push({ kind: "fixed", item, start: resolved.start, end: resolved.end });
+      continue;
+    }
+    const last = chunks[chunks.length - 1];
+    if (last && last.kind === "flex") last.items.push(item);
+    else chunks.push({ kind: "flex", items: [item] });
+  }
+
+  const scheduled: AiGeneratedItem[] = [];
+  const overflowItems: AiGeneratedItem[] = [];
+  let cursor = window.startMinutes;
+
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    const chunk = chunks[chunkIndex];
+
+    if (chunk.kind === "fixed") {
+      scheduled.push({ ...chunk.item, plannedStartTime: minutesToClock(chunk.start), endTime: minutesToClock(chunk.end) });
+      cursor = Math.max(cursor, chunk.end + bufferMinutesFor(chunk.item, classifyVisitScale(chunk.item)));
       continue;
     }
 
-    // Real travel time from the previous stop occupies the timeline before
-    // this item can start (spec item 16) — it's already resolved onto the
-    // item's own travelMinutes elsewhere in the pipeline.
-    if (item.travelMinutes && item.travelMinutes > 0) {
-      cursor += item.travelMinutes;
+    // The boundary this flex run must not cross: the next fixed anchor's
+    // own start, if any — items are never allowed to overlap it, and the
+    // anchor itself is never pushed later to make room.
+    let boundary = window.endMinutes;
+    for (let lookahead = chunkIndex + 1; lookahead < chunks.length; lookahead += 1) {
+      const candidate = chunks[lookahead];
+      if (candidate.kind === "fixed") {
+        boundary = candidate.start;
+        break;
+      }
     }
 
-    const scale = classifyVisitScale(item);
-    const remainingWindow = Math.max(window.endMinutes - cursor, 60);
-    const resolvedDuration = resolveVisitDurationMinutes(item, scale);
-    const duration = scale === "full_day" ? Math.min(resolvedDuration, remainingWindow) : resolvedDuration;
+    for (const item of chunk.items) {
+      if (item.category === "transportation") {
+        const duration = Math.max(item.travelMinutes ?? 15, 5);
+        const start = cursor;
+        const end = start + duration;
+        if (end > boundary) {
+          overflowItems.push(item);
+          continue;
+        }
+        scheduled.push({ ...item, plannedStartTime: minutesToClock(start), endTime: minutesToClock(end) });
+        cursor = end;
+        continue;
+      }
 
-    const start = cursor;
-    const end = start + duration;
-    scheduled.push({ ...item, plannedStartTime: minutesToClock(start), endTime: minutesToClock(end) });
-    cursor = end + bufferMinutesFor(item, scale);
+      let start = cursor;
+      if (item.travelMinutes && item.travelMinutes > 0) start += item.travelMinutes;
+
+      // A "practical" filler (buildFreeTimeItem, the arrival/departure
+      // logistics item, ...) gets its own duration set deliberately —
+      // exactly enough to fill whatever specific gap it was created for —
+      // never a claim about how long a "typical visit" to it should be.
+      // Real bug found while adding fixed-time-anchor support: running it
+      // through classifyVisitScale like any other item is what let a
+      // stale free-time block (inherited from an earlier resequencing
+      // pass, often several hours long) get misread as a "full_day"-scale
+      // attraction and swallow the rest of the day, overflowing whatever
+      // came after it (here, a real dinner stop). Same reasoning as the
+      // transportation branch just above — bypass the visit-scale system
+      // entirely and trust the item's own number.
+      const isFillerItem = item.category === "practical";
+      const scale = isFillerItem ? null : classifyVisitScale(item);
+      const remainingWindow = Math.max(boundary - start, 60);
+      const resolvedDuration = isFillerItem
+        ? Math.max(item.estimatedDurationMinutes ?? 30, 5)
+        : resolveVisitDurationMinutes(item, scale!);
+      const duration = scale === "full_day" ? Math.min(resolvedDuration, remainingWindow) : resolvedDuration;
+      const end = start + duration;
+
+      if (start >= boundary || end > boundary) {
+        // Doesn't fit before the next fixed anchor (or the day's end) —
+        // never overlap it, never pretend it fits (spec item 8).
+        overflowItems.push(item);
+        continue;
+      }
+
+      scheduled.push({ ...item, plannedStartTime: minutesToClock(start), endTime: minutesToClock(end) });
+      cursor = end + bufferMinutesFor(item, scale);
+    }
   }
 
   const leftover = window.endMinutes - cursor;
   const freeTimeItem = leftover >= MIN_FREE_TIME_BLOCK_MINUTES ? buildFreeTimeItem(cursor, window.endMinutes, areaLabel) : null;
 
-  return { items: scheduled, freeTimeItem };
+  return { items: scheduled, freeTimeItem, overflowItems, fixedTimeConflicts };
 }

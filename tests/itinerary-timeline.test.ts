@@ -56,6 +56,7 @@ function genItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
     plannedStartTime: overrides.plannedStartTime ?? "09:00",
     estimatedDurationMinutes: overrides.estimatedDurationMinutes ?? 90,
     approximatePrice: overrides.approximatePrice ?? 100,
+    pricePerPerson: overrides.pricePerPerson ?? null,
     priceOriginalAmount: overrides.priceOriginalAmount ?? overrides.approximatePrice ?? 100,
     priceOriginalCurrency: overrides.priceOriginalCurrency ?? "ILS",
     priceConvertedAmount: overrides.priceConvertedAmount ?? overrides.approximatePrice ?? 100,
@@ -65,6 +66,8 @@ function genItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
     sourceType: overrides.sourceType ?? null,
     travelMinutes: overrides.travelMinutes ?? 20,
     openingHours: overrides.openingHours ?? "09:00-18:00",
+    lastEntryTime: overrides.lastEntryTime ?? "",
+    canonicalPlaceId: overrides.canonicalPlaceId ?? "",
     reservationRequired: overrides.reservationRequired ?? false,
     transportation: overrides.transportation ?? "הליכה",
     mapLink: overrides.mapLink ?? "",
@@ -84,6 +87,7 @@ function genDay(overrides: Partial<AiGeneratedDay> = {}): AiGeneratedDay {
     dayNumber: overrides.dayNumber ?? 1,
     date: overrides.date ?? "2026-10-06",
     title: overrides.title ?? "Day 1",
+    theme: overrides.theme ?? "",
     cityRegion: overrides.cityRegion ?? "Tokyo",
     accommodation: overrides.accommodation ?? "Tokyo Station Hotel",
     notes: overrides.notes ?? "",
@@ -174,6 +178,26 @@ test("computeDayIntensity buckets a light, a medium, and a heavy day correctly",
     ["קל", "בינוני", "עמוס"].indexOf(light.level) < ["קל", "בינוני", "עמוס"].indexOf(heavy.level),
     "the light day must classify as less intense than the heavy day"
   );
+});
+
+// Spec item 95: real free time within the day's own active span.
+test("computeDayIntensity reports the real gap between two items as free time", () => {
+  const summary = computeDayIntensity([
+    { category: "attraction", name: "Museum", shortDescription: "", estimatedDurationMinutes: 60, plannedStartTime: "10:00", travelMinutes: 10, lat: 35.0, lon: 139.0 },
+    // Starts at 15:00 (300 min after 10:00) — 60 min museum + 10 min travel
+    // to get here + this item's own 60 min duration leaves a real gap.
+    { category: "attraction", name: "Viewpoint", shortDescription: "", estimatedDurationMinutes: 60, plannedStartTime: "15:00", travelMinutes: 10, lat: 35.01, lon: 139.01 },
+  ]);
+  // Span = 10:00 to 16:00 (last start + its own duration) = 360 min.
+  // Scheduled = 60 + 60 (durations) + 10 + 10 (travel) = 140 min.
+  assert.equal(summary.freeMinutes, 360 - 140);
+});
+
+test("computeDayIntensity reports zero free time for a fully packed day", () => {
+  const summary = computeDayIntensity([
+    { category: "attraction", name: "Museum", shortDescription: "", estimatedDurationMinutes: 60, plannedStartTime: "10:00", travelMinutes: 0, lat: 35.0, lon: 139.0 },
+  ]);
+  assert.equal(summary.freeMinutes, 0);
 });
 
 // 4 & 6. locked/priority/fixedTime and accommodation coordinates survive a

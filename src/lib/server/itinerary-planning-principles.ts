@@ -1,3 +1,6 @@
+import { evaluateFinalBaseDepartureFeasibility } from "../flight-planning";
+import { estimateMinutesForMode, selectTransportMode, type TransportMode } from "../transport-mode";
+import { haversineKm } from "../trip-workspace";
 import type { RecommendationCategory } from "../trip-workspace";
 
 /**
@@ -135,6 +138,228 @@ export interface TripFrame {
 
 export function findFramePhaseForDay(frame: TripFrame, dayNumber: number): TripFramePhase | null {
   return frame.phases.find((phase) => dayNumber >= phase.startDayNumber && dayNumber <= phase.endDayNumber) ?? null;
+}
+
+/**
+ * Explicit model of a base change between two consecutive TripFrame phases
+ * (spec §C1) — no overnight teleportation: every phase boundary gets a
+ * real, computed transition rather than the next day's content simply
+ * starting somewhere else. Reuses the existing distance-based transport
+ * infrastructure (transport-mode.ts's selectTransportMode/
+ * estimateMinutesForMode — the exact same primitives item-level travel
+ * already uses) rather than a second, disconnected routing system.
+ */
+export interface StayTransition {
+  fromBase: string;
+  toBase: string;
+  fromCoordinates: { lat: number; lon: number } | null;
+  toCoordinates: { lat: number; lon: number } | null;
+  transportMode: TransportMode;
+  /** Null only when neither base's real coordinates are known. */
+  estimatedTravelMinutes: number | null;
+  /** The day this transition happens on — always the new phase's first day. */
+  dayNumber: number;
+}
+
+/**
+ * One transition per phase boundary (spec §C1/§C2) — `areaAnchors` is the
+ * same per-area coordinate centroid map used by
+ * reorderAreasForDepartureFeasibility, so both features stay derived from
+ * one real geography source rather than two.
+ */
+export function buildStayTransitions(
+  frame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>
+): StayTransition[] {
+  const transitions: StayTransition[] = [];
+
+  for (let index = 1; index < frame.phases.length; index += 1) {
+    const from = frame.phases[index - 1];
+    const to = frame.phases[index];
+    const fromCoordinates = areaAnchors.get(from.areaLabel) ?? null;
+    const toCoordinates = areaAnchors.get(to.areaLabel) ?? null;
+    const distanceKm =
+      fromCoordinates && toCoordinates
+        ? haversineKm(fromCoordinates.lat, fromCoordinates.lon, toCoordinates.lat, toCoordinates.lon)
+        : null;
+    // Luggage + intercity are always true here — a stay transition is by
+    // definition an overnight base change, never a same-day local hop.
+    const transportMode =
+      distanceKm != null ? selectTransportMode(distanceKm, { hasLuggage: true, isIntercity: true }) : "car";
+    const estimatedTravelMinutes = distanceKm != null ? estimateMinutesForMode(distanceKm, transportMode) : null;
+
+    transitions.push({
+      fromBase: from.areaLabel,
+      toBase: to.areaLabel,
+      fromCoordinates,
+      toCoordinates,
+      transportMode,
+      estimatedTravelMinutes,
+      dayNumber: to.startDayNumber,
+    });
+  }
+
+  return transitions;
+}
+
+// Section A7 — a bounded number of structural-repair attempts per
+// generation, never an unbounded/retrying loop.
+export const MAX_STAY_STRUCTURE_REPAIR_PASSES = 2;
+
+export type StayStructureRepairStrategy =
+  | "shift_boundary_earlier"
+  | "shift_boundary_later"
+  | "reselect_base"
+  | "merge_short_stay";
+
+export interface StayStructureRepairResult {
+  frame: TripFrame;
+  changed: boolean;
+  strategy: StayStructureRepairStrategy | null;
+}
+
+function dayRangeHasProtectedContent(phase: TripFramePhase, protectedDayNumbers: Set<number>): boolean {
+  for (let day = phase.startDayNumber; day <= phase.endDayNumber; day += 1) {
+    if (protectedDayNumbers.has(day)) return true;
+  }
+  return false;
+}
+
+function shiftPhaseBoundary(frame: TripFrame, phaseIndex: number, delta: -1 | 1): TripFrame {
+  const phases = frame.phases.map((phase) => ({ ...phase }));
+  phases[phaseIndex - 1].endDayNumber += delta;
+  phases[phaseIndex - 1].nights += delta;
+  phases[phaseIndex].startDayNumber += delta;
+  phases[phaseIndex].nights -= delta;
+  return { ...frame, phases };
+}
+
+function mergePhase(frame: TripFrame, removeIndex: number, intoIndex: number): TripFrame {
+  const removed = frame.phases[removeIndex];
+  const phases = frame.phases
+    .map((phase, index) =>
+      index === intoIndex
+        ? {
+            ...phase,
+            startDayNumber: Math.min(phase.startDayNumber, removed.startDayNumber),
+            endDayNumber: Math.max(phase.endDayNumber, removed.endDayNumber),
+            nights: phase.nights + removed.nights,
+          }
+        : phase
+    )
+    .filter((_, index) => index !== removeIndex);
+  return { ...frame, phases };
+}
+
+/**
+ * Section A1-A4 — ONE generic structural repair attempt for ONE impossible
+ * stay transition (between phases[phaseIndex-1] and phases[phaseIndex]),
+ * tried in the spec's own order: shift the phase boundary by a day (A2, in
+ * whichever direction has a spare night to give up), reselect the "to"
+ * phase's base to another feasible candidate area (A3), or merge a
+ * genuinely short (1-night) phase into whichever neighbor is unaffected
+ * (A4). Never touches a phase whose day range contains protected (locked/
+ * fixedTime) content (A5) — that candidate strategy is simply skipped, not
+ * forced. Returns `changed: false` when nothing generic and safe was
+ * found; the caller (repairPlan) is responsible for bounding repeated
+ * calls (spec §A7 — MAX_STAY_STRUCTURE_REPAIR_PASSES) and rebuilding every
+ * derived structure afterward (spec §A6) — this function only ever
+ * returns a new frame, never touches days/items/transitions itself.
+ */
+export function repairImpossibleStayTransition(args: {
+  frame: TripFrame;
+  phaseIndex: number;
+  candidateAreas: string[];
+  protectedDayNumbers: Set<number>;
+  /** Real time/distance feasibility check for a candidate replacement base — injected so this pure planning-principles module never has to import flight-planning.ts's math itself. */
+  isTransitionFeasible: (fromArea: string, toArea: string) => boolean;
+}): StayStructureRepairResult {
+  const { frame, phaseIndex, candidateAreas, protectedDayNumbers, isTransitionFeasible } = args;
+  const toPhase = frame.phases[phaseIndex];
+  const fromPhase = frame.phases[phaseIndex - 1];
+  if (!toPhase || !fromPhase) return { frame, changed: false, strategy: null };
+
+  // A2a: shift the boundary earlier — the FROM phase gives up its last
+  // night to the TO phase, provided FROM still keeps at least one night
+  // and that shared day isn't protected content.
+  const earlierBoundaryDay = toPhase.startDayNumber - 1;
+  if (fromPhase.nights > 1 && !protectedDayNumbers.has(earlierBoundaryDay)) {
+    return { frame: shiftPhaseBoundary(frame, phaseIndex, -1), changed: true, strategy: "shift_boundary_earlier" };
+  }
+
+  // A2b: the symmetric case — TO gives up its first night to FROM.
+  if (toPhase.nights > 1 && !protectedDayNumbers.has(toPhase.startDayNumber)) {
+    return { frame: shiftPhaseBoundary(frame, phaseIndex, 1), changed: true, strategy: "shift_boundary_later" };
+  }
+
+  // A3: reselect the TO phase's base — a candidate area not already used
+  // elsewhere in the frame, genuinely feasible from the FROM phase (real
+  // time/distance, never a name-based rule).
+  const usedAreas = new Set(frame.phases.map((phase) => phase.areaLabel));
+  const alternative = candidateAreas.find(
+    (area) => !usedAreas.has(area) && isTransitionFeasible(fromPhase.areaLabel, area)
+  );
+  if (alternative) {
+    const phases = frame.phases.map((phase, index) =>
+      index === phaseIndex ? { ...phase, areaLabel: alternative } : phase
+    );
+    return { frame: { ...frame, phases }, changed: true, strategy: "reselect_base" };
+  }
+
+  // A4: a genuinely short (1-night) stay creating this expensive transfer
+  // — merge it into whichever neighbor has no protected content in its
+  // range, rather than force an impossible transition around it. Not
+  // "blindly eliminate all one-night stays" (spec §A4) — only the specific
+  // one-night phase actually involved in THIS impossible transition, and
+  // only when merging doesn't disturb protected content.
+  if (toPhase.nights === 1 && !dayRangeHasProtectedContent(toPhase, protectedDayNumbers)) {
+    return { frame: mergePhase(frame, phaseIndex, phaseIndex - 1), changed: true, strategy: "merge_short_stay" };
+  }
+  if (fromPhase.nights === 1 && !dayRangeHasProtectedContent(fromPhase, protectedDayNumbers)) {
+    return { frame: mergePhase(frame, phaseIndex - 1, phaseIndex), changed: true, strategy: "merge_short_stay" };
+  }
+
+  return { frame, changed: false, strategy: null };
+}
+
+/**
+ * Departure-aware final-base selection (spec §B) — runs BEFORE
+ * buildTripFramePhases decides which area becomes the trip's last phase, so
+ * an infeasible final base is never chosen in the first place rather than
+ * being discovered later at validation time. Generic: works from
+ * coordinates + a clock time only, never a named airport/city/country.
+ *
+ * `rankedAreas`'s LAST element (after buildTripFramePhases's own slicing)
+ * is what becomes the final overnight base — this only ever reorders that
+ * array so a feasible area ends up there, never touches
+ * buildTripFramePhases itself. An area with no known coordinates, or when
+ * no departure flight exists at all, is always treated as feasible (never
+ * block on missing data) — B2's hard rejection only ever fires when a real
+ * distance/time comparison genuinely fails.
+ */
+export function reorderAreasForDepartureFeasibility(
+  rankedAreas: string[],
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  departureAirportIata: string | null,
+  departureTime: string | null
+): string[] {
+  if (!departureAirportIata || !departureTime || rankedAreas.length <= 1) return rankedAreas;
+
+  const isFeasible = (area: string): boolean => {
+    const anchor = areaAnchors.get(area);
+    if (!anchor) return true;
+    const result = evaluateFinalBaseDepartureFeasibility(departureAirportIata, departureTime, anchor);
+    return result?.feasible ?? true;
+  };
+
+  const lastArea = rankedAreas[rankedAreas.length - 1];
+  if (isFeasible(lastArea)) return rankedAreas;
+
+  const feasibleArea = rankedAreas.find((area) => area !== lastArea && isFeasible(area));
+  if (!feasibleArea) return rankedAreas; // no known feasible alternative — leave as-is, the hard validation gate still catches it
+
+  const rest = rankedAreas.filter((area) => area !== feasibleArea && area !== lastArea);
+  return [...rest, lastArea, feasibleArea];
 }
 
 /**
@@ -364,13 +589,22 @@ const QUICK_STOP_KEYWORDS = [
   "פסל",
 ];
 
-const HALF_DAY_KEYWORDS = ["half-day", "half day", "louvre", "חצי יום"];
+// Generic worldwide architecture audit (Phase 28): "disneyland"/"disney"
+// and "louvre" used to be listed here by brand/proper name — exactly the
+// per-place hardcoding the planning logic must never do. Removed as pure
+// cleanup, not a behavior change: any real theme park is still classified
+// correctly by the generic "theme park"/"amusement park" keywords
+// (Disneyland included, by TYPE not name), and "half-day"/"half day"
+// already covers a text-described half-day attraction generically —
+// there was no generic substitute for "louvre" specifically, so a museum
+// described that way now falls through to category-based classification
+// instead (still reasonable: museum → medium, and a genuinely half-day
+// museum can still say so in its own description text).
+const HALF_DAY_KEYWORDS = ["half-day", "half day", "חצי יום"];
 
 const FULL_DAY_KEYWORDS = [
   "theme park",
   "amusement park",
-  "disneyland",
-  "disney",
   "national park",
   "safari",
   "ski",
@@ -441,4 +675,121 @@ export function resolveVisitDurationMinutes(
     return Math.min(Math.max(item.estimatedDurationMinutes, range.min), range.max);
   }
   return range.default;
+}
+
+function parseClockMinutesLocal(value: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})/.exec(value.trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+  return hours * 60 + minutes;
+}
+
+function formatClockMinutesLocal(totalMinutes: number): string {
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+/**
+ * The item's real occupied-until clock time, same calendar day as its
+ * start — arrival/departure feasibility must validate the item's whole
+ * interval, not just when it starts (a real bug: an activity starting at
+ * 10:18 but running to 15:18 against a 13:15 departure cutoff used to
+ * silently pass because only the start was checked). Prefers the
+ * scheduler's own assigned endTime; derives one from the exact same
+ * canonical duration semantics used everywhere else
+ * (resolveVisitDurationMinutes/classifyVisitScale, with the same
+ * "practical" filler exclusion as calculateDayLoadMinutes/
+ * countDayTimeOverlaps) when no real endTime exists yet — never a second,
+ * different duration interpretation.
+ */
+export function resolveItemEffectiveEndTime(item: {
+  category: RecommendationCategory;
+  name: string;
+  shortDescription: string;
+  reservationRequired?: boolean;
+  estimatedDurationMinutes?: number | null;
+  plannedStartTime: string;
+  endTime?: string;
+}): string | null {
+  const startMinutes = parseClockMinutesLocal(item.plannedStartTime);
+  if (startMinutes == null) return null;
+
+  const scheduledEndMinutes = item.endTime ? parseClockMinutesLocal(item.endTime) : null;
+  if (scheduledEndMinutes != null && scheduledEndMinutes > startMinutes) {
+    return formatClockMinutesLocal(scheduledEndMinutes);
+  }
+
+  const duration =
+    item.category === "practical"
+      ? Math.max(item.estimatedDurationMinutes ?? 30, 5)
+      : resolveVisitDurationMinutes(item);
+  return formatClockMinutesLocal(startMinutes + Math.max(duration, 1));
+}
+
+/**
+ * Indoor/outdoor/mixed tagging (spec items 64/65) — this app has no real
+ * weather forecast anywhere, so this only ever supports Plan B (a backup
+ * suggestion for an outdoor-heavy day), never a real "prioritize outdoor in
+ * good weather" claim — no forecast is fabricated. Same category+keyword
+ * heuristic style as classifyVisitScale/classifyItemEnergy.
+ */
+export type WeatherSensitivity = "indoor" | "outdoor" | "mixed";
+
+const OUTDOOR_KEYWORDS = [
+  "hike",
+  "hiking",
+  "trail",
+  "beach",
+  "viewpoint",
+  "lookout",
+  "park",
+  "garden",
+  "mountain",
+  "lake",
+  "waterfall",
+  "desert",
+  "safari",
+  "טיול רגלי",
+  "מסלול הליכה",
+  "חוף",
+  "תצפית",
+  "פארק",
+  "גן",
+  "הר",
+  "אגם",
+  "מפל",
+  "מדבר",
+  "ספארי",
+];
+
+const INDOOR_KEYWORDS = [
+  "museum",
+  "gallery",
+  "mall",
+  "aquarium",
+  "theater",
+  "theatre",
+  "cinema",
+  "מוזיאון",
+  "גלריה",
+  "קניון",
+  "אקווריום",
+  "תיאטרון",
+  "קולנוע",
+];
+
+export function classifyWeatherSensitivity(item: {
+  category: RecommendationCategory;
+  name: string;
+  shortDescription: string;
+}): WeatherSensitivity {
+  const text = `${item.name} ${item.shortDescription}`;
+  if (item.category === "nature" || includesAnyKeywordLocal(text, OUTDOOR_KEYWORDS)) return "outdoor";
+  if (item.category === "museum" || item.category === "shopping" || includesAnyKeywordLocal(text, INDOOR_KEYWORDS)) {
+    return "indoor";
+  }
+  return "mixed";
 }

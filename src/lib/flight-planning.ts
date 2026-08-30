@@ -1,7 +1,7 @@
 import { addMinutes, format } from "date-fns";
 import { fromZonedTime, toZonedTime } from "date-fns-tz";
 
-import { findAirportByIata } from "@/lib/facts/airports-data";
+import { COUNTRY_NAMES_HE, findAirportByIata } from "@/lib/facts/airports-data";
 import { getCountryTimezone } from "@/lib/facts/country-timezones";
 import { haversineKm } from "@/lib/trip-workspace";
 import type { TripFlightConnection, TripFlightLeg, TripFlights } from "@/lib/trip-workspace";
@@ -162,15 +162,35 @@ export interface MultiSegmentFlightResult {
   totalJourneyMinutes: number;
 }
 
+// Ground transfer between two DIFFERENT airports at the same connection
+// stop (spec item 6 — "arrived at HND, departing from NRT") — a real
+// distance-based estimate (same family as estimateFlightDurationMinutesByDistance),
+// on top of the layover itself, never silently treated as no time at all.
+const AIRPORT_TRANSFER_GROUND_SPEED_KMH = 40;
+const AIRPORT_TRANSFER_FIXED_OVERHEAD_MINUTES = 30;
+
+export function estimateAirportTransferMinutes(fromIata: string, toIata: string): number | null {
+  const from = findAirportByIata(fromIata);
+  const to = findAirportByIata(toIata);
+  if (!from || !to) return null;
+  const km = haversineKm(from.lat, from.lon, to.lat, to.lon);
+  return Math.round(AIRPORT_TRANSFER_FIXED_OVERHEAD_MINUTES + (km / AIRPORT_TRANSFER_GROUND_SPEED_KMH) * 60);
+}
+
 /**
  * Chains estimateFlightArrival across zero or more intermediate connections
- * (spec items 17-21) — each segment is calculated independently, with the
- * layover added (in the connection airport's own local time) between one
- * segment's arrival and the next segment's departure. Zero connections is
- * the default, ordinary direct-flight path (spec item 22) and returns a
- * single-segment result identical in shape to a connecting itinerary.
- * Returns null if any airport in the chain can't be resolved — same
- * manual-entry fallback contract as estimateFlightArrival.
+ * (spec items 17-21) — each REAL FLIGHT segment is calculated
+ * independently. A connection contributes two airports to the chain (the
+ * one it lands at, the one the next segment departs from — usually the
+ * same one); when they differ, a real ground-transfer time is added on top
+ * of the layover (spec item 6), computed and applied in the arrival
+ * airport's own local time throughout — exact for the common case of an
+ * airport change within the same city/timezone, a small known
+ * simplification for the rare case of a cross-timezone connection change.
+ * Zero connections is the default, ordinary direct-flight path (spec item
+ * 22) and returns a single-segment result identical in shape to a
+ * connecting itinerary. Returns null if any airport in the chain can't be
+ * resolved — same manual-entry fallback contract as estimateFlightArrival.
  */
 export function computeMultiSegmentFlight(
   departureAirportIata: string,
@@ -182,21 +202,22 @@ export function computeMultiSegmentFlight(
   arrivalTimeZoneFallback: string
 ): MultiSegmentFlightResult | null {
   if (!departureAirportIata || !finalArrivalAirportIata || !departureDate || !departureTime) return null;
+  if (connections.some((connection) => !connection.arrivalAirport || !connection.departureAirport)) return null;
 
-  const stops = [departureAirportIata, ...connections.map((connection) => connection.airport), finalArrivalAirportIata];
-  if (stops.some((iata) => !iata)) return null;
+  const flightOrigins = [departureAirportIata, ...connections.map((connection) => connection.departureAirport)];
+  const flightDestinations = [...connections.map((connection) => connection.arrivalAirport), finalArrivalAirportIata];
 
   const segments: FlightSegmentResult[] = [];
   let currentDate = departureDate;
   let currentTime = departureTime;
   let totalAirborneMinutes = 0;
-  let totalLayoverMinutes = 0;
+  let totalGroundMinutes = 0;
 
-  for (let index = 0; index < stops.length - 1; index += 1) {
-    const origin = stops[index];
-    const destination = stops[index + 1];
+  for (let index = 0; index < flightOrigins.length; index += 1) {
+    const origin = flightOrigins[index];
+    const destination = flightDestinations[index];
     const isFirstHop = index === 0;
-    const isLastHop = index === stops.length - 2;
+    const isLastHop = index === flightOrigins.length - 1;
 
     const estimate = estimateFlightArrival(
       origin,
@@ -204,7 +225,7 @@ export function computeMultiSegmentFlight(
       currentDate,
       currentTime,
       isFirstHop ? departureTimeZoneFallback : arrivalTimeZoneFallback,
-      isLastHop ? arrivalTimeZoneFallback : arrivalTimeZoneFallback
+      arrivalTimeZoneFallback
     );
     if (!estimate) return null;
 
@@ -220,10 +241,17 @@ export function computeMultiSegmentFlight(
     totalAirborneMinutes += estimate.estimatedFlightDurationMinutes;
 
     if (!isLastHop) {
-      const layoverMinutes = Math.max(0, connections[index]?.layoverMinutes ?? 0);
-      totalLayoverMinutes += layoverMinutes;
+      const connection = connections[index];
+      const layoverMinutes = Math.max(0, connection.layoverMinutes ?? 0);
+      const transferMinutes =
+        connection.arrivalAirport !== connection.departureAirport
+          ? estimateAirportTransferMinutes(connection.arrivalAirport, connection.departureAirport) ?? 0
+          : 0;
+      const groundMinutes = layoverMinutes + transferMinutes;
+      totalGroundMinutes += groundMinutes;
+
       const layoverTimeZone = resolveAirportTimeZone(destination, arrivalTimeZoneFallback);
-      const next = shiftLocalDateTime(estimate.arrivalDate, estimate.arrivalTime, layoverTimeZone, layoverMinutes);
+      const next = shiftLocalDateTime(estimate.arrivalDate, estimate.arrivalTime, layoverTimeZone, groundMinutes);
       currentDate = next.date;
       currentTime = next.time;
     }
@@ -235,8 +263,137 @@ export function computeMultiSegmentFlight(
     finalArrivalDate: lastSegment.arrivalDate,
     finalArrivalTime: lastSegment.arrivalTime,
     totalAirborneMinutes,
-    totalJourneyMinutes: totalAirborneMinutes + totalLayoverMinutes,
+    totalJourneyMinutes: totalAirborneMinutes + totalGroundMinutes,
   };
+}
+
+/**
+ * A country-aware view of a leg's route — one entry per real flight
+ * segment, each carrying its own origin/destination country (not just
+ * airport), derived on demand from the leg's existing flat fields +
+ * connections rather than a separately stored duplicate. Used for the UI's
+ * per-segment labels/route summary and for validation. Never persisted —
+ * same "zero-migration" reasoning as the rest of this leg's design.
+ */
+export interface FlightJourneySegment {
+  originCountry: string;
+  originAirport: string;
+  destinationCountry: string;
+  destinationAirport: string;
+  /** The connection immediately following this segment, if any (null for the last segment). */
+  layoverMinutes: number | null;
+  /** True when that connection's departure airport differs from its arrival airport (spec item 6). */
+  airportChangedAfter: boolean;
+}
+
+export function getJourneySegments(
+  leg: Pick<TripFlightLeg, "departureAirport" | "arrivalAirport" | "connections">,
+  originCountryIso: string,
+  destinationCountryIso: string
+): FlightJourneySegment[] {
+  if (!leg.departureAirport || !leg.arrivalAirport) return [];
+
+  const connections = leg.connections ?? [];
+  const segments: FlightJourneySegment[] = [];
+
+  for (let index = 0; index <= connections.length; index += 1) {
+    const isFirst = index === 0;
+    const isLast = index === connections.length;
+    const connectionAfter = isLast ? null : connections[index];
+
+    segments.push({
+      originCountry: isFirst ? originCountryIso : connections[index - 1].countryIso,
+      originAirport: isFirst ? leg.departureAirport : connections[index - 1].departureAirport,
+      destinationCountry: isLast ? destinationCountryIso : connections[index].countryIso,
+      destinationAirport: isLast ? leg.arrivalAirport : connections[index].arrivalAirport,
+      layoverMinutes: connectionAfter ? connectionAfter.layoverMinutes : null,
+      airportChangedAfter: connectionAfter ? connectionAfter.arrivalAirport !== connectionAfter.departureAirport : false,
+    });
+  }
+
+  return segments;
+}
+
+/**
+ * Defensive, independent check (spec items 20/21) — even though
+ * getJourneySegments's own output always chains by construction, this is
+ * also meant to validate raw data reconstructed elsewhere (e.g.
+ * server-side from a request payload). Only rejects an airport we actually
+ * recognize and can place in the wrong country — same
+ * never-reject-what-we-don't-know rule as validateFlightAirportCountries.
+ */
+export function validateJourneySegments(
+  segments: FlightJourneySegment[],
+  originCountryIso: string,
+  destinationCountryIso: string
+): string | null {
+  if (segments.length === 0) return null;
+
+  const originIso = originCountryIso.trim().toUpperCase();
+  const destinationIso = destinationCountryIso.trim().toUpperCase();
+
+  const first = segments[0];
+  if (first.originCountry.trim().toUpperCase() !== originIso) {
+    return "מקטע הטיסה הראשון חייב להתחיל במדינת המוצא של הטיול.";
+  }
+  const last = segments[segments.length - 1];
+  if (last.destinationCountry.trim().toUpperCase() !== destinationIso) {
+    return "מקטע הטיסה האחרון חייב להסתיים במדינת היעד של הטיול.";
+  }
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const originAirport = findAirportByIata(segment.originAirport);
+    if (originAirport && originAirport.countryIso !== segment.originCountry.trim().toUpperCase()) {
+      return `שדה התעופה ${segment.originAirport} אינו נמצא ב${COUNTRY_NAMES_HE[segment.originCountry.toUpperCase()] ?? segment.originCountry}.`;
+    }
+    const destinationAirport = findAirportByIata(segment.destinationAirport);
+    if (destinationAirport && destinationAirport.countryIso !== segment.destinationCountry.trim().toUpperCase()) {
+      return `שדה התעופה ${segment.destinationAirport} אינו נמצא ב${COUNTRY_NAMES_HE[segment.destinationCountry.toUpperCase()] ?? segment.destinationCountry}.`;
+    }
+    if (index > 0 && segments[index - 1].destinationCountry.trim().toUpperCase() !== segment.originCountry.trim().toUpperCase()) {
+      return "מקטעי הטיסה אינם מחוברים — מדינת ההגעה של מקטע אחד חייבת להיות מדינת היציאה של המקטע הבא.";
+    }
+  }
+
+  return null;
+}
+
+/** One structured, debuggable finding from detectInvalidFlightLegs — never a bare boolean, so a caller/log always has enough to act on. */
+export interface InvalidFlightLegDiagnostic {
+  legId: "outbound" | "return" | `connection-${number}`;
+  originAirport: string;
+  destinationAirport: string;
+  reason: string;
+}
+
+/**
+ * Generic, airport-agnostic sanity check (spec §A2) — a leg (or a
+ * connection's own hop) whose origin and destination airport are identical
+ * is never a real flight, regardless of which airport it happens to be.
+ * Catches an accidental default surviving two dropdowns silently resolving
+ * to the same value, without ever naming a specific airport/country.
+ */
+export function detectInvalidFlightLegs(flights: TripFlights | null | undefined): InvalidFlightLegDiagnostic[] {
+  const findings: InvalidFlightLegDiagnostic[] = [];
+  if (!flights) return findings;
+
+  const checkLeg = (legId: InvalidFlightLegDiagnostic["legId"], leg: TripFlightLeg | null) => {
+    if (!leg || !leg.departureAirport || !leg.arrivalAirport) return;
+    if (leg.departureAirport.trim().toUpperCase() === leg.arrivalAirport.trim().toUpperCase()) {
+      findings.push({
+        legId,
+        originAirport: leg.departureAirport,
+        destinationAirport: leg.arrivalAirport,
+        reason: "origin and destination airport are identical — this cannot be a real flight leg",
+      });
+    }
+  };
+
+  checkLeg("outbound", flights.outbound);
+  checkLeg("return", flights.return);
+
+  return findings;
 }
 
 /**
@@ -276,6 +433,102 @@ export function computeArrivalDepartureWindow(
   return { earliestUsableTimeOnArrivalDay, latestUsableTimeOnDepartureDay };
 }
 
+// computeArrivalDepartureWindow's AIRPORT_TO_ACCOMMODATION_MINUTES/
+// ACCOMMODATION_TO_AIRPORT_MINUTES are fixed planning assumptions — real
+// only when the day's actual base is a normal, nearby distance from the
+// airport. Ground speed is a deliberately conservative average (city
+// streets + some highway, not a real routing API — same reasoning as
+// AVERAGE_BLOCK_SPEED_KMH above) used only to catch a base that's clearly
+// a *different region* from the airport, not to time-box a normal commute.
+const AVERAGE_GROUND_SPEED_KMH = 50;
+const AIRPORT_BASE_MISMATCH_EXTRA_MINUTES = 45;
+
+export interface AirportBaseMismatchDiagnostic {
+  direction: "arrival" | "departure";
+  airport: string;
+  estimatedGroundMinutes: number;
+  assumedGroundMinutes: number;
+}
+
+/**
+ * Generic distance check (spec §A3-A5) — flags an airport whose real
+ * great-circle distance from the day's own dominant anchor coordinates
+ * implies meaningfully more ground travel than the fixed buffer the
+ * arrival/departure window already assumes. Deliberately conservative
+ * (only trips clearly past a different-region distance, never a normal
+ * same-city commute) since haversine + a flat speed is an estimate, not a
+ * real route. Structural inputs only (no AiGeneratedItem import), same
+ * leaf-module convention as the rest of this file.
+ */
+export function detectAirportBaseMismatch(
+  direction: "arrival" | "departure",
+  airportIata: string,
+  dayAnchors: Array<{ lat: number | null; lon: number | null }>
+): AirportBaseMismatchDiagnostic | null {
+  const airport = findAirportByIata(airportIata);
+  if (!airport) return null;
+
+  const anchorsWithCoordinates = dayAnchors.filter(
+    (anchor): anchor is { lat: number; lon: number } => anchor.lat != null && anchor.lon != null
+  );
+  if (anchorsWithCoordinates.length === 0) return null;
+
+  const nearestDistanceKm = Math.min(
+    ...anchorsWithCoordinates.map((anchor) => haversineKm(airport.lat, airport.lon, anchor.lat, anchor.lon))
+  );
+  const estimatedGroundMinutes = Math.round((nearestDistanceKm / AVERAGE_GROUND_SPEED_KMH) * 60);
+  const assumedGroundMinutes =
+    direction === "arrival" ? AIRPORT_TO_ACCOMMODATION_MINUTES : ACCOMMODATION_TO_AIRPORT_MINUTES;
+
+  if (estimatedGroundMinutes <= assumedGroundMinutes + AIRPORT_BASE_MISMATCH_EXTRA_MINUTES) return null;
+
+  return { direction, airport: airportIata, estimatedGroundMinutes, assumedGroundMinutes };
+}
+
+// Not "a normal day must remain" (that's a quality preference, not a
+// feasibility question) — this is the absolute floor: at least enough time
+// to wake and get ready before the ground-transit-plus-buffer countdown to
+// the flight has to start. Below this, the traveler would need to leave
+// before a normal night's sleep even ends, regardless of which country/
+// city/airport is involved (spec §B2's hard rejection). This is exactly
+// what makes an early flight require a close base and a late flight
+// tolerate a farther one (spec §B3/§B4) — the same real time budget,
+// evaluated against a real distance, with no separate distance rule.
+const MINIMUM_REASONABLE_DEPARTURE_DAY_MINUTES = 60;
+
+export interface FinalBaseDepartureFeasibility {
+  feasible: boolean;
+  estimatedGroundMinutes: number;
+  usableMinutesOfDay: number;
+}
+
+/**
+ * Real time-based feasibility (spec §B1-B4) for choosing which candidate
+ * area should be the trip's FINAL overnight base, given the actual return
+ * flight — not a threshold applied after the fact, meant to run BEFORE
+ * that base is committed to. Generic: works from coordinates and a clock
+ * time only, no airport/city ever named in the logic itself.
+ */
+export function evaluateFinalBaseDepartureFeasibility(
+  departureAirportIata: string,
+  departureTime: string,
+  areaAnchor: { lat: number; lon: number }
+): FinalBaseDepartureFeasibility | null {
+  const airport = findAirportByIata(departureAirportIata);
+  const departureMinutes = parseClockTimeToMinutes(departureTime);
+  if (!airport || departureMinutes == null) return null;
+
+  const distanceKm = haversineKm(airport.lat, airport.lon, areaAnchor.lat, areaAnchor.lon);
+  const estimatedGroundMinutes = Math.round((distanceKm / AVERAGE_GROUND_SPEED_KMH) * 60);
+  const usableMinutesOfDay = departureMinutes - INTERNATIONAL_DEPARTURE_BUFFER_MINUTES - estimatedGroundMinutes;
+
+  return {
+    feasible: usableMinutesOfDay >= MINIMUM_REASONABLE_DEPARTURE_DAY_MINUTES,
+    estimatedGroundMinutes,
+    usableMinutesOfDay,
+  };
+}
+
 /**
  * Shared by both the diagnostics counter (itinerary-generation-constraints.ts)
  * and the repair pass (country-itinerary-generation.ts) so the two never
@@ -288,26 +541,41 @@ export function violatesArrivalDepartureWindow(
   dayDate: string,
   isArrivalDay: boolean,
   isDepartureDay: boolean,
-  window: ArrivalDepartureWindow
+  window: ArrivalDepartureWindow,
+  /**
+   * The item's real occupied-until clock time (same day) — required to
+   * correctly validate the departure-day check below, which must look at
+   * when the item ENDS, not when it starts (spec §A1: "starts before
+   * cutoff, ends after cutoff" must be invalid). Callers derive this via
+   * itinerary-planning-principles.ts's resolveItemEffectiveEndTime — the
+   * exact same canonical duration semantics used everywhere else — never a
+   * second interpretation. Optional/omittable only for callers with no
+   * item context at all (e.g. a bare clock-time probe); falls back to
+   * treating start and end as identical in that case, which under-detects
+   * rather than over-detects.
+   */
+  itemEffectiveEndTime?: string | null
 ): boolean {
-  const itemMinutes = parseClockTimeToMinutes(itemPlannedStartTime);
-  if (itemMinutes == null) return false;
+  const itemStartMinutes = parseClockTimeToMinutes(itemPlannedStartTime);
+  if (itemStartMinutes == null) return false;
 
   if (isArrivalDay && window.earliestUsableTimeOnArrivalDay) {
     const { date, time } = window.earliestUsableTimeOnArrivalDay;
     if (date > dayDate) return true;
     if (date === dayDate) {
       const earliestMinutes = parseClockTimeToMinutes(time);
-      if (earliestMinutes != null && itemMinutes < earliestMinutes) return true;
+      if (earliestMinutes != null && itemStartMinutes < earliestMinutes) return true;
     }
   }
 
   if (isDepartureDay && window.latestUsableTimeOnDepartureDay) {
     const { date, time } = window.latestUsableTimeOnDepartureDay;
+    const itemEndMinutes =
+      (itemEffectiveEndTime != null ? parseClockTimeToMinutes(itemEffectiveEndTime) : null) ?? itemStartMinutes;
     if (date < dayDate) return true;
     if (date === dayDate) {
       const latestMinutes = parseClockTimeToMinutes(time);
-      if (latestMinutes != null && itemMinutes > latestMinutes) return true;
+      if (latestMinutes != null && itemEndMinutes > latestMinutes) return true;
     }
   }
 
