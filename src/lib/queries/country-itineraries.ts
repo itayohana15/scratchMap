@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { isClientDebugEnabled } from "@/lib/client-debug";
 import type {
   CountryItineraryGenerationSuccessPayload,
   CountryItineraryRecord,
@@ -121,7 +122,7 @@ export function useGenerateCountryItinerary(iso: string) {
 
   return useMutation({
     mutationFn: async ({ signal, ...payload }: AiItineraryRequest & { signal?: AbortSignal }) => {
-      if (process.env.NODE_ENV !== "production") {
+      if (isClientDebugEnabled()) {
         console.log("[Itinerary] request payload", {
           isoA2: iso.toUpperCase(),
           clientRequestId: payload.clientRequestId,

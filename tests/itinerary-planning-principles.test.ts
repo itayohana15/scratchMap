@@ -202,17 +202,21 @@ test("classifyItemEnergy buckets representative low/medium/high stops", () => {
 });
 
 test("buildTripFramePhases distributes days geography-first across weighted areas", () => {
+  // Significance is absolute (>= OVERNIGHT_WORTHY_MINUTES per area), not a
+  // share of the trip total — weights below are real minute-scale content,
+  // each clearing the bar on its own, so all three areas qualify as
+  // significant regardless of their relative share of the trip.
   const bucket = getTripLengthBucket(10);
   const rankedAreas = ["Tbilisi", "Kutaisi", "Batumi"];
   const areaWeights = new Map([
-    ["Tbilisi", 12],
-    ["Kutaisi", 5],
-    ["Batumi", 8],
+    ["Tbilisi", 480],
+    ["Kutaisi", 260],
+    ["Batumi", 360],
   ]);
 
   const phases = buildTripFramePhases(rankedAreas, areaWeights, 10, bucket, null);
 
-  assert.ok(phases.length >= 1 && phases.length <= bucket.maxBases);
+  assert.equal(phases.length, 3);
   assert.equal(phases[0].startDayNumber, 1);
   assert.equal(phases.at(-1)!.endDayNumber, 10);
   assert.equal(
@@ -235,6 +239,65 @@ test("buildTripFramePhases respects a pinned single area for short trips", () =>
   assert.equal(phases.length, 1);
   assert.equal(phases[0].areaLabel, "Berlin");
   assert.equal(phases[0].nights, 4);
+});
+
+// Real 46-day trace bug: a wide-ranging trip's areas each held real,
+// substantial content but no single one held a large SHARE of the whole
+// trip's weight, so the old relative "12% of total" significance test
+// found nothing significant and collapsed to the bucket's floor (3 bases)
+// regardless of how much real content existed. Significance must be
+// absolute (does this area alone clear a real day's worth of content),
+// not a share that shrinks the more genuinely distinct areas a trip has.
+test("buildTripFramePhases treats every area with real per-area content as significant, even when no single area dominates the trip's total weight", () => {
+  const dayCount = 46;
+  const bucket = getTripLengthBucket(dayCount);
+  const areaNames = Array.from({ length: 12 }, (_, index) => `Area ${index + 1}`);
+  // 250 min each clears OVERNIGHT_WORTHY_MINUTES (240) individually, but
+  // each is only ~8.3% of the combined total — below the old 12% bar.
+  const areaWeights = new Map(areaNames.map((area) => [area, 250]));
+
+  const phases = buildTripFramePhases(areaNames, areaWeights, dayCount, bucket, null);
+
+  assert.equal(phases.length, 12);
+});
+
+// Companion to the test above: the bucket table's own ratio (minDays /
+// maxBases) implies how many extra days justify one more base — for the
+// one open-ended bucket (slow_travel, maxDays: null), that ratio should
+// keep scaling the ceiling past the bucket's own entry point instead of
+// freezing at its fixed maxBases (10), which would otherwise cap a 90-day
+// trip at the same base count as a 25-day one.
+test("buildTripFramePhases lets the base-count ceiling grow for very long trips in the open-ended bucket", () => {
+  const dayCount = 90;
+  const bucket = getTripLengthBucket(dayCount);
+  assert.equal(bucket.maxDays, null); // sanity: still the open-ended bucket
+  assert.equal(bucket.maxBases, 10); // sanity: the bucket's own fixed ceiling
+
+  const areaNames = Array.from({ length: 20 }, (_, index) => `Region ${index + 1}`);
+  const areaWeights = new Map(areaNames.map((area) => [area, 300]));
+
+  const phases = buildTripFramePhases(areaNames, areaWeights, dayCount, bucket, null);
+
+  assert.ok(phases.length > bucket.maxBases, `expected more than the bucket's fixed ${bucket.maxBases} bases for a ${dayCount}-day trip, got ${phases.length}`);
+  assert.equal(phases.length, 20);
+});
+
+// Regression: the ratio-scaling above is specific to the one open-ended
+// bucket — a bounded bucket's fixed maxBases must still cap the base
+// count exactly as before, even when many areas individually clear the
+// significance bar.
+test("buildTripFramePhases keeps a bounded bucket's fixed base-count ceiling even with many significant areas", () => {
+  const dayCount = 10;
+  const bucket = getTripLengthBucket(dayCount);
+  assert.notEqual(bucket.maxDays, null); // sanity: a bounded bucket, not slow_travel
+  assert.equal(bucket.maxBases, 3);
+
+  const areaNames = Array.from({ length: 6 }, (_, index) => `City ${index + 1}`);
+  const areaWeights = new Map(areaNames.map((area) => [area, 300]));
+
+  const phases = buildTripFramePhases(areaNames, areaWeights, dayCount, bucket, null);
+
+  assert.equal(phases.length, bucket.maxBases);
 });
 
 test("collectPlanDiagnostics flags 3+ consecutive high-energy days and clears on a lighter rhythm", () => {

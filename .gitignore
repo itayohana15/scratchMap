@@ -14,6 +14,12 @@
 /coverage
 /.test-dist
 
+# QA/debug runtime captures (CAPTURE_FIXTURES=1) — dev-only diagnostic
+# output, never committed. Canonical, hand-promoted regression fixtures
+# stay under /fixtures (intentionally NOT ignored) — a capture only
+# becomes a fixture by deliberately copying it there, never automatically.
+/.qa-artifacts
+
 # next.js
 /.next/
 /.next-corrupt-*/

@@ -383,7 +383,7 @@ interface CountryItineraryDetailsDialogProps {
   ) => Promise<void> | void;
   onRestore: (versionId: string) => Promise<void> | void;
   onArchive: (itineraryId: string) => Promise<void> | void;
-  onDelete: (itineraryId: string) => Promise<void> | void;
+  onDelete: (itinerary: CountryItineraryRecord) => void;
   onExport: (itinerary: CountryItineraryRecord) => void;
 }
 
@@ -745,7 +745,7 @@ export function CountryItineraryDetailsDialog({
                         <Archive className="size-4" />
                         ארכוב
                       </DropdownMenuItem>
-                      <DropdownMenuItem variant="destructive" onClick={() => void onDelete(draft.id)}>
+                      <DropdownMenuItem variant="destructive" onClick={() => onDelete(draft)}>
                         <Trash2 className="size-4" />
                         מחיקת מסלול
                       </DropdownMenuItem>

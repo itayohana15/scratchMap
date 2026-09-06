@@ -86,8 +86,12 @@ function PillList({ items }: { items: string[] }) {
 
   return (
     <div className="flex flex-wrap gap-2">
-      {list.map((item) => (
-        <Badge key={item} variant="secondary" className="rounded-full px-3 py-1 text-xs font-normal">
+      {list.map((item, index) => (
+        // Plain AI-generated display strings, no other stable id available —
+        // a repeated value (e.g. a route that legitimately revisits the same
+        // city) is valid data, never deduped, so the key must stay unique
+        // per occurrence rather than per value.
+        <Badge key={`${item}-${index}`} variant="secondary" className="rounded-full px-3 py-1 text-xs font-normal">
           {item}
         </Badge>
       ))}
@@ -101,8 +105,12 @@ function BulletList({ items, className }: { items: string[]; className?: string 
 
   return (
     <ul className={cn("space-y-2 text-sm leading-6 text-muted-foreground", className)}>
-      {list.map((item) => (
-        <li key={item} className="flex gap-2">
+      {list.map((item, index) => (
+        // Same reasoning as PillList above — e.g. idea.route can legitimately
+        // list the same city twice (a real round-trip: "לאס וגאס" ->
+        // "הגרנד קניון" -> "הפארק הלאומי ציון" -> "לאס וגאס"), so the key
+        // must be unique per occurrence, not per display value.
+        <li key={`${item}-${index}`} className="flex gap-2">
           <span className="mt-2 size-1.5 shrink-0 rounded-full bg-primary/75" />
           <span>{item}</span>
         </li>
@@ -134,8 +142,11 @@ function TimelineList({ items }: { items: CountryTimelineEntry[] }) {
 
   return (
     <div className="space-y-3">
-      {items.map((item) => (
-        <div key={`${item.year}-${item.event}`} className="grid gap-2 rounded-2xl border border-border/70 p-3 md:grid-cols-[110px_minmax(0,1fr)]">
+      {items.map((item, index) => (
+        // year+event is usually distinct enough on its own, but an
+        // AI-generated timeline repeating the same entry is still real
+        // data (never deduped here) — index keeps the key unique regardless.
+        <div key={`${item.year}-${item.event}-${index}`} className="grid gap-2 rounded-2xl border border-border/70 p-3 md:grid-cols-[110px_minmax(0,1fr)]">
           <p className="text-sm font-semibold text-foreground">{item.year}</p>
           <p className="text-sm leading-6 text-muted-foreground">{item.event}</p>
         </div>
@@ -741,9 +752,12 @@ export function CountryAboutSection({ isoA2, countryName }: CountryAboutSectionP
 
           <ScrollArea className="w-full whitespace-nowrap rounded-[24px] border border-border/70">
             <div className="flex gap-4 p-4">
-              {monthCards.map((month) => (
+              {monthCards.map((month, index) => (
                 <article
-                  key={month.month}
+                  // Months should be 12 distinct values, but AI-generated
+                  // content repeating one is still real data to render, not
+                  // silently collapse — index keeps the key unique regardless.
+                  key={`${month.month}-${index}`}
                   className="inline-flex w-[260px] shrink-0 flex-col rounded-[22px] border border-border/60 bg-background/75 p-4 align-top"
                 >
                   <div className="flex items-center justify-between gap-3">

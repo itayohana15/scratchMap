@@ -7,6 +7,11 @@ import type {
 } from "@/lib/trip-workspace";
 import { buildSuggestedItineraryTitle, type CountryItineraryRecord } from "@/lib/itineraries";
 import { formatCurrency, formatDate, formatTripDateRange, formatTripDateRangeExpanded } from "@/lib/format";
+import {
+  computeDayGeographyDebugRow,
+  computeGeoResolutionMatchSummary,
+  type GeoResolutionOverrideMap,
+} from "@/lib/itinerary-day-view-helpers";
 
 /**
  * Rich, day-by-day PDF export for a saved itinerary — printed via the
@@ -51,6 +56,19 @@ function escapeHtml(value: string): string {
   });
 }
 
+/**
+ * Bidi-isolates a real entity name (a POI, a city, a hotel) so the browser
+ * never reorders its own internal word order just because it sits inside
+ * this RTL document — the exact bug behind "York New"/"Francisco San" in
+ * a real exported PDF. `<bdi>` (not a hardcoded `dir="ltr"`) lets the
+ * browser auto-detect the name's own real direction instead of assuming
+ * every name is English — the underlying string itself is never touched,
+ * only how it's isolated for rendering.
+ */
+export function bidiName(value: string): string {
+  return `<bdi>${escapeHtml(value)}</bdi>`;
+}
+
 export function itineraryDisplayTitle(itinerary: CountryItineraryRecord, countryName: string): string {
   const title = itinerary.title.trim();
   if (!title) return countryName;
@@ -76,16 +94,16 @@ function sortedItems(items: TripItineraryItem[]): TripItineraryItem[] {
   });
 }
 
-function renderItem(item: TripItineraryItem): string {
+export function renderItem(item: TripItineraryItem): string {
   const emoji = CATEGORY_EMOJI[item.category] ?? "•";
   const price = item.approximatePrice && item.approximatePrice > 0 ? formatCurrency(item.approximatePrice) : "";
   return `
     <li>
       <div class="item-head">
-        <strong>${item.plannedStartTime ? `${escapeHtml(item.plannedStartTime)} · ` : ""}${emoji} ${escapeHtml(item.name)}</strong>
+        <strong>${item.plannedStartTime ? `${escapeHtml(item.plannedStartTime)} · ` : ""}${emoji} ${bidiName(item.name)}</strong>
         ${price ? `<span class="price">${escapeHtml(price)}</span>` : ""}
       </div>
-      ${item.location ? `<span class="location">${escapeHtml(item.location)}</span>` : ""}
+      ${item.location ? `<span class="location">${bidiName(item.location)}</span>` : ""}
       ${item.shortDescription ? `<p>${escapeHtml(item.shortDescription)}</p>` : ""}
       ${item.openingHours ? `<p class="meta">שעות פתיחה: ${escapeHtml(item.openingHours)}</p>` : ""}
       ${item.bookingWarning ? `<p class="warning">⚠ ${escapeHtml(item.bookingWarning)}</p>` : ""}
@@ -111,14 +129,70 @@ function dayCostBreakdown(day: TripItineraryDay): string {
     </div>`;
 }
 
-function renderDay(day: TripItineraryDay): string {
+/**
+ * QA_DEBUG_GEOGRAPHY overlay for the PDF (the flag matters more here than
+ * on the day screen — this is where real geography bugs actually get
+ * found, per direct instruction). Same degraded, JIT-approximated
+ * geoSource/derivedDayType as the day-screen panel — see
+ * computeDayGeographyDebugRow's own note for exactly why. English field
+ * values (geoSource/precision/dayType tokens) get the same bidiName()
+ * isolation as every other English/foreign token in this RTL document, so
+ * they don't get word-reordered the way plain names once did.
+ */
+export interface GeoDebugContext {
+  previousDay: TripItineraryDay | null;
+  isFirstDay: boolean;
+  isLastDay: boolean;
+  geoResolutionOverride: GeoResolutionOverrideMap | null;
+}
+
+function renderGeographyDebugSection(day: TripItineraryDay, context: GeoDebugContext): string {
+  const row = computeDayGeographyDebugRow(
+    day,
+    context.previousDay,
+    context.isFirstDay,
+    context.isLastDay,
+    "balanced",
+    context.geoResolutionOverride
+  );
+  const itemRows = row.items
+    .map(
+      (it) => `<tr class="${
+        it.geoSource === "unresolved" ? "geo-debug-unresolved" : it.geoSource === "unmatched" ? "geo-debug-unmatched" : ""
+      }">
+        <td>${bidiName(it.itemName)}</td>
+        <td>${bidiName(it.category)}</td>
+        <td>${bidiName(it.geoSource)}</td>
+        <td>${bidiName(it.precision)}</td>
+        <td>${it.legMinutes ?? "—"}</td>
+      </tr>`
+    )
+    .join("");
+
+  return `
+    <div class="geo-debug">
+      <p class="geo-debug-title">🔧 QA_DEBUG_GEOGRAPHY — יום ${row.dayNumber}</p>
+      <p>derivedDayType=${bidiName(row.derivedDayType)} · textualDayType=${bidiName(row.textualDayType)} · ${
+        row.dayTypeMismatch
+          ? '<strong class="geo-debug-mismatch">dayTypeMismatch=TRUE</strong>'
+          : "dayTypeMismatch=false"
+      }</p>
+      <p>totalLegMinutes=${row.totalLegMinutes} · maxLegMinutes=${row.maxLegMinutes} · unresolvedItemCount=${row.unresolvedItemCount}</p>
+      ${
+        itemRows
+          ? `<table class="geo-debug-table"><thead><tr><th>item</th><th>category</th><th>geoSource</th><th>precision</th><th>legMinutes</th></tr></thead><tbody>${itemRows}</tbody></table>`
+          : ""
+      }
+    </div>`;
+}
+
+export function renderDay(day: TripItineraryDay, geoDebugContext?: GeoDebugContext): string {
   const weekday = formatDate(day.date, "EEEE");
   const dateLabel = formatDate(day.date, "d בMMMM yyyy");
-  const heading = `יום ${day.dayNumber}${weekday ? ` – ${weekday}` : ""}${dateLabel ? ` | ${dateLabel}` : ""}${day.title ? `: ${escapeHtml(day.title)}` : ""}`;
+  const heading = `יום ${day.dayNumber}${weekday ? ` – ${weekday}` : ""}${dateLabel ? ` | ${dateLabel}` : ""}${day.title ? `: ${bidiName(day.title)}` : ""}`;
 
-  const subLine = [day.cityRegion, day.accommodation ? `לינה: ${day.accommodation}` : ""]
+  const subLine = [day.cityRegion ? bidiName(day.cityRegion) : "", day.accommodation ? `לינה: ${bidiName(day.accommodation)}` : ""]
     .filter(Boolean)
-    .map(escapeHtml)
     .join(" · ");
 
   const items = sortedItems(day.items).map(renderItem).join("");
@@ -137,6 +211,7 @@ function renderDay(day: TripItineraryDay): string {
       ${dayNotes}
       ${items ? `<ol>${items}</ol>` : '<p class="empty">אין פעילויות מתוכננות ליום זה.</p>'}
       ${dayCostBreakdown(day)}
+      ${geoDebugContext ? renderGeographyDebugSection(day, geoDebugContext) : ""}
     </section>`;
 }
 
@@ -145,7 +220,7 @@ function renderSummaryBullets(days: TripItineraryDay[]): string {
     .map((day) => {
       const dateLabel = formatDate(day.date, "d.M");
       const headline = day.title || day.cityRegion || "";
-      return `<li>${dateLabel ? `<bdi dir="ltr">${escapeHtml(dateLabel)}</bdi> · ` : ""}<strong>יום ${day.dayNumber}</strong>${headline ? `: ${escapeHtml(headline)}` : ""}</li>`;
+      return `<li>${dateLabel ? `<bdi dir="ltr">${escapeHtml(dateLabel)}</bdi> · ` : ""}<strong>יום ${day.dayNumber}</strong>${headline ? `: ${bidiName(headline)}` : ""}</li>`;
     })
     .join("");
   return `
@@ -163,7 +238,7 @@ function flightLegLine(label: string, leg: TripFlightLeg | null): string {
     dateLabel,
     leg.departureTime ? `המראה ${escapeHtml(leg.departureTime)}` : "",
     leg.arrivalTime ? `נחיתה ${escapeHtml(leg.arrivalTime)}${leg.estimated ? " (משוער)" : ""}` : "",
-    leg.airline || leg.flightNumber ? `${escapeHtml(leg.airline)} ${escapeHtml(leg.flightNumber)}`.trim() : "",
+    leg.airline || leg.flightNumber ? bidiName(`${leg.airline} ${leg.flightNumber}`.trim()) : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -202,10 +277,12 @@ function renderPracticalInfo(days: TripItineraryDay[], workspace?: CountryTripWo
     </section>`;
 }
 
-function buildItineraryPdfHtml(
+export function buildItineraryPdfHtml(
   itinerary: CountryItineraryRecord,
   countryName: string,
-  workspace?: CountryTripWorkspaceState
+  workspace?: CountryTripWorkspaceState,
+  debugGeoEnabled = false,
+  geoResolutionOverride: GeoResolutionOverrideMap | null = null
 ): string {
   const title = itineraryDisplayTitle(itinerary, countryName);
   const dates = formatTripDateRangeExpanded(
@@ -214,7 +291,24 @@ function buildItineraryPdfHtml(
     itinerary.preferencesSnapshot.partialDate
   );
   const days = [...itinerary.itineraryDays].sort((first, second) => first.dayNumber - second.dayNumber);
-  const dayHtml = days.map(renderDay).join("");
+  // Spec "אני רואה את זה בשנייה במקום להסיק לאורך 44 ימים" — one line for
+  // the whole trip, shown once near the top, not repeated per day.
+  const geoResolutionSummary = debugGeoEnabled ? computeGeoResolutionMatchSummary(days, geoResolutionOverride) : null;
+  const dayHtml = days
+    .map((day, index) =>
+      renderDay(
+        day,
+        debugGeoEnabled
+          ? {
+              previousDay: index > 0 ? days[index - 1] : null,
+              isFirstDay: index === 0,
+              isLastDay: index === days.length - 1,
+              geoResolutionOverride,
+            }
+          : undefined
+      )
+    )
+    .join("");
 
   return `<!doctype html>
     <html lang="he" dir="rtl">
@@ -255,6 +349,14 @@ function buildItineraryPdfHtml(
           .practical-section h3 { font-size: 13px; margin-top: 12px; }
           .plain-list, .check-list { list-style: none; margin-top: 6px; padding: 0; }
           .plain-list li, .check-list li { font-size: 13px; padding: 3px 0; }
+          .geo-debug { background: #fffbe6; border: 1px dashed #d4a017; border-radius: 6px; font-family: monospace; font-size: 11px; margin-top: 10px; padding: 8px 10px; }
+          .geo-debug-title { color: #8a6d00; font-family: Arial, sans-serif; font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+          .geo-debug-mismatch { color: #b3261e; }
+          .geo-debug-table { border-collapse: collapse; margin-top: 6px; width: 100%; }
+          .geo-debug-table th, .geo-debug-table td { border: 1px solid #e6d28f; padding: 2px 6px; text-align: right; }
+          .geo-debug-unresolved { color: #b3261e; }
+          .geo-debug-unmatched { color: #b06a00; font-weight: 700; }
+          .geo-debug-summary { background: #fffbe6; border: 1px dashed #d4a017; border-radius: 6px; font-family: monospace; font-size: 12px; margin: 12px 0; padding: 6px 10px; }
           @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
         </style>
       </head>
@@ -269,6 +371,11 @@ function buildItineraryPdfHtml(
             <div class="fact"><span>עלות כוללת משוערת</span>${escapeHtml(formatCurrency(itinerary.costSummary.totalEstimatedCost))}</div>
           </div>
         </header>
+        ${
+          geoResolutionSummary
+            ? `<div class="geo-debug-summary">🔧 geo-resolution: ${geoResolutionSummary.matched}/${geoResolutionSummary.total} items matched</div>`
+            : ""
+        }
         ${days.length > 0 ? renderSummaryBullets(days) : ""}
         ${dayHtml || '<p class="empty">אין ימים מתוכננים במסלול זה.</p>'}
         ${renderPracticalInfo(days, workspace)}
@@ -281,16 +388,29 @@ function buildItineraryPdfHtml(
  * Opens a new tab with the printable itinerary and triggers the browser's
  * print dialog (the user picks "Save as PDF"). Returns false (and lets the
  * caller show its own toast) when the popup was blocked.
+ *
+ * `geoResolutionOverride` is the caller's responsibility (via
+ * useGeoResolutionDebugMap, already fetched by the time the export button
+ * is clicked) rather than fetched here — keeps this function synchronous,
+ * so window.open()'s popup-blocker-sensitive timing is untouched.
  */
 export function openItineraryPdfExport(
   itinerary: CountryItineraryRecord,
   countryName: string,
-  workspace?: CountryTripWorkspaceState
+  workspace?: CountryTripWorkspaceState,
+  geoResolutionOverride: GeoResolutionOverrideMap | null = null
 ): boolean {
   const printWindow = window.open("", "_blank");
   if (!printWindow) return false;
   printWindow.opener = null;
-  printWindow.document.write(buildItineraryPdfHtml(itinerary, countryName, workspace));
+  // Reads the CURRENT page's own ?debugGeo=1 (the same flag the itinerary
+  // day screen checks) rather than adding a third way to opt in — a user
+  // who's already looking at the debug overlay on-screen gets it in the
+  // exported PDF too, with no extra step.
+  const debugGeoEnabled = new URLSearchParams(window.location.search).get("debugGeo") === "1";
+  printWindow.document.write(
+    buildItineraryPdfHtml(itinerary, countryName, workspace, debugGeoEnabled, geoResolutionOverride)
+  );
   printWindow.document.close();
   return true;
 }

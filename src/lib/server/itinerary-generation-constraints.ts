@@ -3,6 +3,7 @@ import type {
   AiGeneratedItem,
   AiItineraryResponse,
   DayPart,
+  DestinationMobilityProfile,
   RecommendationCategory,
   TripPreferences,
   TripRecommendation,
@@ -24,6 +25,7 @@ import {
 } from "../flight-planning";
 import type { TripFlights } from "@/lib/trip-workspace";
 import { violatesOpeningHours } from "./opening-hours";
+import { isPlannerQaTraceEnabled, buildDuplicateTraceReports, formatDuplicateTraceReport } from "@/lib/planner-qa-trace";
 import { findFixedTimeConflicts, type FixedTimeConflict } from "./itinerary-scheduler";
 import { isImplausiblyFastTravelTime, resolveTransportModeFromLabel } from "../transport-mode";
 import {
@@ -104,6 +106,8 @@ export interface PlanDiagnostics {
   invalidCoordinates: number;
   crossCityDays: number;
   longTravelDays: number;
+  /** Spec "MAKE TRAVEL METRICS ACTUALLY ACTIVE" — a NORMAL day (never day-trip/transfer) whose single-segment travel time still exceeds the destination's own real DestinationMobilityProfile budget after repair. Distinct from longTravelDays' fixed-constant check: this one is mobility-profile-aware, real per-trip, and only counted when a real profile was actually supplied. Optional — absent on any diagnostics object built before this field existed (a hand-built test fixture, an older code path); treat absent the same as 0, never as a failure. */
+  normalDayTravelOutliers?: number;
   foodDominantDays: number;
   missingAnchorDays: number;
   longMealDetours: number;
@@ -463,12 +467,16 @@ const DAY_TRIP_BASE_RADIUS_KM = 5;
  * error — a chain that never returns (like Tokyo→Osaka) still correctly
  * falls through to the cross-city check.
  */
-export function isDayTripDay(
-  day: Pick<AiGeneratedDay, "title" | "notes" | "transportation" | "transportSegments" | "items">
-) {
-  if (isIntercityTransferDay(day)) return false;
-  if (DAY_TRIP_PATTERN.test(`${day.title} ${day.notes} ${day.transportation}`)) return true;
-
+/**
+ * The structural half of isDayTripDay's own check, extracted so a caller
+ * that deliberately does NOT want to trust Gemini's own title/notes/
+ * transportation wording (spec "GEOGRAPHIC CORRECTNESS REDESIGN" — day-
+ * type must be provably derived, not merely asserted by the model) can
+ * still use the one real, coordinate-based signal: a genuine out-and-back
+ * structure, first/last anchor at the same base, a real distant middle
+ * anchor. No text is consulted here at all.
+ */
+export function isStructuralRoundTripDay(day: Pick<AiGeneratedDay, "items">) {
   const anchors = sortItemsBySchedule(
     day.items.filter((item) => isAnchorCategory(item.category) && hasCoordinates(item))
   );
@@ -483,6 +491,14 @@ export function isDayTripDay(
     const oneWayMinutes = estimateTravelMinutes(first.lat, first.lon, middle.lat, middle.lon, "balanced", "");
     return oneWayMinutes > DAY_TRIP_REAL_DISTANCE_MINUTES;
   });
+}
+
+export function isDayTripDay(
+  day: Pick<AiGeneratedDay, "title" | "notes" | "transportation" | "transportSegments" | "items">
+) {
+  if (isIntercityTransferDay(day)) return false;
+  if (DAY_TRIP_PATTERN.test(`${day.title} ${day.notes} ${day.transportation}`)) return true;
+  return isStructuralRoundTripDay(day);
 }
 
 /**
@@ -644,6 +660,45 @@ function normalizeSearchableText(value: string) {
 
 function isFoodCategory(category: RecommendationCategory) {
   return category === "restaurant" || category === "cafe";
+}
+
+// The single source of truth for "how much real activity time fits in a
+// day," pace-driven — used both by buildTripPreferenceProfile (below) and
+// by route-optimization.ts's day-trip feasibility math (usableMinutes),
+// which needs the same number without building an entire
+// TripPreferenceProfile just to read one field off it.
+export function deriveDailyCapacityMinutes(tripPace: TripPreferences["tripPace"]): number {
+  return tripPace === "relaxed" ? 480 : tripPace === "balanced" ? 600 : 720;
+}
+
+// Real bug found via a real 44-day US QA run: duplicateRestaurants,
+// foodDominant, and mealSpacingViolations all filtered by isFoodCategory
+// alone, so a meal-opportunity placeholder (createFallbackMealPlaceholder —
+// no recommendationId, no coordinates, by design: "not a real POI the
+// traveler picks from the food tab") got validated as if it were a real
+// restaurant. FALLBACK_LUNCH_PHRASES/FALLBACK_DINNER_PHRASES only rotate
+// through 3 templates each, so any phase spanning more than 3 days
+// mathematically guarantees the same rendered phrase repeats — duplicateRestaurants
+// then flagged that as a real repeated restaurant name. The exact same
+// real-place test buildPlaceKey already uses (a real place claims either a
+// known candidate id or real coordinates) — shared here, not reimplemented,
+// so these three checks can never drift from duplicatePlaces' own
+// definition of "real."
+function isRealPlaceCandidate(item: Pick<AiGeneratedItem, "recommendationId" | "lat" | "lon">): boolean {
+  return Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
+}
+
+// Spec "SEPARATE NON-PLACE SCHEDULE ITEMS" — the ONE authoritative check
+// for "is this a synthetic filler block (meal opportunity / free time /
+// transit-practical), never a real POI claim." Reads ScheduleItemRole
+// (trip-workspace.ts), set explicitly by every synthetic-item builder at
+// creation — never inferred from display text or category. An item with
+// no itemRole (built before this field existed, or a genuine
+// Gemini-authored real place) is treated as a real place, never
+// synthetic — this function only ever narrows, never widens, what counts
+// as a real POI claim.
+export function isSyntheticScheduleItem(item: Pick<AiGeneratedItem, "itemRole">): boolean {
+  return item.itemRole != null && item.itemRole !== "real_place";
 }
 
 function isAnchorCategory(category: RecommendationCategory) {
@@ -949,7 +1004,10 @@ export function analyzeDayGeography(
   }
 
   const anchorItems = orderedItems.filter((item) => isAnchorCategory(item.category));
-  const foodItems = orderedItems.filter((item) => isFoodCategory(item.category));
+  // Real-POI guard (see isRealPlaceCandidate's own comment): a day full of
+  // meal-opportunity placeholders is not "food-dominant" — it has no real
+  // food content at all, just as many unfilled slots as anything else.
+  const foodItems = orderedItems.filter((item) => isFoodCategory(item.category) && isRealPlaceCandidate(item));
   const isTransferDay = isIntercityTransferDay(day);
   // A day trip keeps the day's own overnight base (day.accommodation is
   // unchanged from the surrounding days) but its stops genuinely sit far
@@ -1269,12 +1327,7 @@ export function buildTripPreferenceProfile(
     budgetTarget != null ? Math.round(budgetTarget * (1 - budgetAllocation.buffer)) : null;
   const perDayBudget =
     usableBudget != null && dayCount > 0 ? Math.round(usableBudget / dayCount) : null;
-  const dailyCapacityMinutes =
-    preferences.tripPace === "relaxed"
-      ? 480
-      : preferences.tripPace === "balanced"
-        ? 600
-        : 720;
+  const dailyCapacityMinutes = deriveDailyCapacityMinutes(preferences.tripPace);
   const luxuryEnabled = includesAnyKeyword(
     `${preferences.tripStyle} ${preferences.interests} ${preferences.generationMode}`,
     LUXURY_KEYWORDS
@@ -1621,7 +1674,9 @@ export function collectPlanDiagnostics(
   arrivalDepartureWindow?: ArrivalDepartureWindow | null,
   flights?: TripFlights | null,
   protectedGeographicConflictDetails: ProtectedGeographicConflict[] = [],
-  impossibleStayTransitionDetails: ImpossibleStayTransition[] = []
+  impossibleStayTransitionDetails: ImpossibleStayTransition[] = [],
+  /** Optional real DestinationMobilityProfile — absent (default) means normalDayTravelOutliers stays 0, exactly like every caller before this parameter existed. */
+  mobilityProfile: DestinationMobilityProfile | null = null
 ): PlanDiagnostics {
   let missingMeals = 0;
   let duplicatePlaces = 0;
@@ -1633,6 +1688,7 @@ export function collectPlanDiagnostics(
   let invalidCoordinates = 0;
   let crossCityDays = 0;
   let longTravelDays = 0;
+  let normalDayTravelOutliers = 0;
   let foodDominantDays = 0;
   let missingAnchorDays = 0;
   let longMealDetours = 0;
@@ -1733,9 +1789,15 @@ export function collectPlanDiagnostics(
       excessFoodStopsDays += 1;
     }
 
+    // Real-POI guard (isRealPlaceCandidate) — spacing between two
+    // meal-opportunity placeholders (or a placeholder and a real meal) is
+    // meaningless; only two real, identifiable food stops can genuinely be
+    // "too close together."
+    const realDayFoodItems = dayFoodItems.filter(isRealPlaceCandidate);
+
     // Minimum spacing between consecutive food stops (spec item 39) —
     // lunch→dinner needs 4h+, anything else (e.g. an extra cafe) needs 3h+.
-    const orderedFoodItems = sortItemsBySchedule(dayFoodItems);
+    const orderedFoodItems = sortItemsBySchedule(realDayFoodItems);
     for (let index = 1; index < orderedFoodItems.length; index += 1) {
       const previousMeal = orderedFoodItems[index - 1];
       const currentMeal = orderedFoodItems[index];
@@ -1751,8 +1813,11 @@ export function collectPlanDiagnostics(
     // Trip-wide repeated restaurant/cafe name (spec item 42) — a defensive
     // backstop counted here regardless of how the name got repeated,
     // separate from pickNearbyMealRecommendation's own hard exclusion at
-    // generation time.
-    for (const item of dayFoodItems) {
+    // generation time. Real-POI guard (isRealPlaceCandidate, via
+    // realDayFoodItems): a repeated meal-opportunity phrase (guaranteed by
+    // FALLBACK_LUNCH_PHRASES/FALLBACK_DINNER_PHRASES only rotating 3
+    // templates each) is not a repeated restaurant.
+    for (const item of realDayFoodItems) {
       const nameKey = item.name.trim().toLowerCase();
       if (!nameKey) continue;
       if (seenMealNames.has(nameKey)) {
@@ -1805,6 +1870,21 @@ export function collectPlanDiagnostics(
         geography.longTravelSegments.some((segment) => segment.minutes > 45))
     ) {
       longTravelDays += 1;
+    }
+    // Spec "MAKE TRAVEL METRICS ACTUALLY ACTIVE" — a real, mobility-
+    // profile-aware check alongside longTravelDays' fixed-constant one:
+    // a day can be under MAX_NORMAL_DAY_TRAVEL_MINUTES/45min overall and
+    // still have one segment that's genuinely excessive for THIS
+    // destination's own real travel budget (e.g. a compact destination
+    // where even 40 minutes is an outlier). Same day-trip/transfer
+    // exemption as longTravelDays.
+    if (
+      mobilityProfile &&
+      !geography.isTransferDay &&
+      !isDayTripDay(day) &&
+      day.items.some((item) => item.travelMinutes != null && item.travelMinutes > mobilityProfile.normalDayTravelBudgetMinutes)
+    ) {
+      normalDayTravelOutliers += 1;
     }
     if (geography.foodDominant) {
       foodDominantDays += 1;
@@ -1864,22 +1944,51 @@ export function collectPlanDiagnostics(
       // candidate id, or real coordinates) participate in the fuzzy
       // name-similarity scan — generic filler content has nothing real to
       // compare, and relies solely on its own always-unique key above.
-      const isRealPlace = Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
+      const isRealPlace = isRealPlaceCandidate(item);
       const fuzzyRecord: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon };
       const exactMatch = seenPlaces.has(key);
       const fuzzyMatch = isRealPlace ? seenFuzzyPlaces.find((seen) => isFuzzyDuplicatePlace(seen, fuzzyRecord)) : undefined;
       const isDuplicate = exactMatch || Boolean(fuzzyMatch);
       if (isDuplicate) {
-        // Dev-only — real evidence for whichever specific pair is still
-        // slipping through, since this can't be reproduced against real
-        // production-scale candidate data in a synthetic test.
-        if (process.env.NODE_ENV !== "production") {
+        // QA-gated (hygiene pass — this used to fire on every non-production
+        // request instead of only a deliberate QA run) — real evidence for
+        // whichever specific pair is still slipping through, since this
+        // can't be reproduced against real production-scale candidate data
+        // in a synthetic test.
+        if (isPlannerQaTraceEnabled()) {
           console.log("[collectPlanDiagnostics] duplicatePlaces", {
             day: day.dayNumber,
             matchType: exactMatch ? "exact-key" : "fuzzy-name-coords",
             item: { name: item.name, category: item.category, recommendationId: item.recommendationId, lat: item.lat, lon: item.lon, key },
             matchedAgainst: fuzzyMatch ?? null,
           });
+        }
+        // Spec "DUPLICATE FORENSIC REPORT" — "this is the most important
+        // requirement." `key` here is byte-identical in format to
+        // computeCanonicalPlaceIdentity's own `identity` string (both
+        // `id:${recommendationId}` and `coords:${lat}:${lon}:${name}` are
+        // the exact same construction), so an exact-key duplicate's trace
+        // history is always found this way. A fuzzy-name-coords duplicate
+        // (matchedAgainst a DIFFERENT key) is a real, separate case this
+        // lookup cannot resolve — buildPlaceKey's own coordinate rounding
+        // means two near-identical-but-not-identical keys never collide
+        // here; disclosed as a known gap rather than silently missed.
+        if (isPlannerQaTraceEnabled()) {
+          const reports = buildDuplicateTraceReports(key);
+          if (reports.length > 0) {
+            for (const report of reports) {
+              console.log(formatDuplicateTraceReport(report));
+            }
+          } else {
+            console.log("[DuplicateTrace] no insertion-trace history found for this duplicate's key", {
+              key,
+              matchType: exactMatch ? "exact-key" : "fuzzy-name-coords",
+              note:
+                exactMatch
+                  ? "an exact-key duplicate with no trace history means the place was inserted by a code path not yet instrumented with tracePlaceInsertion"
+                  : "a fuzzy-name-coords duplicate matches a DIFFERENT canonical key than this item's own — buildDuplicateTraceReports only looks up exact-key history, so this case is a known observability gap, not a bug in the trace itself",
+            });
+          }
         }
         duplicatePlaces += 1;
       } else {
@@ -1972,6 +2081,7 @@ export function collectPlanDiagnostics(
     invalidCoordinates,
     crossCityDays,
     longTravelDays,
+    normalDayTravelOutliers,
     foodDominantDays,
     missingAnchorDays,
     longMealDetours,

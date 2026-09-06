@@ -1,3 +1,5 @@
+import { isClientDebugEnabled } from "@/lib/client-debug";
+
 export interface CountrySuccessIllustrationDefinition {
   countryCode: string;
   illustrationPath: string;
@@ -91,7 +93,7 @@ export function getCountrySuccessIllustration(
 
   if (!dedicatedIllustration) {
     if (
-      process.env.NODE_ENV === "development" &&
+      isClientDebugEnabled() &&
       typeof window !== "undefined" &&
       !loggedMissingCountries.has(normalizedCountryCode)
     ) {

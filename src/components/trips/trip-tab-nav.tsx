@@ -10,6 +10,7 @@ export type TripTabValue =
   | "itinerary"
   | "map"
   | "accommodation"
+  | "food"
   | "transport"
   | "budget"
   | "bookings"
@@ -23,6 +24,7 @@ export const TRIP_TAB_LABELS: Record<TripTabValue, string> = {
   itinerary: "מסלול",
   map: "מפה",
   accommodation: "לינה",
+  food: "אוכל",
   transport: "תחבורה",
   budget: "תקציב",
   bookings: "הזמנות",
@@ -37,6 +39,7 @@ const TRIP_TAB_EMOJIS: Record<TripTabValue, string> = {
   itinerary: "🗓️",
   map: "🗺️",
   accommodation: "🛏️",
+  food: "🍽️",
   transport: "🚆",
   budget: "💳",
   bookings: "🎟️",
@@ -51,6 +54,7 @@ const PRIMARY_TABS: TripTabValue[] = [
   "itinerary",
   "map",
   "accommodation",
+  "food",
   "transport",
   "budget",
   "bookings",

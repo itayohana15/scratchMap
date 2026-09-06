@@ -17,6 +17,7 @@ import { CountryBanner } from "@/components/shared/country-banner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { computeCountryFeatureMapFocus } from "@/lib/map/focus";
 import { useWorldCountriesGeoJson, type CountryFeatureProperties } from "@/lib/map/geo";
 import { useCountryByIso, useUpsertCountry } from "@/lib/queries/countries";
 import { cn } from "@/lib/utils";
@@ -216,9 +217,9 @@ export function CountryPageClient({ iso }: { iso: string }) {
   const feature = geojson?.features.find((item) => item.properties.iso_a2 === iso.toUpperCase());
   const displayName = country?.name ?? feature?.properties.name ?? iso.toUpperCase();
 
-  const bbox = feature?.properties.bbox;
-  const centerLon = bbox ? (bbox[0] + bbox[2]) / 2 : undefined;
-  const centerLat = bbox ? (bbox[1] + bbox[3]) / 2 : undefined;
+  const focus = computeCountryFeatureMapFocus(feature);
+  const centerLon = focus?.center[0];
+  const centerLat = focus?.center[1];
 
   useEffect(() => {
     if (isLoading || country || autoCreateAttemptedRef.current) return;

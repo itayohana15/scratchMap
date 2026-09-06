@@ -82,7 +82,7 @@ export function WorldMap() {
     (iso: string) => {
       const feature = geojson?.features.find((f) => f.properties.iso_a2 === iso);
       if (!feature) return;
-      flyToBbox(feature.properties.bbox);
+      flyToCountryFeature(feature);
       setStage("country");
       setSelectedIso(iso);
       setCountryPanelOpen(true);
@@ -97,7 +97,7 @@ export function WorldMap() {
     [geojson]
   );
 
-  const { containerRef, mapRef, ready, syncCountryStatuses, flyToBbox, resetToWorld } =
+  const { containerRef, mapRef, ready, syncCountryStatuses, flyToCountryFeature, resetToWorld } =
     useMaplibreMap({ isDark, onCountryClick: handleCountryClick, geojson });
 
   useEffect(() => {

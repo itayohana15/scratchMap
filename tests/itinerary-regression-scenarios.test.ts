@@ -13,6 +13,7 @@ import type {
   AiGeneratedItem,
   AiItineraryRequest,
   TripPreferences,
+  TripRecommendation,
 } from "../src/lib/trip-workspace";
 
 // This file is the "permanent regression test" the spec calls for (item
@@ -113,6 +114,38 @@ function buildDay(overrides: Partial<AiGeneratedDay> = {}): AiGeneratedDay {
     restWindow: overrides.restWindow ?? "",
     transportSegments: overrides.transportSegments ?? [],
     items: overrides.items ?? [],
+  };
+}
+
+function buildRecommendation(overrides: Partial<TripRecommendation> = {}): TripRecommendation {
+  return {
+    id: overrides.id ?? "rec-1",
+    name: overrides.name ?? "Sample Place",
+    category: overrides.category ?? "attraction",
+    location: overrides.location ?? "Tel Aviv",
+    shortDescription: overrides.shortDescription ?? "Sample description",
+    estimatedDurationMinutes: overrides.estimatedDurationMinutes ?? 90,
+    approximatePrice: overrides.approximatePrice ?? 120,
+    openingHours: overrides.openingHours ?? "09:00-18:00",
+    recommendedTimeOfDay: overrides.recommendedTimeOfDay ?? "afternoon",
+    reservationRequired: overrides.reservationRequired ?? false,
+    priceOriginalAmount: overrides.priceOriginalAmount ?? null,
+    priceOriginalCurrency: overrides.priceOriginalCurrency ?? null,
+    priceConvertedAmount: overrides.priceConvertedAmount ?? null,
+    priceExchangeRate: overrides.priceExchangeRate ?? null,
+    priceRateTimestamp: overrides.priceRateTimestamp ?? null,
+    convertedCurrency: overrides.convertedCurrency ?? null,
+    sourceType: overrides.sourceType ?? null,
+    mapLink: overrides.mapLink ?? "",
+    imageUrl: overrides.imageUrl ?? "",
+    imageQuery: overrides.imageQuery ?? "",
+    lat: overrides.lat ?? 32.08,
+    lon: overrides.lon ?? 34.78,
+    source: overrides.source ?? "api",
+    wikipediaUrl: overrides.wikipediaUrl ?? null,
+    website: overrides.website ?? null,
+    wheelchairAccessible: overrides.wheelchairAccessible ?? null,
+    isFree: overrides.isFree ?? null,
   };
 }
 
@@ -240,4 +273,55 @@ test("lightenHighEnergyStreaks lightens a day after too many consecutive high-en
   // consecutive high-energy day falls back to a real rest-window note —
   // a genuinely lighter framing, not a silent no-op.
   assert.ok(lightened[2].restWindow.length > 0, "the third consecutive heavy day must be flagged for a lighter pace");
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — lightenHighEnergyStreaks' own
+// replacement call used to hand pickReplacementRecommendation a day view
+// that still included the high-energy anchor being replaced, so a
+// candidate close only to IT (never to the day's real other anchor)
+// could pass.
+test("lightenHighEnergyStreaks never selects a replacement close only to the high-energy anchor itself, not to the day's real other anchor", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({
+        id: "fake-near-hike",
+        // Deliberately no energy-suggestive word in the name (found the
+        // hard way: "...Hike Only" made classifyItemEnergy's own
+        // keyword match reject this candidate regardless of geography,
+        // via HIGH_ENERGY_KEYWORDS — masking whether the fix was really
+        // what rejected it).
+        name: "Fake Nearby To Far Anchor Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        // Close to the far hike (33.44, 34.78) — far from the real base (32.08, 34.78).
+        lat: 33.441,
+        lon: 34.781,
+      }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Israel", 3);
+
+  // ~140km, explicit "רכב" — the real-walking-speed scheduling-overflow
+  // trap found earlier this round; buildItem's own default transportation
+  // in this file is "הליכה".
+  const heavyDay = (dayNumber: number, date: string, includeFarAnchor: boolean) =>
+    buildDay({
+      dayNumber,
+      date,
+      transportation: "רכב",
+      items: includeFarAnchor
+        ? [
+            buildItem({ name: "Base Anchor", category: "attraction", slot: "morning", lat: 32.08, lon: 34.78, transportation: "רכב" }),
+            buildItem({ name: `Major Hike Day ${dayNumber}`, category: "day_trip", slot: "afternoon", lat: 33.44, lon: 34.78, transportation: "רכב" }),
+          ]
+        : [buildItem({ name: `Major Hike Day ${dayNumber}`, category: "day_trip", slot: "morning", transportation: "רכב" })],
+    });
+
+  const days = [heavyDay(1, "2026-10-06", false), heavyDay(2, "2026-10-07", false), heavyDay(3, "2026-10-08", true)];
+  const lightened = lightenHighEnergyStreaks(days, payload, profile);
+
+  assert.ok(
+    !lightened[2].items.some((item) => item.name === "Fake Nearby To Far Anchor Only"),
+    "a candidate close only to the high-energy anchor being replaced must never be selected"
+  );
 });

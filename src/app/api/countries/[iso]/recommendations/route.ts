@@ -12,6 +12,8 @@ import {
 } from "@/lib/trip-workspace";
 import { searchPlaces } from "@/lib/places/nominatim";
 import { categoryHasOpenDataSource, queryOverpassPlaces } from "@/lib/places/overpass";
+import { startFixtureCaptureSession } from "@/lib/server/fixture-capture";
+import { isPlannerQaTraceEnabled } from "@/lib/planner-qa-trace";
 
 isoCountries.registerLocale(enLocale);
 
@@ -149,9 +151,9 @@ const getFallbackSeeds = unstable_cache(
   ): Promise<FallbackRecommendationSeed[]> => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      if (process.env.NODE_ENV !== "production") {
-        console.log("[Recommendations] GEMINI_API_KEY is not configured — skipping fallback seeds");
-      }
+      // Actionable (the fix is setting the env var), not routine progress
+      // noise — kept as a real warning rather than gated behind a QA flag.
+      console.warn("[Recommendations] GEMINI_API_KEY is not configured — skipping fallback seeds");
       return [];
     }
 
@@ -202,7 +204,7 @@ Rules:
 
     const raw = response.text;
     if (!raw) {
-      if (process.env.NODE_ENV !== "production") {
+      if (isPlannerQaTraceEnabled()) {
         console.log("[Recommendations] Gemini returned an empty response for seeds", {
           category,
           englishCountryName,
@@ -233,7 +235,7 @@ Rules:
       // compensate for 429s eating a chunk of every batch.
       .slice(0, Math.ceil(count * 1.3));
 
-    if (process.env.NODE_ENV !== "production") {
+    if (isPlannerQaTraceEnabled()) {
       console.log("[Recommendations] Gemini seeds generated", {
         category,
         englishCountryName,
@@ -264,12 +266,12 @@ async function buildFallbackRecommendations(
     startDate,
     endDate
   ).catch((error) => {
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[Recommendations] getFallbackSeeds threw", {
-        category,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    // A genuine exception, not routine progress — kept visible as a real
+    // error rather than gated behind a QA flag.
+    console.error("[Recommendations] getFallbackSeeds threw", {
+      category,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return [];
   });
 
@@ -318,20 +320,20 @@ async function buildFallbackRecommendations(
             isFree: null,
           };
         } catch (error) {
-          if (process.env.NODE_ENV !== "production") {
-            console.log("[Recommendations] Nominatim geocoding threw for a seed", {
-              category,
-              seedName: seed.name,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
+          // A genuine exception, not routine progress — kept visible as a
+          // real error rather than gated behind a QA flag.
+          console.error("[Recommendations] Nominatim geocoding threw for a seed", {
+            category,
+            seedName: seed.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
           return null;
         }
       })
     )
   ).filter((item): item is TripRecommendation => item != null);
 
-  if (process.env.NODE_ENV !== "production" && seeds.length > 0) {
+  if (isPlannerQaTraceEnabled() && seeds.length > 0) {
     console.log("[Recommendations] fallback geocoding summary", {
       category,
       seedCount: seeds.length,
@@ -370,6 +372,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ iso:
   }
 
   const englishCountryName = isoCountries.getName(isoA2, "en") ?? isoA2;
+  startFixtureCaptureSession(isoA2, { isoA2, countryName: englishCountryName, startDate, endDate });
   const openSourceAvailable = categoryHasOpenDataSource(category);
 
   // Section B2: the real request outcome, kept apart from "does this

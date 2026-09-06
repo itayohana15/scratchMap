@@ -4,6 +4,11 @@ import type { GeoJSONSource, LngLatBoundsLike, Map as MapLibreMap, StyleSpecific
 import { useEffect, useRef, useState } from "react";
 import type { Feature, MultiPolygon, Polygon } from "geojson";
 
+import {
+  computeCountryFeatureMapFocus,
+  logMapFocus,
+  toUnwrappedMapBbox,
+} from "@/lib/map/focus";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureProperties } from "@/lib/map/geo";
 
@@ -126,11 +131,16 @@ export function useCountryMiniMap({ isDark, feature }: UseCountryMiniMapOptions)
       });
     }
 
-    const [west, south, east, north] = feature.properties.bbox;
+    const focus = computeCountryFeatureMapFocus(feature);
+    if (!focus) return;
+
+    const [west, south, east, north] = toUnwrappedMapBbox(focus.bbox);
     const bounds: LngLatBoundsLike = [
       [west, south],
       [east, north],
     ];
+    const camera = map.cameraForBounds(bounds, { padding: 32, maxZoom: 9 });
+    logMapFocus("country-mini-map", feature.properties.iso_a2, focus, camera?.zoom);
     map.fitBounds(bounds, { padding: 32, duration: 0, maxZoom: 9 });
   }, [feature, ready]);
 

@@ -1153,157 +1153,98 @@ function DayMapCanvas({
   }, [activeSegmentKey, mapId, mapRef, onSelectSegment, ready, segments]);
 
   return (
-    <div className={cn("relative min-h-[18rem] overflow-hidden rounded-[24px] border border-border/70 bg-background/70", className)}>
+    <div className="relative min-h-[18rem] overflow-hidden rounded-[24px] border border-border/70 bg-background/70">
       {!ready || loading ? <Skeleton className="absolute inset-0 rounded-[24px]" /> : null}
-      <div ref={containerRef} className="h-[20rem] w-full sm:h-[24rem]" />
+      <div ref={containerRef} className={cn("w-full", className || "h-[20rem] sm:h-[24rem]")} />
     </div>
   );
 }
 
-function SegmentDetailPanel({
-  segments,
-  selectedSegmentKey,
-  onSelectSegment,
+/**
+ * Compact day-route stats (spec B2/B13) — a handful of real numbers under
+ * the map, never a repeated card per segment. Replaces the old always-
+ * visible full segment list.
+ */
+function DayRouteStats({ day, segments }: { day: TripItineraryDay; segments: MapSegment[] }) {
+  const totalTravelMinutes = segments.reduce((sum, segment) => sum + (segment.durationMinutes ?? 0), 0);
+  const totalDistanceKm = segments.reduce((sum, segment) => sum + (segment.distanceKm ?? 0), 0);
+  const stats: Array<{ label: string; value: string }> = [
+    { label: "סה״כ נסיעות", value: `${segments.length} מקטעים` },
+    { label: "זמן נסיעה היום", value: totalTravelMinutes > 0 ? `${totalTravelMinutes} דק׳` : "לא זמין" },
+    { label: "מרחק משוער", value: totalDistanceKm > 0 ? formatDistance(totalDistanceKm) : "לא זמין" },
+    { label: "בסיס לינה", value: day.accommodation || "לא נבחר" },
+  ];
+  return (
+    <div className="grid grid-cols-2 gap-2 rounded-[18px] border border-border/60 bg-background/70 p-3 sm:grid-cols-4">
+      {stats.map((stat) => (
+        <div key={stat.label} className="min-w-0">
+          <p className="truncate text-xs text-muted-foreground">{stat.label}</p>
+          <p className="truncate text-sm font-semibold text-foreground">{stat.value}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Selected-segment detail (spec B9/B10) — shown ONLY when a travel
+ * connector/route line is actually selected, as a compact overlay under
+ * the map, never a permanent panel duplicating every segment.
+ */
+function SelectedSegmentDetail({
+  segment,
+  onClose,
+}: {
+  segment: MapSegment;
+  onClose: () => void;
+}) {
+  return (
+    <div className="rounded-[18px] border border-primary/30 bg-primary/5 p-3.5" role="region" aria-label="פרטי מקטע נבחר">
+      <div className="flex items-start justify-between gap-3">
+        <p className="text-sm font-medium text-foreground">
+          {segment.from.name} ← {segment.to.name}
+        </p>
+        <button type="button" onClick={onClose} className="shrink-0 text-xs text-muted-foreground hover:text-foreground" aria-label="סגור פרטי מקטע">
+          ✕
+        </button>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+        <span>{segment.mode || "תחבורה מקומית"}</span>
+        <span>{segment.durationMinutes != null ? `${segment.durationMinutes} דק׳` : "זמן לא זמין"}</span>
+        <span>{formatDistance(segment.distanceKm)}</span>
+        {segment.cost != null ? <span>{formatCurrency(segment.cost)}</span> : null}
+        {segment.departureTime ? <span>יציאה {segment.departureTime}</span> : null}
+        {segment.arrivalTime ? <span>הגעה {segment.arrivalTime}</span> : null}
+      </div>
+      {segment.estimated ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">הקו על המפה הוא חיבור מוערך — אין geometry מאומת למצב התחבורה הזה.</p>
+      ) : null}
+    </div>
+  );
+}
+
+function MapDataStatus({
   unresolvedNames,
   geocodeErrors,
   routeErrors,
 }: {
-  segments: MapSegment[];
-  selectedSegmentKey: string | null;
-  onSelectSegment: (segmentKey: string | null) => void;
   unresolvedNames: string[];
   geocodeErrors: string[];
   routeErrors: string[];
 }) {
-  const selectedSegment =
-    segments.find((segment) => segment.key === selectedSegmentKey) ?? segments[0] ?? null;
-
+  if (unresolvedNames.length === 0 && geocodeErrors.length === 0 && routeErrors.length === 0) return null;
   return (
-    <div className="space-y-4">
-      <div className="rounded-[24px] border border-border/70 bg-background/70 p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-sm font-semibold text-foreground">מקטעי מסלול</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              לחצו על מקטע כדי להדגיש אותו על המפה ולקשר אותו לטיימליין.
-            </p>
-          </div>
-          <Badge variant="outline">{segments.length}</Badge>
-        </div>
-
-        {segments.length > 0 ? (
-          <div className="mt-4 space-y-2">
-            {segments.map((segment) => (
-              <button
-                key={segment.key}
-                type="button"
-                onClick={() => onSelectSegment(segment.key)}
-                className={cn(
-                  "w-full rounded-[18px] border px-3 py-3 text-right transition-colors",
-                  selectedSegment?.key === segment.key
-                    ? "border-primary/40 bg-primary/10"
-                    : "border-border/60 bg-background/70 hover:bg-muted/50"
-                )}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-medium">
-                    {segment.from.order} → {segment.to.order}
-                  </span>
-                  {segment.estimated ? <Badge variant="outline">הערכה</Badge> : <Badge variant="secondary">מסלול מחושב</Badge>}
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {segment.from.name} → {segment.to.name}
-                </p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {segment.mode || "תחבורה מקומית"} · {segment.durationMinutes != null ? `${segment.durationMinutes} דק׳` : "ללא זמן"}
-                </p>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-4 text-sm text-muted-foreground">
-            עדיין אין מספיק נקודות עם קואורדינטות כדי לחשב מסלול מלא.
-          </p>
-        )}
+    <div className="rounded-[18px] border border-dashed border-border/70 bg-background/70 p-3">
+      <div className="flex items-center gap-2 text-xs font-medium text-foreground">
+        <BadgeAlert className="size-3.5 text-primary" />
+        מצב נתוני מפה
       </div>
-
-      {selectedSegment ? (
-        <div className="rounded-[24px] border border-border/70 bg-background/70 p-4">
-          <p className="text-sm font-semibold text-foreground">פרטי המקטע הנבחר</p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">מוצא</p>
-              <p className="mt-1 font-medium">{selectedSegment.from.name}</p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">יעד</p>
-              <p className="mt-1 font-medium">{selectedSegment.to.name}</p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">אמצעי תחבורה</p>
-              <p className="mt-1 font-medium">{selectedSegment.mode || "תחבורה מקומית"}</p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">מרחק</p>
-              <p className="mt-1 font-medium">{formatDistance(selectedSegment.distanceKm)}</p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">זמן נסיעה</p>
-              <p className="mt-1 font-medium">
-                {selectedSegment.durationMinutes != null ? `${selectedSegment.durationMinutes} דק׳` : "לא זמין"}
-              </p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">עלות משוערת</p>
-              <p className="mt-1 font-medium">
-                {selectedSegment.cost != null ? formatCurrency(selectedSegment.cost) : "לא צוין"}
-              </p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">שעת יציאה</p>
-              <p className="mt-1 font-medium">{selectedSegment.departureTime || "לא צוין"}</p>
-            </div>
-            <div className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-              <p className="text-xs text-muted-foreground">שעת הגעה</p>
-              <p className="mt-1 font-medium">{selectedSegment.arrivalTime || "לא צוין"}</p>
-            </div>
-          </div>
-          <p className="mt-3 text-xs text-muted-foreground">
-            {selectedSegment.transferCount != null
-              ? `מספר החלפות: ${selectedSegment.transferCount}. `
-              : ""}
-            {selectedSegment.estimated ? "הקו על המפה הוא חיבור מוערך כי אין geometry מאומת למצב התחבורה הזה." : "הקו חושב משירות הניתוב הקיים."}
-          </p>
-        </div>
+      {unresolvedNames.length > 0 ? (
+        <p className="mt-1.5 text-xs leading-5 text-muted-foreground">עדיין מנסים לאתר: {unresolvedNames.join(", ")}.</p>
       ) : null}
-
-      {unresolvedNames.length > 0 || geocodeErrors.length > 0 || routeErrors.length > 0 ? (
-        <div className="rounded-[24px] border border-dashed border-border/70 bg-background/70 p-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-            <BadgeAlert className="size-4 text-primary" />
-            מצב נתוני מפה
-          </div>
-          {unresolvedNames.length > 0 ? (
-            <p className="mt-3 text-xs leading-6 text-muted-foreground">
-              עדיין מנסים לאתר: {unresolvedNames.join(", ")}.
-            </p>
-          ) : null}
-          {geocodeErrors.length > 0 ? (
-            <ul className="mt-3 space-y-1 text-xs leading-6 text-muted-foreground">
-              {geocodeErrors.map((error, index) => (
-                <li key={`geo-error-${index}`}>{error}</li>
-              ))}
-            </ul>
-          ) : null}
-          {routeErrors.length > 0 ? (
-            <ul className="mt-3 space-y-1 text-xs leading-6 text-muted-foreground">
-              {routeErrors.map((error, index) => (
-                <li key={`route-error-${index}`}>{error}</li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
-      ) : null}
+      {[...geocodeErrors, ...routeErrors].map((error, index) => (
+        <p key={`map-error-${index}`} className="mt-1.5 text-xs leading-5 text-muted-foreground">{error}</p>
+      ))}
     </div>
   );
 }
@@ -1316,6 +1257,7 @@ export function ItineraryDayRouteSection({
   onPatchItem,
   onActiveItemIdsChange,
   focusItemId,
+  compact,
 }: {
   day: TripItineraryDay;
   countryName: string;
@@ -1329,6 +1271,8 @@ export function ItineraryDayRouteSection({
   onActiveItemIdsChange: (itemIds: string[]) => void;
   /** Set from the timeline (outside this component) to pan the map to that item's marker. */
   focusItemId?: string | null;
+  /** Redesigned day-screen side panel (spec B1/B2/B28) — no large title, larger map, compact stats instead of a permanent segment list. Defaults to false so every other existing caller of this component keeps its current layout. */
+  compact?: boolean;
 }) {
   const [mapCollapsed, setMapCollapsed] = useState(false);
   const [fullscreenOpen, setFullscreenOpen] = useState(false);
@@ -1404,81 +1348,90 @@ export function ItineraryDayRouteSection({
     },
   } as const;
 
+  const selectedSegment = segments.find((entry) => entry.key === selectedSegmentKey) ?? null;
+  const controls = (
+    <div className="flex flex-wrap items-center gap-2">
+      {geocoding.loading || routing.loading ? (
+        <Badge variant="outline" className="gap-1">
+          <LoaderCircle className="size-3.5 animate-spin" />
+          מחשבים מסלול
+        </Badge>
+      ) : null}
+      {hasActualData ? (
+        <div className="flex items-center gap-1 rounded-full border border-border/60 bg-background/60 p-1">
+          {(["planned", "actual"] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setViewMode(mode)}
+              className={cn(
+                "rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+                viewMode === mode ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted/60"
+              )}
+            >
+              {mode === "planned" ? "מתוכנן" : "בפועל"}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {!compact ? (
+        <Button variant="outline" size="sm" onClick={() => setMapCollapsed((current) => !current)}>
+          {mapCollapsed ? <Expand className="size-4" /> : <Shrink className="size-4" />}
+          {mapCollapsed ? "הצג מפה" : "הסתר מפה"}
+        </Button>
+      ) : null}
+      <Button variant="outline" size="sm" className={compact ? undefined : "lg:hidden"} onClick={() => setFullscreenOpen(true)}>
+        <MapPinned className="size-4" />
+        {compact ? "מפה מלאה" : "פתח מפה מלאה"}
+      </Button>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => {
+          geocoding.retry();
+          routing.retry();
+        }}
+      >
+        <RotateCcw className="size-4" />
+        {compact ? null : "נסה שוב"}
+      </Button>
+    </div>
+  );
+
   return (
-    <section className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h5 className="font-heading text-lg font-semibold text-foreground">מפת המסלול היומית</h5>
-          <p className="mt-1 text-sm text-muted-foreground">
-            המפה מתעדכנת לפי העצירות, הלינה והמסלול של היום הנבחר.
-          </p>
+    <section className={compact ? "space-y-3" : "space-y-4"}>
+      {compact ? (
+        <div className="flex justify-end">{controls}</div>
+      ) : (
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h5 className="font-heading text-lg font-semibold text-foreground">מפת המסלול היומית</h5>
+            <p className="mt-1 text-sm text-muted-foreground">
+              המפה מתעדכנת לפי העצירות, הלינה והמסלול של היום הנבחר.
+            </p>
+          </div>
+          {controls}
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {geocoding.loading || routing.loading ? (
-            <Badge variant="outline" className="gap-1">
-              <LoaderCircle className="size-3.5 animate-spin" />
-              מחשבים מסלול
-            </Badge>
-          ) : null}
-          {hasActualData ? (
-            <div className="flex items-center gap-1 rounded-full border border-border/60 bg-background/60 p-1">
-              {(["planned", "actual"] as const).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  onClick={() => setViewMode(mode)}
-                  className={cn(
-                    "rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                    viewMode === mode ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted/60"
-                  )}
-                >
-                  {mode === "planned" ? "מתוכנן" : "בפועל"}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          <Button variant="outline" size="sm" onClick={() => setMapCollapsed((current) => !current)}>
-            {mapCollapsed ? <Expand className="size-4" /> : <Shrink className="size-4" />}
-            {mapCollapsed ? "הצג מפה" : "הסתר מפה"}
-          </Button>
-          <Button variant="outline" size="sm" className="lg:hidden" onClick={() => setFullscreenOpen(true)}>
-            <MapPinned className="size-4" />
-            פתח מפה מלאה
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              geocoding.retry();
-              routing.retry();
-            }}
-          >
-            <RotateCcw className="size-4" />
-            נסה שוב
-          </Button>
-        </div>
-      </div>
+      )}
 
       {!mapCollapsed ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(20rem,0.95fr)]">
-          <div className="space-y-3">
-            <DayMapCanvas {...sharedMapProps} />
-            {stops.length < 2 ? (
-              <div className="rounded-[22px] border border-dashed border-border/70 bg-background/70 p-4 text-sm text-muted-foreground">
-                {stops.length === 1
-                  ? "יש כרגע רק נקודה אחת עם קואורדינטות, לכן מוצג marker יחיד עד שנאסוף עוד נתוני מסלול."
-                  : "אין עדיין מספיק נקודות עם קואורדינטות כדי לחשב route מלא."}
-              </div>
-            ) : null}
-          </div>
-
-          <SegmentDetailPanel
-            segments={segments}
-            selectedSegmentKey={selectedSegmentKey}
-            onSelectSegment={(segmentKey) => {
-              setSelectedSegmentKey(segmentKey);
-              setSelectedStopKey(null);
-            }}
+        <div className="space-y-3">
+          <DayMapCanvas
+            {...sharedMapProps}
+            className={compact ? "h-[220px] sm:h-[280px] lg:h-[420px] xl:h-[480px]" : undefined}
+          />
+          {stops.length < 2 ? (
+            <div className="rounded-[18px] border border-dashed border-border/70 bg-background/70 p-3 text-xs text-muted-foreground">
+              {stops.length === 1
+                ? "יש כרגע רק נקודה אחת עם קואורדינטות, לכן מוצג marker יחיד עד שנאסוף עוד נתוני מסלול."
+                : "אין עדיין מספיק נקודות עם קואורדינטות כדי לחשב מסלול מלא."}
+            </div>
+          ) : null}
+          <DayRouteStats day={hydratedDay} segments={segments} />
+          {selectedSegment ? (
+            <SelectedSegmentDetail segment={selectedSegment} onClose={() => setSelectedSegmentKey(null)} />
+          ) : null}
+          <MapDataStatus
             unresolvedNames={geocoding.unresolvedNames}
             geocodeErrors={Object.values(geocoding.errors)}
             routeErrors={Object.values(routing.errors)}

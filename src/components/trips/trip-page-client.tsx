@@ -25,6 +25,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TripAccommodationTab } from "@/components/trips/trip-accommodation-tab";
+import { DeleteTripDialog } from "@/components/trips/delete-trip-dialog";
+import { TripFoodTab } from "@/components/trips/trip-food-tab";
 import { TripBudgetTab } from "@/components/trips/trip-budget-tab";
 import { TripHeroHeader } from "@/components/trips/trip-hero-header";
 import { TripItineraryTab } from "@/components/trips/trip-itinerary-tab";
@@ -33,6 +35,8 @@ import { TripPrimaryMetrics } from "@/components/trips/trip-primary-metrics";
 import { TripTabNav, type TripTabValue } from "@/components/trips/trip-tab-nav";
 import { TripTransportTab } from "@/components/trips/trip-transport-tab";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
+import { formatTripDateRangeExpanded } from "@/lib/format";
+import { itineraryDisplayTitle } from "@/lib/itinerary-pdf-export";
 import { appendDocument } from "@/lib/trip-documents";
 import type { ReadinessCategory } from "@/lib/trip-readiness";
 import { useCountryByIso } from "@/lib/queries/countries";
@@ -127,6 +131,16 @@ export function TripPageClient({ tripId }: { tripId: string }) {
     router.replace(`/trips/${tripId}?${params.toString()}`, { scroll: false });
   }
 
+  // Section "FOOD TAB FILTERING" — clicking a meal opportunity in the
+  // itinerary opens the Food tab already focused on that exact day/slot,
+  // never a generic unscoped Food tab.
+  const [foodFocus, setFoodFocus] = useState<{ dayId: string; slot: "breakfast" | "lunch" | "dinner"; token: number } | null>(null);
+  function openFoodOpportunity(dayId: string, dayPart: string) {
+    const slot = dayPart === "morning" ? "breakfast" : dayPart === "dinner" ? "dinner" : "lunch";
+    setFoodFocus({ dayId, slot, token: Date.now() });
+    goToTab("food");
+  }
+
   if (isLoading || !isFetched) return <TripPageSkeleton />;
   if (!lookupResult) return <TripNotFound />;
   if (!draft || !country) return <TripPageSkeleton />;
@@ -148,11 +162,6 @@ export function TripPageClient({ tripId }: { tripId: string }) {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "עדכון השם נכשל");
     }
-  }
-
-  async function handleDelete() {
-    await controller.handleDelete(draft!.id);
-    router.push("/trips");
   }
 
   function handleReadinessIssueClick(section: ReadinessCategory["section"]) {
@@ -207,7 +216,7 @@ export function TripPageClient({ tripId }: { tripId: string }) {
               <DropdownMenuItem onClick={() => void controller.handleArchive(draft!.id)}>
                 העבר לארכיון
               </DropdownMenuItem>
-              <DropdownMenuItem variant="destructive" onClick={() => void handleDelete()}>
+              <DropdownMenuItem variant="destructive" onClick={() => controller.requestDelete(draft!)}>
                 מחק
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -241,6 +250,7 @@ export function TripPageClient({ tripId }: { tripId: string }) {
             onPatchDraft={controller.patchDraft}
             onRegenerateDay={(dayId) => void controller.handleRegenerate(draft.id, "day", dayId)}
             isRegenerating={controller.isRegenerating}
+            onOpenFoodOpportunity={openFoodOpportunity}
           />
         ) : null}
 
@@ -262,6 +272,16 @@ export function TripPageClient({ tripId }: { tripId: string }) {
             countryName={country.name}
             flights={draft.preferencesSnapshot.flights}
             onPatchDay={controller.patchDay}
+          />
+        ) : null}
+        {activeTab === "food" ? (
+          <TripFoodTab
+            days={draft.itineraryDays}
+            isoA2={draft.isoA2}
+            onPatchDay={controller.patchDay}
+            focusDayId={foodFocus?.dayId ?? null}
+            focusSlot={foodFocus?.slot ?? null}
+            focusToken={foodFocus?.token ?? null}
           />
         ) : null}
         {activeTab === "transport" ? <TripTransportTab days={draft.itineraryDays} /> : null}
@@ -348,9 +368,29 @@ export function TripPageClient({ tripId }: { tripId: string }) {
         onRegenerate={controller.handleRegenerate}
         onRestore={controller.handleRestore}
         onArchive={controller.handleArchive}
-        onDelete={() => handleDelete()}
+        onDelete={() => controller.requestDelete(draft!)}
         onExport={controller.exportItinerary}
       />
+
+      {controller.deleteTarget ? (
+        <DeleteTripDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) controller.cancelDelete();
+          }}
+          tripName={itineraryDisplayTitle(controller.deleteTarget, country.name)}
+          tripDates={formatTripDateRangeExpanded(
+            controller.deleteTarget.startDate,
+            controller.deleteTarget.endDate,
+            controller.deleteTarget.preferencesSnapshot.partialDate
+          )}
+          tripDuration={`${controller.deleteTarget.daysCount} ימים`}
+          onConfirm={async () => {
+            await controller.confirmDelete();
+            router.push("/trips");
+          }}
+        />
+      ) : null}
     </div>
   );
 }

@@ -12,7 +12,10 @@ import {
 } from "../src/lib/server/country-itinerary-generation";
 import {
   buildFallbackAiItinerary,
+  buildLegalDayCandidatePool,
+  createItineraryUsageState,
   isCandidateGeographicallyCompatibleWithDay,
+  selectFallbackCandidate,
   type AiGeneratedDay,
   type AiGeneratedItem,
   type AiItineraryRequest,
@@ -225,7 +228,7 @@ test("pickReplacementRecommendation never replaces a City A item with a globally
     day,
     item: day.items[0],
     profile,
-    usedPlaceKeys: new Set(),
+    usageState: createItineraryUsageState(),
   });
 
   assert.ok(replacement, "a real, geographically compatible replacement must still be found");
@@ -257,7 +260,7 @@ test("pickReplacementRecommendation accepts a Region D candidate on a genuine da
     day: dayTripDay,
     item: dayTripDay.items[0],
     profile,
-    usedPlaceKeys: new Set(),
+    usageState: createItineraryUsageState(),
   });
 
   // Not asserting it MUST pick this specific candidate (scoring may prefer
@@ -298,6 +301,57 @@ test("diversifyActivities cannot import a wrong-region candidate even to balance
   assert.ok(
     !repaired[0].items.some((item) => item.name === "City B Nature Reserve"),
     "a wrong-region candidate must never be imported just to satisfy a diversity/tier quota"
+  );
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — diversifyActivities has its own
+// PARALLEL candidate search (it never goes through
+// pickReplacementRecommendation at all, unlike every other repair pass —
+// a real discrepancy found while writing this test: the earlier
+// investigation had assumed it shared the same call path), so the
+// generic fix inside pickReplacementRecommendation does not cover it —
+// this one needed its own, separate fix. Its own geo-compatibility check
+// used to hand a day view that still included the item being swapped
+// out, so a candidate close only to IT (never to the day's real anchor)
+// could pass. Unlike the test above (where the day has no far item at
+// all, so there's nothing for a bad candidate to hide behind), here the
+// item BEING REPLACED is itself the far one — the exact shape the bug
+// needed. Candidate category is deliberately NOT "museum" — diversifyActivities
+// only ever considers a candidate from a DIFFERENT category than the one
+// being diversified away from, by design.
+test("diversifyActivities never selects a replacement close only to the item it's swapping out, not to the day's real anchor", () => {
+  const fakeNearbyToTarget = buildRecommendation({
+    id: "fake-near-target",
+    name: "Fake Nearby To Target Only",
+    category: "nature",
+    location: "Nowhere Real",
+    // Close to the far museum (11.26, 10) — far from the real base City A (10, 10).
+    lat: 11.261,
+    lon: 10.001,
+  });
+  const day = buildDay({
+    dayNumber: 1,
+    transportation: "רכב",
+    items: [
+      buildItem({ name: "City A Anchor", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon, transportation: "רכב" }),
+      // ~140km from City A — the dominant-category item diversifyActivities
+      // will pick to swap out.
+      buildItem({ name: "Far Museum", category: "museum", slot: "afternoon", lat: 11.26, lon: 10, transportation: "רכב" }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [fakeNearbyToTarget] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  const repaired = diversifyActivities([day], payload, profile, "museum", []);
+
+  // diversifyActivities has no free-exploration fallback of its own — a
+  // day with no valid candidate simply keeps its original item untouched
+  // (unlike every other repair pass tested this round), so the real
+  // assertion here is narrower: the rejected far candidate specifically
+  // must never appear, regardless of whether Far Museum itself survives.
+  assert.ok(
+    !repaired[0].items.some((item) => item.name === "Fake Nearby To Target Only"),
+    "a candidate close only to the item being swapped out must never be selected"
   );
 });
 
@@ -398,4 +452,163 @@ test("buildFallbackAiItinerary never mixes City A and City B content within the 
       `day ${day.dayNumber} mixes City A and City B content: ${itemsWithCoords.map((item) => `${item.name}@${item.lat}`).join(", ")}`
     );
   }
+});
+
+// Real bug found via a real 44-day US QA run: a transfer day's own practical
+// item (checkout/transfer block, lat/lon both null) is pushed into
+// existingItems BEFORE selectFallbackCandidate is ever called for that day's
+// real slots — so existingItems.length was never 0 by the time this ran,
+// the pool-based area anchor never got seeded, and the hard geographic
+// filter had zero coordinate anchors to judge against (silently passing
+// everything). This is the same "target/context excluded itself out of the
+// safe path" shape as pickReplacementRecommendation's original bug, just
+// triggered by a coordinate-less existing item instead of a self-referential
+// one. A dummy no-coordinate transfer item is the fixture below precisely
+// because that's the real trigger, not an incidental detail.
+// Built via object-spread AFTER buildItem, not through its overrides param
+// — that helper's own lat/lon use `??`, which treats an explicit `null`
+// override as "not provided" and falls back to CITY_A's coordinates,
+// silently defeating the whole point of this fixture.
+const NO_COORDS_TRANSFER_ITEM = { ...buildItem({ name: "Checkout block", category: "practical" }), lat: null, lon: null };
+
+test("selectFallbackCandidate picks the geographically-correct candidate over a higher-scoring far one, even on a transfer day (no-coordinate existing item)", () => {
+  const closeCandidate = buildRecommendation({
+    id: "close-city-a",
+    name: "City A Real Stop",
+    category: "attraction",
+    location: "City A",
+    lat: CITY_A.lat,
+    lon: CITY_A.lon,
+  });
+  const farCandidate = buildRecommendation({
+    id: "far-city-b",
+    name: "City B Landmark Stop",
+    category: "attraction",
+    location: "City B",
+    lat: CITY_B.lat,
+    lon: CITY_B.lon,
+    recommendedTimeOfDay: "morning",
+  });
+
+  const picked = selectFallbackCandidate({
+    pool: [closeCandidate, farCandidate],
+    slot: "morning",
+    template: { kind: "transfer", titleHint: "", slots: ["morning"], maxStops: 3, notes: "", restWindow: "" },
+    preferredArea: "City A",
+    previousItem: null,
+    existingItems: [NO_COORDS_TRANSFER_ITEM],
+    usedToday: new Set<string>(),
+    usageCounts: new Map<string, number>(),
+    usedRealPlaces: [],
+    // Stacked scoring bonuses give the FAR candidate a real score advantage
+    // (recommendedTimeOfDay exact match +14, selectedIds +12, keyword match
+    // +12 = 38) that comfortably beats the close candidate's own area-label
+    // match bonus (+24) — under the old (no-op-when-uncoordinated) filter
+    // this alone would be enough for the far candidate to win on score.
+    selectedIds: new Set([farCandidate.id]),
+    preferredKeywords: ["landmark"],
+    avoidKeywords: [],
+  });
+
+  assert.equal(picked?.id, closeCandidate.id, "the geographically-correct candidate must win even when the far one scores higher");
+});
+
+test("selectFallbackCandidate returns null (never the closest of only-far candidates) when nothing real is geographically compatible", () => {
+  // Anchor-only: establishes City A's real coordinate anchor via the pool
+  // (the exact mechanism the fix widens), but is excluded from actual
+  // candidate selection via usedToday — so it can never itself be "the"
+  // answer, only prove an anchor was available to judge against.
+  const anchorOnly = buildRecommendation({
+    id: "anchor-city-a",
+    name: "City A Anchor",
+    category: "attraction",
+    location: "City A",
+    lat: CITY_A.lat,
+    lon: CITY_A.lon,
+  });
+  const farCandidate = buildRecommendation({
+    id: "far-city-b-2",
+    name: "City B Only Option",
+    category: "attraction",
+    location: "City B",
+    lat: CITY_B.lat,
+    lon: CITY_B.lon,
+  });
+
+  const picked = selectFallbackCandidate({
+    pool: [anchorOnly, farCandidate],
+    slot: "morning",
+    template: { kind: "transfer", titleHint: "", slots: ["morning"], maxStops: 3, notes: "", restWindow: "" },
+    preferredArea: "City A",
+    previousItem: null,
+    existingItems: [NO_COORDS_TRANSFER_ITEM],
+    usedToday: new Set([anchorOnly.id]),
+    usageCounts: new Map<string, number>(),
+    usedRealPlaces: [],
+    selectedIds: new Set<string>(),
+    preferredKeywords: [],
+    avoidKeywords: [],
+  });
+
+  assert.equal(picked, null, "must fall through to null (the caller's placeholder path), never the far candidate");
+});
+
+// ===== buildLegalDayCandidatePool — Point D/G invariants =====
+// Real bug this closes: the deterministic fallback used to draw from an
+// unrestricted pool with filters duplicated inline — this is that same
+// logic, now a single named/testable function every caller (currently
+// selectFallbackCandidate) routes through, so "never a global unrestricted
+// pool" is a real, checkable property instead of an inline convention.
+
+test("buildLegalDayCandidatePool: a cross-owner (wrong-city) candidate is excluded even when nothing else is filtered", () => {
+  const nearCandidate = buildRecommendation({ id: "near-1", name: "City A Place", location: "City A", lat: CITY_A.lat, lon: CITY_A.lon });
+  const farCandidate = buildRecommendation({ id: "far-1", name: "City B Place", location: "City B", lat: CITY_B.lat, lon: CITY_B.lon });
+
+  const legalPool = buildLegalDayCandidatePool({
+    pool: [nearCandidate, farCandidate],
+    ownerAnchors: [CITY_A],
+    usedToday: new Set(),
+    usageCounts: new Map(),
+    usedRealPlaces: [],
+  });
+
+  assert.deepEqual(legalPool.map((c) => c.id), ["near-1"], "a genuinely different city must never be in the legal pool for this owner");
+});
+
+test("buildLegalDayCandidatePool: an already-used real place (by id, by usage count, or by fuzzy name+coordinate identity) is excluded", () => {
+  const usedById = buildRecommendation({ id: "used-by-id", name: "Used By Id", location: "City A", lat: CITY_A.lat, lon: CITY_A.lon });
+  const usedByCount = buildRecommendation({ id: "used-by-count", name: "Used By Count", location: "City A", lat: CITY_A.lat, lon: CITY_A.lon });
+  const usedByFuzzy = buildRecommendation({
+    id: "different-id-same-place",
+    name: "Old Town Market",
+    location: "City A",
+    lat: CITY_A.lat + 0.0001,
+    lon: CITY_A.lon + 0.0001,
+  });
+  const freshCandidate = buildRecommendation({ id: "fresh-1", name: "Fresh Place", location: "City A", lat: CITY_A.lat, lon: CITY_A.lon });
+
+  const legalPool = buildLegalDayCandidatePool({
+    pool: [usedById, usedByCount, usedByFuzzy, freshCandidate],
+    ownerAnchors: [CITY_A],
+    usedToday: new Set(["used-by-id"]),
+    usageCounts: new Map([["used-by-count", 1]]),
+    usedRealPlaces: [{ nameSlug: "old town market", lat: CITY_A.lat, lon: CITY_A.lon }],
+  });
+
+  assert.deepEqual(legalPool.map((c) => c.id), ["fresh-1"], "every already-used real place must be excluded, regardless of which tracking mechanism caught it");
+});
+
+test("buildLegalDayCandidatePool: a day_trip day is exempt from the geographic gate (matches isCandidateGeographicallyCompatibleWithDay's own contract)", () => {
+  const farCandidate = buildRecommendation({ id: "far-1", name: "City B Place", location: "City B", lat: CITY_B.lat, lon: CITY_B.lon });
+
+  const legalPool = buildLegalDayCandidatePool({
+    pool: [farCandidate],
+    ownerAnchors: [CITY_A],
+    isDayTripDay: true,
+    usedToday: new Set(),
+    usageCounts: new Map(),
+    usedRealPlaces: [],
+  });
+
+  assert.deepEqual(legalPool.map((c) => c.id), ["far-1"]);
 });

@@ -26,8 +26,41 @@ import {
   type TripItineraryDay,
   type TripItineraryItem,
   type TripPreferences,
+  type TripRecommendation,
 } from "../src/lib/trip-workspace";
 import type { CountryItineraryRecord } from "../src/lib/itineraries";
+
+function recommendation(overrides: Partial<TripRecommendation> = {}): TripRecommendation {
+  return {
+    id: overrides.id ?? "rec-1",
+    name: overrides.name ?? "Sample Place",
+    category: overrides.category ?? "attraction",
+    location: overrides.location ?? "Tokyo",
+    shortDescription: overrides.shortDescription ?? "Sample description",
+    estimatedDurationMinutes: overrides.estimatedDurationMinutes ?? 90,
+    approximatePrice: overrides.approximatePrice ?? 120,
+    openingHours: overrides.openingHours ?? "09:00-18:00",
+    recommendedTimeOfDay: overrides.recommendedTimeOfDay ?? "afternoon",
+    reservationRequired: overrides.reservationRequired ?? false,
+    priceOriginalAmount: overrides.priceOriginalAmount ?? null,
+    priceOriginalCurrency: overrides.priceOriginalCurrency ?? null,
+    priceConvertedAmount: overrides.priceConvertedAmount ?? null,
+    priceExchangeRate: overrides.priceExchangeRate ?? null,
+    priceRateTimestamp: overrides.priceRateTimestamp ?? null,
+    convertedCurrency: overrides.convertedCurrency ?? null,
+    sourceType: overrides.sourceType ?? null,
+    mapLink: overrides.mapLink ?? "",
+    imageUrl: overrides.imageUrl ?? "",
+    imageQuery: overrides.imageQuery ?? "",
+    lat: overrides.lat ?? 35.68,
+    lon: overrides.lon ?? 139.76,
+    source: overrides.source ?? "api",
+    wikipediaUrl: overrides.wikipediaUrl ?? null,
+    website: overrides.website ?? null,
+    wheelchairAccessible: overrides.wheelchairAccessible ?? null,
+    isFree: overrides.isFree ?? null,
+  };
+}
 
 const BASE_PREFERENCES: TripPreferences = createDefaultWorkspace("Japan").preferences;
 
@@ -197,6 +230,44 @@ test("applyDeterministicReplacement only changes the targeted item within its da
   assert.equal(resultDay.items[0].name, "Keep Me");
   assert.equal(resultDay.items[1].id, "target");
   assert.notEqual(resultDay.items[1].name, "Closed Place");
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — applyDeterministicReplacement (Live
+// Trip Mode's "skip/replace this" fast path) used to hand
+// pickReplacementRecommendation a day view that still included the item
+// being replaced, so a candidate close only to IT (never to the day's
+// real anchor) could pass.
+test("applyDeterministicReplacement never selects a replacement close only to the target item itself, not to the day's real anchor", () => {
+  const baseAnchor = item({ id: "base", name: "Base Anchor", lat: 10, lon: 10, transportation: "רכב" });
+  // ~140km — pickReplacementRecommendation here gets no maxDistanceKm
+  // override, so it falls back to the fixed 80km default
+  // (CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM); explicit "רכב" keeps the
+  // resulting travel time schedulable rather than risking the
+  // scheduling-overflow trap found earlier this round.
+  const targetItem = item({ id: "target", name: "Closed Place", lat: 11.26, lon: 10, transportation: "רכב" });
+  const testDay = day({ items: [baseAnchor, targetItem] });
+  const payload = buildPayload({
+    recommendations: [
+      recommendation({
+        id: "fake-near-target",
+        name: "Fake Nearby To Target Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        // Close to the target item (11.26, 10) — far from the real base (10, 10).
+        lat: 11.261,
+        lon: 10.001,
+      }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(BASE_PREFERENCES, "Japan", 1);
+
+  const { day: resultDay } = applyDeterministicReplacement(testDay, targetItem, payload, profile);
+
+  assert.ok(!resultDay.items.some((entry) => entry.name === "Closed Place"), "the target item must not survive under its original name");
+  assert.ok(
+    !resultDay.items.some((entry) => entry.name === "Fake Nearby To Target Only"),
+    "a candidate close only to the target item being replaced must never be selected"
+  );
 });
 
 // 9. computeNextActivity ignores completed/skipped items even when they

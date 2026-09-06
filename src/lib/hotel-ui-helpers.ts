@@ -3,7 +3,12 @@
 // runtime import) so client components never pull in src/lib/hotels.ts's
 // server-only Overpass dependency just to use this logic.
 import type { RankedHotel } from "@/lib/hotels";
-import { buildMapLink, detectHotelBaseMismatch, type TripItineraryDay } from "@/lib/trip-workspace";
+import {
+  buildMapLink,
+  detectHotelBaseMismatch,
+  HOTEL_BASE_MISMATCH_KM,
+  type TripItineraryDay,
+} from "@/lib/trip-workspace";
 
 /**
  * Whether a real hotel was explicitly chosen for this day, vs. still
@@ -88,7 +93,8 @@ export function pickHotelComparisonWinners(hotels: RankedHotel[]): HotelComparis
  */
 export function buildHotelSelectionPatch(
   hotel: Pick<RankedHotel, "name" | "lat" | "lon">,
-  activityClusters: Array<{ lat: number; lon: number }> = []
+  activityClusters: Array<{ lat: number; lon: number }> = [],
+  thresholdKm?: number
 ): Pick<
   TripItineraryDay,
   "accommodation" | "accommodationMapLink" | "accommodationLat" | "accommodationLon" | "accommodationBaseMismatch"
@@ -98,6 +104,38 @@ export function buildHotelSelectionPatch(
     accommodationMapLink: buildMapLink(hotel.name, hotel.lat, hotel.lon),
     accommodationLat: hotel.lat,
     accommodationLon: hotel.lon,
-    accommodationBaseMismatch: detectHotelBaseMismatch({ lat: hotel.lat, lon: hotel.lon }, activityClusters),
+    accommodationBaseMismatch: detectHotelBaseMismatch(
+      { lat: hotel.lat, lon: hotel.lon },
+      activityClusters,
+      thresholdKm ?? HOTEL_BASE_MISMATCH_KM
+    ),
   };
+}
+
+/**
+ * A real, worldwide-generic location-fit sentence (spec "HOTEL LOCATION
+ * QUALITY") — thresholds are fractions of the SAME
+ * normalDayTravelBudgetMinutes the planner itself already uses for this
+ * destination (DestinationMobilityProfile), never a fixed number of
+ * minutes: a compact destination's "excellent" is a much smaller number of
+ * minutes than a large/sparse destination's.
+ */
+export function deriveHotelLocationQualityLabel(
+  averageActivityTravelMinutes: number | null,
+  normalDayTravelBudgetMinutes: number
+): string {
+  if (averageActivityTravelMinutes == null) {
+    return "אין מספיק נתוני מיקום כדי לדרג את מיקום המלון.";
+  }
+  const ratio = averageActivityTravelMinutes / normalDayTravelBudgetMinutes;
+  if (ratio <= 0.25) {
+    return `מצוין — רוב הפעילויות במרחק של כ-${averageActivityTravelMinutes} דק' מהמלון.`;
+  }
+  if (ratio <= 0.5) {
+    return `טוב — נסיעות קצרות יחסית לרוב הפעילויות (כ-${averageActivityTravelMinutes} דק' בממוצע).`;
+  }
+  if (ratio <= 1) {
+    return `בינוני — כמה נסיעות ארוכות יחסית לפעילויות המתוכננות (כ-${averageActivityTravelMinutes} דק' בממוצע).`;
+  }
+  return `חלש — המלון רחוק ממרכז הפעילויות של הבסיס הזה (כ-${averageActivityTravelMinutes} דק' נסיעה בממוצע).`;
 }

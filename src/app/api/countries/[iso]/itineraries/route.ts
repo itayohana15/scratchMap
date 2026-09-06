@@ -11,9 +11,13 @@ import {
 } from "@/lib/server/country-itineraries";
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { AiItineraryRequest } from "@/lib/trip-workspace";
+import { isPlannerQaTraceEnabled } from "@/lib/planner-qa-trace";
 
+// Hygiene pass — see country-itineraries.ts's identical devLog for why
+// this is gated behind the QA/debug flags instead of NODE_ENV: it used to
+// print on every single non-production request with no way to turn it off.
 function devLog(message: string, details?: Record<string, unknown>) {
-  if (process.env.NODE_ENV === "production") return;
+  if (!isPlannerQaTraceEnabled()) return;
   if (details) console.log(`[Itinerary] ${message}`, details);
   else console.log(`[Itinerary] ${message}`);
 }

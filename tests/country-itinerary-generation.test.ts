@@ -9,8 +9,13 @@ import {
   type PlanDiagnostics,
 } from "../src/lib/server/itinerary-generation-constraints";
 import {
+  buildDeterministicTripFrame,
+  buildFallbackMealPlaceholder,
   buildFreeExplorationReplacement,
   buildItemKey,
+  computeAreaWeightsFromClusters,
+  pickReplacementRecommendation,
+  repairNormalDayTravelOutliers,
   enforceBudgetOnDays,
   fillUnderfilledDay,
   fixOverloadedDays,
@@ -20,6 +25,11 @@ import {
   ensureArrivalDepartureDayHasContent,
   enforceArrivalDepartureWindow,
   attemptStayStructureRepair,
+  computeGeographyDiagnostics,
+  summarizeGeographyDiagnostics,
+  deriveDayType,
+  enforceNormalDayLocality,
+  enforceTransportRoleGuard,
   enforceStayTransitions,
   removeFuzzyDuplicatePlaces,
   ensureWeatherBackup,
@@ -34,11 +44,25 @@ import {
   insertMissingMeals,
   resequenceDayItems,
   repairOpeningHoursViolations,
+  repairPlan,
   resolveCanonicalPlaceId,
   resolveItemPriceFields,
   scoreMealCandidate,
+  type RawGeneratedPlan,
+  type RawGeneratedItem,
 } from "../src/lib/server/country-itinerary-generation";
-import { buildFallbackAiItinerary, selectFallbackCandidate } from "../src/lib/trip-workspace";
+import {
+  buildFallbackAiItinerary,
+  buildLegalDayCandidatePool,
+  computeDestinationMobilityProfile,
+  createItineraryUsageState,
+  buildItineraryUsageState,
+  isItineraryPlaceUsed,
+  registerItineraryUsage,
+  releaseItineraryUsage,
+  isMealOpportunityMarker,
+  selectFallbackCandidate,
+} from "../src/lib/trip-workspace";
 import type { StayTransition, TripFrame } from "../src/lib/server/itinerary-planning-principles";
 import type {
   AiGeneratedDay,
@@ -121,6 +145,7 @@ function buildItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
   return {
     name: overrides.name ?? "Sample Stop",
     category: overrides.category ?? "attraction",
+    itemRole: overrides.itemRole,
     location: overrides.location ?? "Tokyo",
     shortDescription: overrides.shortDescription ?? "Sample stop",
     slot: overrides.slot ?? "morning",
@@ -265,6 +290,47 @@ test("enforceBudgetOnDays caps a wildly over-budget plan instead of leaving it ~
   assert.ok(
     totalAfter <= profile.budgetHardCeiling! * 1.05,
     `expected repaired total (${totalAfter}) to land near the ₪22,500 budget's hard ceiling (${profile.budgetHardCeiling}), not stay in the hundreds of thousands`
+  );
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — enforceBudgetOnDays' own replacement
+// call used to hand pickReplacementRecommendation a day view that still
+// included the over-cap item being replaced, so a candidate close only
+// to IT (never to the day's real anchor) could pass.
+test("enforceBudgetOnDays never selects a replacement close only to the over-cap item itself, not to the day's real anchor", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 1);
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({
+        id: "fake-near-overcap",
+        name: "Fake Nearby To Over-Cap Item Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        approximatePrice: 10,
+        // Close to the over-cap item (11.26, 10) — far from the real base (10, 10).
+        lat: 11.261,
+        lon: 10.001,
+      }),
+    ],
+  });
+  const day = buildDay({
+    estimatedCost: 30010,
+    activityCost: 30010,
+    transportation: "רכב",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", approximatePrice: 10, lat: 10, lon: 10, transportation: "רכב" }),
+      // ~140km from Base Anchor, explicit "רכב" to keep the recomputed
+      // travel time schedulable rather than risking the scheduling-overflow
+      // trap found earlier this round.
+      buildItem({ name: "Over-Cap Item", category: "attraction", slot: "afternoon", approximatePrice: 30000, lat: 11.26, lon: 10, transportation: "רכב" }),
+    ],
+  });
+
+  const [repaired] = enforceBudgetOnDays([day], payload, profile);
+
+  assert.ok(
+    !repaired.items.some((item) => item.name === "Fake Nearby To Over-Cap Item Only"),
+    "a candidate close only to the over-cap item being replaced must never be selected"
   );
 });
 
@@ -457,7 +523,7 @@ test("rebalanceDayItems replaces a restaurant that repeats across many days", ()
   });
   const profile = buildTripPreferenceProfile(basePreferences, "Japan", 5);
 
-  const usedPlaceKeys = new Set<string>();
+  const usageState = createItineraryUsageState();
   const repeatedItem = () =>
     buildItem({
       name: "Same Restaurant Every Night",
@@ -473,7 +539,7 @@ test("rebalanceDayItems replaces a restaurant that repeats across many days", ()
       buildDay({ dayNumber, items: [repeatedItem()] }),
       payload,
       profile,
-      usedPlaceKeys
+      usageState
     )
   );
 
@@ -526,6 +592,54 @@ test("repairDayGeography replaces an item with impossible coordinates", () => {
   assert.equal(repaired.items.some((item) => item.name === "Broken Coordinates Spot"), false);
 });
 
+// Spec "תיקון גנרי, לא תיקון תשיעי" — repairDayGeography's own cross-city
+// outlier swap used to hand pickReplacementRecommendation a day view that
+// still included the outlier being replaced, so a candidate close only to
+// IT (never to the day's real primary anchor) could pass.
+test("repairDayGeography's cross-city outlier swap never selects a replacement close only to the outlier itself", () => {
+  // repairDayGeography retries internally up to 4 times — with only ONE
+  // bad candidate in the pool, a first (buggy) selection gets "used up"
+  // (usedPlaceKeys) and the SECOND attempt then has nothing left to pick,
+  // falling to free exploration regardless of geography. That self-heals
+  // the symptom on its own, silently passing this test even without the
+  // real fix — several near-outlier-only candidates (one per possible
+  // attempt) close that gap, since pool exhaustion alone can no longer
+  // explain a passing result.
+  const nearOutlierCandidates = Array.from({ length: 5 }, (_, index) =>
+    buildRecommendation({
+      id: `fake-near-outlier-${index}`,
+      name: `Fake Nearby To Outlier Only ${index}`,
+      category: "attraction",
+      location: "Nowhere Real",
+      // Close to the outlier (11.26, 10) — far from the real base (10, 10).
+      lat: 11.261 + index * 0.001,
+      lon: 10.001,
+    })
+  );
+  const payload = buildPayload({ recommendations: nearOutlierCandidates });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  // ~140km (well past DISTANT_CITY_DISTANCE_KM=80) with explicit "רכב" —
+  // real-world walking-speed distances risk a scheduling overflow that
+  // would mask whether geography is what's actually rejecting the
+  // candidate (the same trap found and worked around earlier this round).
+  const day = buildDay({
+    transportation: "רכב",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 10, lon: 10, transportation: "רכב" }),
+      buildItem({ name: "Distant Outlier", category: "attraction", slot: "afternoon", lat: 11.26, lon: 10, transportation: "רכב" }),
+    ],
+  });
+
+  const repaired = repairDayGeography(day, payload, profile);
+
+  assert.ok(!repaired.items.some((item) => item.name === "Distant Outlier"), "outlier must not survive under its original name");
+  assert.ok(
+    !repaired.items.some((item) => item.name.startsWith("Fake Nearby To Outlier Only")),
+    "a candidate close only to the outlier being replaced (not to the day's real primary anchor) must never be selected"
+  );
+});
+
 // Spec items 49/50/76: theme and canonicalPlaceId are always derived for
 // real, regardless of the AI's own title, once a day passes through the
 // shared derivation pass (fillDerivedDayFields, exercised here via
@@ -543,6 +657,115 @@ test("fillDerivedDayFields derives a content-matched theme and a real canonicalP
   const filled = fillDerivedDayFields(day, payload);
   assert.equal(filled.theme, "תרבות");
   assert.equal(filled.items.find((item) => item.name === "City Museum")?.canonicalPlaceId, "id:rec-museum");
+});
+
+// Spec "gav nv abrtv kl vfh yuc" (Phase B) — a Gemini-stated travelMinutes
+// is invented text, not a real geographic computation; the model has no
+// way to actually know the distance between two coordinates. Real
+// coordinates must always win when both endpoints have them, and the
+// result must scale with real distance across every order of magnitude —
+// never saturate at a fixed ceiling regardless of how far apart the two
+// points really are. Anchor point ("Point A") and three second points at
+// increasing distance orders of magnitude — invented coordinates, not
+// real named places, per this suite's own convention.
+test("fillDerivedDayFields: real coordinates always win over a Gemini-stated travelMinutes, and the result is strictly monotonic across distance orders of magnitude", () => {
+  const payload = buildPayload();
+  const anchorLat = 10;
+  const anchorLon = 10;
+
+  function travelMinutesAtDistance(targetLat: number, targetLon: number): number {
+    const day = buildDay({
+      items: [
+        buildItem({ name: "Point A (anchor)", lat: anchorLat, lon: anchorLon, travelMinutes: 20 }),
+        // Every candidate here states the exact SAME Gemini-invented
+        // travelMinutes (145) regardless of its real distance from the
+        // anchor — reproducing the real-world symptom verbatim (Thor's
+        // Well/Letchworth/Mendenhall/Magnificent Mile/Pioneer
+        // Saloon/Mystery Spot all logged travelMinutes: 145 from the same
+        // base, at wildly different real distances).
+        buildItem({ name: "Point B (candidate)", lat: targetLat, lon: targetLon, travelMinutes: 145 }),
+      ],
+    });
+    const filled = fillDerivedDayFields(day, payload);
+    return filled.items.find((item) => item.name === "Point B (candidate)")!.travelMinutes!;
+  }
+
+  // Within-city order of magnitude (~2km).
+  const withinCity = travelMinutesAtDistance(10.02, 10);
+  // Between-nearby-cities order of magnitude (~50km).
+  const betweenNearbyCities = travelMinutesAtDistance(10.45, 10);
+  // Cross-continent order of magnitude (~8,000km — opposite hemisphere).
+  const crossContinent = travelMinutesAtDistance(-60, 130);
+
+  assert.notEqual(withinCity, 145, "the real, recomputed value must replace Gemini's invented 145, not just happen to also equal it");
+  assert.notEqual(betweenNearbyCities, 145);
+  assert.notEqual(crossContinent, 145);
+
+  assert.ok(
+    withinCity < betweenNearbyCities,
+    `within-city (${withinCity}min) must be less than between-nearby-cities (${betweenNearbyCities}min)`
+  );
+  assert.ok(
+    betweenNearbyCities < crossContinent,
+    `between-nearby-cities (${betweenNearbyCities}min) must be less than cross-continent (${crossContinent}min)`
+  );
+  assert.notEqual(withinCity, betweenNearbyCities, "no two distance orders of magnitude may collapse to the same value");
+  assert.notEqual(betweenNearbyCities, crossContinent);
+
+  // The specific "3 hours vs 40 hours must not be equal" acceptance case:
+  // cross-continent must be dramatically larger, not just marginally so
+  // (a genuine saturation bug would show up as "barely bigger" or
+  // identical, not proportbig to real distance).
+  assert.ok(
+    crossContinent > withinCity * 20,
+    `a ~8,000km hop (${crossContinent}min) must be dramatically larger than a ~2km one (${withinCity}min), never saturated toward it`
+  );
+});
+
+test("fillDerivedDayFields: a synthetic stay-transition item (canonicalPlaceId starting with 'transition:') keeps its own mode-aware travelMinutes, never recomputed from the generic haversine estimate", () => {
+  const payload = buildPayload();
+  const day = buildDay({
+    items: [
+      buildItem({ name: "Point A (anchor)", lat: 10, lon: 10 }),
+      buildItem({
+        name: "Flight: City A → City B",
+        category: "transportation",
+        canonicalPlaceId: "transition:City A->City B",
+        // Real coordinates far enough away that the generic haversine
+        // estimate would produce a very different number than this
+        // already-correct, mode-aware value (e.g. a real flight duration
+        // that a flat car/walking speed table would badly misjudge).
+        lat: -60,
+        lon: 130,
+        travelMinutes: 480,
+      }),
+    ],
+  });
+
+  const filled = fillDerivedDayFields(day, payload);
+  const transitionItem = filled.items.find((item) => item.canonicalPlaceId === "transition:City A->City B")!;
+  assert.equal(transitionItem.travelMinutes, 480, "a marked transition item's own real, mode-aware estimate must never be second-guessed");
+});
+
+test("fillDerivedDayFields: falls back to the Gemini-stated travelMinutes only when real coordinates are genuinely unavailable on either end", () => {
+  const payload = buildPayload();
+  const day = buildDay({
+    items: [
+      buildItem({ name: "Point A (anchor)", lat: 10, lon: 10 }),
+      // buildItem's own defaulting uses `??`, which treats an explicit
+      // `lat: null` override as "not provided" and falls through to its
+      // Tokyo default — spreading lat/lon over the built item afterward
+      // is the only way to actually get a coordinateless item here.
+      { ...buildItem({ name: "Coordinateless Stop", travelMinutes: 33 }), lat: null, lon: null },
+    ],
+  });
+
+  const filled = fillDerivedDayFields(day, payload);
+  assert.equal(
+    filled.items.find((item) => item.name === "Coordinateless Stop")?.travelMinutes,
+    33,
+    "with no real coordinates to compute from, the last honest thing left is the stated value — never silently zeroed"
+  );
 });
 
 // Spec tests 84/85, end-to-end through the actual repair function: a
@@ -580,6 +803,53 @@ test("repairOpeningHoursViolations removes an item scheduled outside its own ope
 
   const [repaired] = repairOpeningHoursViolations([day], payload, profile);
   assert.equal(repaired.items.some((item) => item.name === "Timna Park"), false);
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — repairOpeningHoursViolations' own
+// replacement call used to hand pickReplacementRecommendation a day view
+// that still included the violating item being replaced, so a candidate
+// close only to IT (never to the day's real anchor) could pass.
+test("repairOpeningHoursViolations never selects a replacement close only to the violating item itself, not to the day's real anchor", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({
+        id: "fake-near-violator",
+        name: "Fake Nearby To Violator Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        // Close to the violating item (11.26, 10) — far from the real base (10, 10).
+        lat: 11.261,
+        lon: 10.001,
+      }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    transportation: "רכב",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 10, lon: 10, transportation: "רכב" }),
+      // ~140km real distance, explicit "רכב" — the same real-walking-speed
+      // scheduling-overflow trap as the other new tests this round.
+      buildItem({
+        name: "Late Violating Spot",
+        category: "attraction",
+        slot: "afternoon",
+        openingHours: "08:00-16:00",
+        plannedStartTime: "19:52",
+        lat: 11.26,
+        lon: 10,
+        transportation: "רכב",
+      }),
+    ],
+  });
+
+  const [repaired] = repairOpeningHoursViolations([day], payload, profile);
+
+  assert.equal(repaired.items.some((item) => item.name === "Late Violating Spot"), false, "the violating item must not survive under its original name");
+  assert.ok(
+    !repaired.items.some((item) => item.name === "Fake Nearby To Violator Only"),
+    "a candidate close only to the violating item being replaced must never be selected"
+  );
 });
 
 test("repairOpeningHoursViolations never touches a locked or fixed-time item, even when it violates its own hours", () => {
@@ -900,9 +1170,9 @@ test("fillUnderfilledDay inserts nearby candidates until the day reaches its pac
   const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
 
   const emptyDay = buildDay({ dayNumber: 2, items: [] });
-  const usedPlaceKeys = new Set<string>();
+  const usageState = createItineraryUsageState();
 
-  const filled = fillUnderfilledDay(emptyDay, payload, profile, usedPlaceKeys);
+  const filled = fillUnderfilledDay(emptyDay, payload, profile, usageState);
 
   assert.ok(filled.items.length > 0, "expected at least one activity to be inserted into the empty day");
   const utilization = calculateDayLoadMinutes(filled) / profile.dailyCapacityMinutes;
@@ -937,13 +1207,13 @@ test("fillUnderfilledDay leaves a transfer day and a day-trip day alone — they
     recommendations: [buildRecommendation({ id: "rec-a", name: "Extra Stop", estimatedDurationMinutes: 150 })],
   });
   const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
-  const usedPlaceKeys = new Set<string>();
+  const usageState = createItineraryUsageState();
 
   const transferDay = buildDay({ dayNumber: 2, title: "Transfer to Kyoto", transportation: "shinkansen", items: [] });
-  assert.deepEqual(fillUnderfilledDay(transferDay, payload, profile, usedPlaceKeys).items, []);
+  assert.deepEqual(fillUnderfilledDay(transferDay, payload, profile, usageState).items, []);
 
   const dayTrip = buildDay({ dayNumber: 2, title: "Day trip to Nikko", items: [] });
-  assert.deepEqual(fillUnderfilledDay(dayTrip, payload, profile, usedPlaceKeys).items, []);
+  assert.deepEqual(fillUnderfilledDay(dayTrip, payload, profile, usageState).items, []);
 });
 
 // 9. Trip preferences must visibly affect activity-category distribution:
@@ -1507,6 +1777,77 @@ test("enforceStayTransitions inserts a real, visible transportation item that co
   assert.ok((transitionItem?.travelMinutes ?? 0) >= 150, "the transition item must carry most of its real estimated duration");
 });
 
+// Section Q — the exact real browser bug: "day base = Mitzpe Ramon,
+// transportation item = Tel Aviv → Jerusalem" surviving a stay-structure
+// change. A marked item from an earlier fromBase/toBase pair must be
+// recognized as stale and rebuilt from the CURRENT transition.
+test("enforceStayTransitions removes a stale marked transition item from a PREVIOUS fromBase/toBase pair and rebuilds the correct one", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Israel", 2);
+  const staleTransitionItem = buildItem({
+    name: "Train: City X → City Y",
+    category: "transportation",
+    canonicalPlaceId: "transition:City X->City Y", // stale — the structure changed since this was generated
+    travelMinutes: 200,
+  });
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A" }),
+    buildDay({ dayNumber: 2, cityRegion: "City B", items: [staleTransitionItem] }),
+  ];
+
+  const { days: repaired } = enforceStayTransitions(days, [buildTransition({ fromBase: "City A", toBase: "City B" })], payload, profile);
+
+  assert.ok(
+    !repaired[1].items.some((item) => item.canonicalPlaceId === "transition:City X->City Y"),
+    "the stale marked transition (a different fromBase/toBase pair) must be removed"
+  );
+  assert.ok(
+    repaired[1].items.some((item) => item.canonicalPlaceId === "transition:City A->City B"),
+    "the correct, current transition must be present after the rebuild"
+  );
+});
+
+test("enforceStayTransitions never deletes a Gemini-authored (unmarked) transportation item — only its OWN previously-marked stale items", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Israel", 2);
+  const geminiOwnTransport = buildItem({
+    name: "רכבת מקומית",
+    category: "transportation",
+    canonicalPlaceId: "", // Gemini's own content never carries this marker
+    travelMinutes: 60,
+    // Real coordinates matching City B's own transition anchor (spec "כל
+    // ערך אמיתי מנצח"), not buildItem's Tokyo default — otherwise, once
+    // travelMinutes is genuinely recomputed from real coordinates instead
+    // of trusted verbatim, "Tokyo" vs. City B's real (42.6, 44.6) anchor
+    // reads as a fabricated 8,000km jump and overloads the day for a
+    // reason that has nothing to do with what this test is actually
+    // checking (deletion behavior, not distance).
+    lat: 42.6,
+    lon: 44.6,
+  });
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A" }),
+    buildDay({ dayNumber: 2, cityRegion: "City B", items: [geminiOwnTransport] }),
+  ];
+
+  const { days: repaired } = enforceStayTransitions(days, [buildTransition({ fromBase: "City A", toBase: "City B" })], payload, profile);
+
+  assert.ok(
+    repaired[1].items.some((item) => item.name === "רכבת מקומית"),
+    "an unmarked (Gemini-authored) transport item must never be deleted by this pass"
+  );
+});
+
+test("resolveCanonicalPlaceId preserves an existing transition marker instead of overwriting it from coordinates", () => {
+  const marked = buildItem({
+    name: "Train: City A → City B",
+    canonicalPlaceId: "transition:City A->City B",
+    lat: 32.5,
+    lon: 34.9,
+  });
+  assert.equal(resolveCanonicalPlaceId(marked), "transition:City A->City B");
+});
+
 test("enforceStayTransitions is idempotent — it does not insert a second transition item when one is already represented", () => {
   const payload = buildPayload();
   const profile = buildTripPreferenceProfile(basePreferences, "Georgia", 2);
@@ -1927,6 +2268,516 @@ test("collectPlanDiagnostics flags a day with more than two food stops, too-clos
   assert.equal(diagnostics.duplicateRestaurants, 1);
 });
 
+// Part A/D/E: generation-time stay-area weighting now comes from REAL
+// geographic clustering, not a free-text location match — a candidate
+// whose location text says "City A" but whose real coordinates sit far
+// away in a different real cluster must not inflate City A's weight.
+test("computeAreaWeightsFromClusters groups candidates by real coordinates, not by a possibly-wrong location label", () => {
+  const cityACandidates = Array.from({ length: 3 }, () =>
+    buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 })
+  );
+  // Mislabeled: text says "City A" but the real coordinates are a
+  // different, distant real cluster entirely (the exact bug class this
+  // fixes — a candidate's location text is not authoritative, its
+  // coordinates are).
+  const mislabeledCandidate = buildRecommendation({ location: "City A", lat: 5.0, lon: 5.0, estimatedDurationMinutes: 90 });
+
+  const profile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const weights = computeAreaWeightsFromClusters([...cityACandidates, mislabeledCandidate], profile);
+
+  // City A's own weight must reflect only its own real, nearby candidates
+  // (3 x 90 = 270) — never inflated by the mislabeled far candidate just
+  // because its text also says "City A".
+  assert.equal(weights.get("City A"), 270);
+});
+
+test("computeAreaWeightsFromClusters weighs an area by real required visit time, not raw candidate count", () => {
+  const manyShortVisits = Array.from({ length: 5 }, () =>
+    buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 20 })
+  );
+  const fewLongVisits = Array.from({ length: 2 }, () =>
+    buildRecommendation({ location: "City B", lat: 5.0, lon: 5.0, estimatedDurationMinutes: 240 })
+  );
+  const profile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const weights = computeAreaWeightsFromClusters([...manyShortVisits, ...fewLongVisits], profile);
+
+  assert.ok((weights.get("City B") ?? 0) > (weights.get("City A") ?? 0), "2 long visits should outweigh 5 short ones by real time, not by count");
+});
+
+// ==================================================
+// LIVE PRODUCTION WIRING — these call buildDeterministicTripFrame itself
+// (the real function generation calls), never a standalone pure helper in
+// isolation, to prove decideClusterRole/short-stay-viability/night-
+// allocation/backtracking are actually load-bearing in production, not
+// dead utilities. Invented geography (City A/B/C style) only.
+// ==================================================
+
+test("live wiring: a weak cluster near a strong one does not become its own overnight phase", () => {
+  const strong = Array.from({ length: 6 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 }));
+  const weakNearby = Array.from({ length: 2 }, () => buildRecommendation({ location: "City B", lat: 1.05, lon: 1.05, estimatedDurationMinutes: 60 }));
+  const payload = buildPayload({ recommendations: [...strong, ...weakNearby], preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  assert.ok(!frame.phases.some((phase) => phase.areaLabel === "City B"), "the weak nearby cluster must not become its own hotel base");
+});
+
+test("live wiring: a strong cluster, even a remote one, becomes its own overnight phase", () => {
+  const strongA = Array.from({ length: 6 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 }));
+  const strongRemoteC = Array.from({ length: 5 }, () => buildRecommendation({ location: "City C", lat: 10.0, lon: 10.0, estimatedDurationMinutes: 100 }));
+  const payload = buildPayload({ recommendations: [...strongA, ...strongRemoteC], preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  const areas = frame.phases.map((phase) => phase.areaLabel);
+  assert.ok(areas.includes("City A") && areas.includes("City C"), `expected both strong clusters as bases, got: ${areas.join(", ")}`);
+});
+
+test("live wiring: a real but weak cluster far from everything becomes an explicit day trip, never a competing hotel base", () => {
+  const strong = Array.from({ length: 6 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 }));
+  // ~128km from City A — far enough to exceed this pool's own
+  // locality radius (so it stays a separate cluster, not merged) but
+  // close enough to clear the real round-trip day-trip feasibility gate
+  // (evaluateDayTripFeasibility, route-optimization.ts) at "balanced" pace.
+  // The original fixture (~785km) predates that gate and would now be
+  // correctly rejected as an infeasible day trip — this is the fix for
+  // that, not a workaround: the intent of this test ("a real but weak
+  // cluster becomes a day trip, not a competing base") requires the day
+  // trip to actually be a plausible one.
+  const weakFar = Array.from({ length: 2 }, () => buildRecommendation({ location: "City D", lat: 2.15, lon: 1.0, estimatedDurationMinutes: 60 }));
+  const payload = buildPayload({ recommendations: [...strong, ...weakFar], preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  assert.ok(!frame.phases.some((phase) => phase.areaLabel === "City D"), "must never become its own overnight base");
+  assert.ok(frame.dayTripHints?.some((hint) => hint.areaLabel === "City D"), "must be recorded as an explicit day trip instead");
+});
+
+// Real bug this closes: decideClusterRole only ever asked "is this cluster
+// far enough / weak enough to be a day trip" — never "is the round trip
+// from its actual base something a traveler could plausibly do in a day."
+// A cluster ~785km from its nearest base earns "day_trip" role on content
+// alone but is genuinely infeasible (1168 real round-trip minutes against a
+// 600-minute "balanced"-pace budget) — it must never surface as a day-trip
+// hint at all, not even a low-priority one.
+test("live wiring: a weak cluster that is real-world too far for a day trip is never surfaced as a day-trip hint", () => {
+  const strong = Array.from({ length: 6 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 }));
+  const tooFar = Array.from({ length: 2 }, () => buildRecommendation({ location: "City Far", lat: 6.0, lon: 6.0, estimatedDurationMinutes: 60 }));
+  const payload = buildPayload({ recommendations: [...strong, ...tooFar], preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  assert.ok(!frame.phases.some((phase) => phase.areaLabel === "City Far"), "must never become its own overnight base either");
+  assert.ok(
+    !frame.dayTripHints?.some((hint) => hint.areaLabel === "City Far"),
+    "a genuinely infeasible round trip must never surface as a day-trip hint"
+  );
+});
+
+test("live wiring: allocateNightsForClusters' proportional-by-content-time rule is what actually sizes the generated phases", () => {
+  const heavy = Array.from({ length: 8 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 90 }));
+  const light = Array.from({ length: 3 }, () => buildRecommendation({ location: "City B", lat: 9.0, lon: 9.0, estimatedDurationMinutes: 90 }));
+  const payload = buildPayload({ recommendations: [...heavy, ...light], preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  const cityA = frame.phases.find((phase) => phase.areaLabel === "City A");
+  const cityB = frame.phases.find((phase) => phase.areaLabel === "City B");
+  assert.ok(cityA && cityB, "both clusters have enough real content to be their own base");
+  assert.ok(cityA!.nights > cityB!.nights, "the cluster with far more real content must receive more nights");
+  assert.equal(frame.phases.reduce((sum, phase) => sum + phase.nights, 0), 10);
+});
+
+test("live wiring: a cluster with enough content to qualify as overnight is still merged away when its real transfer cost is prohibitive", () => {
+  const cityA = Array.from({ length: 5 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 150 }));
+  // Just at the overnight-content threshold (240min) on its own, and
+  // positioned BETWEEN A and C so it survives both cluster-role selection
+  // (>=12% weight share) and the backtracking reorder (which places it in
+  // the interior) — but its real transfer time from both real, extremely
+  // distant neighbors (not mere cluster-distance geometry) makes it not
+  // worth the hotel change.
+  const cityM = Array.from({ length: 3 }, () => buildRecommendation({ location: "City M", lat: 45.0, lon: 45.0, estimatedDurationMinutes: 80 }));
+  const cityC = Array.from({ length: 5 }, () => buildRecommendation({ location: "City C", lat: 89.0, lon: 89.0, estimatedDurationMinutes: 150 }));
+  const payload = buildPayload({
+    recommendations: [...cityA, ...cityM, ...cityC],
+    preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" },
+  });
+
+  const frame = buildDeterministicTripFrame(payload, 10);
+  assert.ok(!frame.phases.some((phase) => phase.areaLabel === "City M"), "a prohibitively expensive 1-night stay must be merged away, even though its own content cleared the overnight-content bar");
+});
+
+test("live wiring: a weight-only route order that would backtrack is reordered into a coherent A→B→C sequence", () => {
+  // Weight order alone would visit heaviest-first: City C (heaviest, one
+  // end), then City A (lighter, the OTHER end), then City M (lightest,
+  // the real geographic midpoint) — a real backtrack (passing back near
+  // the midpoint after already having gone past it). The coherent order
+  // is City C -> City M -> City A.
+  const cityA = Array.from({ length: 7 }, () => buildRecommendation({ location: "City A", lat: 1.0, lon: 1.0, estimatedDurationMinutes: 100 }));
+  const cityM = Array.from({ length: 4 }, () => buildRecommendation({ location: "City M", lat: 25.0, lon: 25.0, estimatedDurationMinutes: 100 }));
+  const cityC = Array.from({ length: 9 }, () => buildRecommendation({ location: "City C", lat: 50.0, lon: 50.0, estimatedDurationMinutes: 100 }));
+  const payload = buildPayload({
+    recommendations: [...cityA, ...cityM, ...cityC],
+    preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" },
+  });
+
+  const frame = buildDeterministicTripFrame(payload, 15);
+  assert.deepEqual(frame.phases.map((phase) => phase.areaLabel), ["City C", "City M", "City A"]);
+});
+
+test("live wiring: generation completes and stays bounded for a genuinely weak, scattered candidate pool", () => {
+  const scattered = Array.from({ length: 6 }, (_, index) =>
+    buildRecommendation({ location: `Spot ${index}`, lat: index * 5, lon: index * 5, estimatedDurationMinutes: 30 })
+  );
+  const payload = buildPayload({ recommendations: scattered, preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" } });
+  const frame = buildDeterministicTripFrame(payload, 10);
+  assert.equal(frame.phases.reduce((sum, phase) => sum + phase.nights, 0), 10);
+  assert.ok(frame.phases.length >= 1);
+});
+
+// ==================================================
+// PART A — "MAKE TRAVEL METRICS ACTUALLY ACTIVE": repairNormalDayTravelOutliers
+// and its wiring into collectPlanDiagnostics/passesValidation. Invented
+// geography only.
+// ==================================================
+
+const COMPACT_MOBILITY_PROFILE = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+test("A6.2/A6.4: repairNormalDayTravelOutliers replaces the offending item with a nearby real candidate when one exists, never a far red-herring also in the pool", () => {
+  const nearbyCandidate = buildRecommendation({ id: "near-1", name: "Nearby Real Place", category: "attraction", location: "City A", lat: 1.001, lon: 1.001, estimatedDurationMinutes: 60 });
+  // A second, genuinely real candidate that is far from EVERYTHING in the
+  // day (not merely close to the outlier being replaced, which the
+  // dedicated "close only to the outlier" test already covers) — closes
+  // the mutation-audit gap where this test's own candidate pool held only
+  // one option and so never actually proved a far candidate gets rejected.
+  // ~47km (well past COMPACT's 25km radius) with explicit "רכב" — a real
+  // intercontinental distance at buildItem's own default walking speed
+  // would overflow the day's schedule regardless of geography, masking
+  // whether the geographic check is what's actually rejecting it.
+  const farRedHerring = buildRecommendation({ id: "far-1", name: "Far Red Herring", category: "attraction", location: "Nowhere Real", lat: 1.3, lon: 1.3, estimatedDurationMinutes: 60 });
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10, transportation: "רכב" }),
+      buildItem({ name: "Distant Outlier", category: "attraction", lat: 3.0, lon: 3.0, travelMinutes: 200, transportation: "רכב" }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [nearbyCandidate, farRedHerring] });
+  const result = repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+
+  assert.equal(result.outliers.length, 1);
+  assert.equal(result.outliers[0].repaired, true);
+  assert.ok(result.days[0].items.some((item) => item.name === "Nearby Real Place"), "the distant item should be replaced by the real nearby candidate");
+  assert.ok(!result.days[0].items.some((item) => item.name === "Distant Outlier"));
+  assert.ok(!result.days[0].items.some((item) => item.name === "Far Red Herring"), "a genuinely far candidate in the same pool must never win over the nearby one, or be picked at all");
+});
+
+// A6.4: underfilled day prefers free time over a distant POI when no real nearby candidate exists.
+test("A6.4: repairNormalDayTravelOutliers falls back to free exploration (never a distant POI) when the only real candidate is genuinely far away", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10, transportation: "רכב" }),
+      buildItem({ name: "Distant Outlier", category: "attraction", lat: 3.0, lon: 3.0, travelMinutes: 200, recommendationId: null, transportation: "רכב" }),
+    ],
+  });
+  // The old version of this test used an EMPTY candidate pool, which never
+  // actually proved a far candidate gets rejected — only that "nothing to
+  // pick from" falls back correctly. A genuinely far, otherwise-eligible
+  // candidate (not merely close to the outlier itself, and at a moderate
+  // ~47km rather than intercontinental — see the sibling test's comment on
+  // why) closes that gap.
+  const farRedHerring = buildRecommendation({ id: "far-2", name: "Far Red Herring", category: "attraction", location: "Nowhere Real", lat: 1.3, lon: 1.3, estimatedDurationMinutes: 60 });
+  const payload = buildPayload({ recommendations: [farRedHerring] });
+  const result = repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+
+  assert.equal(result.outliers[0].repaired, true);
+  assert.ok(!result.days[0].items.some((item) => item.name === "Far Red Herring"), "a genuinely far real candidate must be rejected, never selected just because it's the only one available");
+  const replaced = result.days[0].items.find((item) => item.name !== "Base Anchor");
+  assert.ok(replaced && replaced.lat == null && replaced.lon == null, "must fall back to a coordinate-less free-exploration item, never leave the distant POI in place");
+});
+
+// Spec "gav nv abrtv kl vfh yuc" (Phase C, part א) — a candidate must pass
+// the SAME distance-from-the-day's-real-anchors test the outlier itself
+// failed. The real bug: pickReplacementRecommendation validated a
+// candidate against a day view that STILL included the outlier, so a
+// candidate merely close to the (already known wrong) outlier — never
+// close to the day's actual base — slipped through as "compatible". Real
+// symptom: Thor's Well (Oregon)/Mendenhall Ice Caves (Alaska) chosen as
+// replacements for days nowhere near them, because the outlier itself
+// counted as a valid anchor to be near. Tested directly against
+// pickReplacementRecommendation (not the full repairNormalDayTravelOutliers
+// pipeline) to isolate the exact mechanism from the scheduler's own
+// unrelated overflow handling, which can independently reject a
+// far-enough candidate for a different reason (its own huge recomputed
+// travelMinutes not fitting the day's time window) and would otherwise
+// mask whether THIS specific fix is what's doing the rejecting.
+// Spec "תיקון גנרי, לא תיקון תשיעי" — REWRITTEN (reported separately, per
+// instruction): the previous version of this test documented the OLD bug
+// by proving a caller that forgot to exclude the target item got the
+// wrong (buggy) result. That's no longer a real scenario to document —
+// pickReplacementRecommendation now excludes args.item from its own
+// internal anchor/scoring context itself, so there is no longer a
+// "forgot to exclude" caller mistake possible at all. This version proves
+// exactly that: the SAME buggy-shaped call (day still includes the
+// target item) now gets the CORRECT result regardless, matching a call
+// that already excluded it manually.
+test("pickReplacementRecommendation: excludes the target item (args.item) from its own anchor/scoring context internally — a caller is never responsible for pre-filtering it out", () => {
+  const fakeNearbyToOutlierOnly = buildRecommendation({
+    id: "fake-near-1",
+    name: "Fake Nearby To Outlier Only",
+    category: "attraction",
+    location: "Nowhere Real",
+    // Close to the outlier (3.0, 3.0) — far from Base Anchor (1.0, 1.0).
+    lat: 3.001,
+    lon: 3.001,
+  });
+  const outlierItem = buildItem({ name: "Distant Outlier", category: "attraction", lat: 3.0, lon: 3.0, travelMinutes: 200, recommendationId: null });
+  const baseAnchor = buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10 });
+  const dayStillIncludingTarget = buildDay({ dayNumber: 1, cityRegion: "City A", items: [baseAnchor, outlierItem] });
+  const dayAlreadyExcludingTarget = { ...dayStillIncludingTarget, items: [baseAnchor] };
+  const payload = buildPayload({ recommendations: [fakeNearbyToOutlierOnly] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  const resultWhenCallerForgotToExclude = pickReplacementRecommendation({
+    payload,
+    day: dayStillIncludingTarget,
+    item: outlierItem,
+    profile,
+    usageState: createItineraryUsageState(),
+    maxDistanceKm: COMPACT_MOBILITY_PROFILE.localityRadiusKm,
+  });
+  assert.equal(
+    resultWhenCallerForgotToExclude,
+    null,
+    "the function's own internal exclusion must reject a candidate close only to the target item, even when the caller passed a day that still includes it"
+  );
+
+  const resultWhenCallerAlreadyExcluded = pickReplacementRecommendation({
+    payload,
+    day: dayAlreadyExcludingTarget,
+    item: outlierItem,
+    profile,
+    usageState: createItineraryUsageState(),
+    maxDistanceKm: COMPACT_MOBILITY_PROFILE.localityRadiusKm,
+  });
+  assert.equal(
+    resultWhenCallerAlreadyExcluded,
+    null,
+    "a caller that already excludes the target item gets the identical (correct) result — the internal exclusion is a no-op there, never a behavior change"
+  );
+});
+
+// The same fix exercised end-to-end through repairNormalDayTravelOutliers
+// itself — distances kept moderate (unlike the unit test above) so the
+// candidate's own recomputed travelMinutes stays well inside the day's
+// schedulable window, and geographic compatibility alone is what decides
+// the outcome, not an unrelated scheduling-overflow rejection.
+test("repairNormalDayTravelOutliers: a replacement candidate close only to the OUTLIER itself (never to the day's real anchor) must be rejected, not chosen", () => {
+  const fakeNearbyToOutlierOnly = buildRecommendation({
+    id: "fake-near-2",
+    name: "Fake Nearby To Outlier Only",
+    category: "attraction",
+    location: "Nowhere Real",
+    // ~1km from the outlier (1.30, 1.31) — within COMPACT's 25km radius of
+    // it, but ~47km from Base Anchor (1.0, 1.0) — outside that radius, and
+    // a modest enough real distance (~50min at the generic estimate) that
+    // it would still fit the day's schedule if accepted.
+    lat: 1.301,
+    lon: 1.311,
+  });
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      // transportation explicitly "רכב" (car, 35km/h) — buildItem's own
+      // default ("הליכה"/walking, 4km/h) would make a real ~47km distance
+      // take over 11 hours even at the fixed, correct estimate, which
+      // would overflow the day's schedule independent of geographic
+      // compatibility and defeat the point of this test.
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10, transportation: "רכב" }),
+      buildItem({ name: "Distant Outlier", category: "attraction", lat: 1.3, lon: 1.3, travelMinutes: 200, recommendationId: null, transportation: "רכב" }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [fakeNearbyToOutlierOnly] });
+  const result = repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+
+  assert.ok(
+    !result.days[0].items.some((item) => item.name === "Fake Nearby To Outlier Only"),
+    "a candidate close only to the outlier being replaced (not to the day's real anchor) must never be selected"
+  );
+  const replaced = result.days[0].items.find((item) => item.name !== "Base Anchor");
+  assert.ok(
+    replaced && replaced.lat == null && replaced.lon == null,
+    "with no candidate genuinely close to the day's real anchor, must fall back to free exploration — never 'closest among the far ones'"
+  );
+});
+
+// Spec "נדנוד אינסופי" (Phase C, part ב) — a place already rejected from a
+// given day earlier in the same repairPlan run must never come back as
+// someone else's replacement on a later attempt. Real symptom: one real
+// day cycled "free block -> Mystery Spot -> free block -> Mystery Spot"
+// across 4 attempts, because usedPlaceKeys was rebuilt fresh every
+// attempt with no memory of what had already been tried and rejected.
+test("repairNormalDayTravelOutliers: a place already removed from this day earlier in the run is never re-selected for a later outlier on the SAME day", () => {
+  const onlyRealCandidate = buildRecommendation({
+    id: "near-1",
+    name: "Nearby Real Place",
+    category: "attraction",
+    location: "City A",
+    lat: 1.001,
+    lon: 1.001,
+    estimatedDurationMinutes: 60,
+  });
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10 }),
+      buildItem({ name: "Distant Outlier", category: "attraction", lat: 3.0, lon: 3.0, travelMinutes: 200, recommendationId: null }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [onlyRealCandidate] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  // Pre-seeded as if an earlier attempt in the SAME repairPlan run already
+  // tried "Nearby Real Place" on day 1 and it was removed again — the
+  // memory a later attempt must respect.
+  const removedItemKeysByDay = new Map<number, Set<string>>([[1, new Set([buildItemKey({ recommendationId: "near-1", name: "", lat: null, lon: null, location: "" })])]]);
+
+  const result = repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, profile, removedItemKeysByDay);
+
+  assert.ok(
+    !result.days[0].items.some((item) => item.name === "Nearby Real Place"),
+    "a place already removed from this exact day must never be re-offered as a replacement, even though it would otherwise be geographically valid"
+  );
+  const replaced = result.days[0].items.find((item) => item.name !== "Base Anchor");
+  assert.ok(replaced && replaced.lat == null && replaced.lon == null, "with the only real candidate blacklisted for this day, must fall back to free exploration");
+});
+
+test("repairNormalDayTravelOutliers: records a removed item's key in removedItemKeysByDay, keyed by day number", () => {
+  const day = buildDay({
+    dayNumber: 7,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 1.0, lon: 1.0, travelMinutes: 10 }),
+      buildItem({ name: "Distant Outlier", category: "attraction", lat: 3.0, lon: 3.0, travelMinutes: 200, recommendationId: "outlier-rec" }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const removedItemKeysByDay = new Map<number, Set<string>>();
+
+  repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, profile, removedItemKeysByDay);
+
+  assert.ok(removedItemKeysByDay.get(7)?.has("id:outlier-rec"), "the removed outlier's own key must be recorded under its real day number");
+  assert.equal(removedItemKeysByDay.has(1), false, "must never bleed into an unrelated day number");
+});
+
+// A2: a genuine day trip's long travel is expected and must never be touched by this repair.
+test("A2: repairNormalDayTravelOutliers never touches a genuine day-trip day's own long travel", () => {
+  const dayTripDay = buildDay({
+    dayNumber: 2,
+    title: "Day trip to the mountains",
+    notes: "יום טיול",
+    cityRegion: "City A",
+    items: [buildItem({ name: "Mountain Excursion", lat: 3.0, lon: 3.0, travelMinutes: 200 })],
+  });
+  const payload = buildPayload({ recommendations: [] });
+  const result = repairNormalDayTravelOutliers([dayTripDay], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+
+  assert.equal(result.outliers.length, 0);
+  assert.ok(result.days[0].items.some((item) => item.name === "Mountain Excursion"), "a real day trip's own content must survive untouched");
+});
+
+// A3: a transfer day's long one-way travel is expected and must never be touched.
+test("A3: repairNormalDayTravelOutliers never touches a genuine transfer day's own long travel", () => {
+  const transferDay = buildDay({
+    dayNumber: 3,
+    transportation: "נסיעה בין בסיסים",
+    notes: "יום מעבר בין בסיסים",
+    cityRegion: "City B",
+    items: [buildItem({ name: "Intercity Transfer", category: "transportation", lat: 3.0, lon: 3.0, travelMinutes: 300 })],
+  });
+  const payload = buildPayload({ recommendations: [] });
+  const result = repairNormalDayTravelOutliers([transferDay], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+
+  assert.equal(result.outliers.length, 0);
+  assert.ok(result.days[0].items.some((item) => item.name === "Intercity Transfer"));
+});
+
+// A6.7: metrics are genuinely recomputed after repair, not stale before-values.
+test("A6.7: travel metrics recomputed after repairNormalDayTravelOutliers show a real reduction", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", lat: 1.0, lon: 1.0, travelMinutes: 10 }),
+      buildItem({ name: "Distant Outlier", lat: 3.0, lon: 3.0, travelMinutes: 200, recommendationId: null }),
+    ],
+  });
+  const payload = buildPayload({ recommendations: [] });
+  const before = day.items.reduce((max, item) => Math.max(max, item.travelMinutes ?? 0), 0);
+  const result = repairNormalDayTravelOutliers([day], COMPACT_MOBILITY_PROFILE, payload, buildTripPreferenceProfile(basePreferences, "Country X", 1));
+  const after = result.days[0].items.reduce((max, item) => Math.max(max, item.travelMinutes ?? 0), 0);
+  assert.ok(after < before, `expected repaired max segment (${after}) below the original (${before})`);
+});
+
+// A6.1: collectPlanDiagnostics only exposes normalDayTravelOutliers when a real
+// mobility profile is supplied — proving the diagnostic genuinely depends
+// on the wiring, not a hardcoded value.
+test("A6.1: collectPlanDiagnostics flags a real normal-day travel outlier only when a real mobility profile is supplied", () => {
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Base Anchor", lat: 1.0, lon: 1.0, travelMinutes: 10 }),
+      buildItem({ name: "Distant Outlier", lat: 3.0, lon: 3.0, travelMinutes: 200, locked: true }), // locked: survives repair, still flagged
+    ],
+  });
+  const plan = { title: "t", summary: "s", totalEstimatedCost: 100, estimatedTransportCost: 0, averageDailyCost: 100, costPerTraveler: 100, categoryBreakdown: {}, days: [day] };
+
+  const withoutProfile = collectPlanDiagnostics(plan, profile, null, null, null, [], [], null);
+  assert.equal(withoutProfile.normalDayTravelOutliers ?? 0, 0, "no profile supplied -> never flagged, matching every pre-existing caller");
+
+  const withProfile = collectPlanDiagnostics(plan, profile, null, null, null, [], [], COMPACT_MOBILITY_PROFILE);
+  assert.equal(withProfile.normalDayTravelOutliers, 1);
+});
+
+// A6.8: plan acceptance (passesValidation) genuinely uses normalDayTravelOutliers
+// in isolation — an otherwise-clean diagnostics object is accepted with 0
+// and rejected with a real outlier count, matching every other gate's
+// existing test pattern (cleanDiagnostics).
+test("A6.8: passesValidation rejects an otherwise-clean plan that still has a real normal-day travel outlier", () => {
+  assert.equal(passesValidation(cleanDiagnostics({ normalDayTravelOutliers: 1 })), false);
+  assert.equal(passesValidation(cleanDiagnostics({ normalDayTravelOutliers: 0 })), true);
+  assert.equal(passesValidation(cleanDiagnostics()), true, "absent normalDayTravelOutliers must never regress a plan that was clean before this field existed");
+});
+
+// Part N/O: a fallback meal item — no real restaurant candidate exists —
+// must read as a recommended TIME WINDOW, never an invented business.
+test("18/19/20/21. buildFallbackMealPlaceholder produces a meal opportunity, never a fake restaurant card", () => {
+  const day = buildDay({ dayNumber: 1, cityRegion: "City A" });
+  const payload = buildPayload();
+  const placeholder = buildFallbackMealPlaceholder(day, "lunch", payload);
+
+  assert.ok(isMealOpportunityMarker(placeholder), "must be recognized as a meal opportunity, not a real place");
+  assert.equal(placeholder.lat, null, "20. no coordinates");
+  assert.equal(placeholder.lon, null, "20. no coordinates");
+  assert.equal(placeholder.recommendationId, null);
+  assert.equal(placeholder.approximatePrice, null, "21. no fabricated price");
+  assert.ok(placeholder.name.startsWith("🍽"), "18. must not read as an invented business name");
+});
+
+test("22. a meal opportunity produced by buildFreeExplorationReplacement's food branch never fabricates a price", () => {
+  const day = buildDay({ dayNumber: 1, cityRegion: "City A" });
+  const foodItem = buildItem({ category: "restaurant", slot: "dinner" });
+  const replacement = buildFreeExplorationReplacement(foodItem, day);
+
+  assert.ok(isMealOpportunityMarker(replacement));
+  assert.equal(replacement.approximatePrice, null);
+  assert.equal(replacement.priceOriginalAmount, null);
+  assert.ok(replacement.name.startsWith("🍽"));
+});
+
 // Regression: a real reported bug — generating a domestic/sparse-candidate
 // trip repeatedly failed with "PLAN_NOT_FEASIBLE" because the deterministic
 // fallback's generic filler content (buildFreeExplorationReplacement) used
@@ -2152,6 +3003,1076 @@ test("removeFuzzyDuplicatePlaces never touches a locked/fixed-time item even whe
   );
 });
 
+// Section (browser QA): computeDestinationMobilityProfile — a real,
+// density-derived locality radius, never one fixed worldwide km value.
+// Invented "Country X"/"Country Y" coordinates only.
+test("computeDestinationMobilityProfile classifies a dense candidate pool as compact with a tight locality radius", () => {
+  // City A's real candidates, all within a couple of km of each other.
+  const denseCandidates = Array.from({ length: 6 }, (_, index) => ({
+    lat: 32.08 + index * 0.01,
+    lon: 34.78 + index * 0.01,
+  }));
+  const profile = computeDestinationMobilityProfile(denseCandidates);
+  assert.equal(profile.tier, "compact");
+  assert.ok(profile.localityRadiusKm < 60);
+});
+
+test("computeDestinationMobilityProfile classifies a sparse candidate pool as large_sparse with a looser locality radius", () => {
+  // Real candidates hundreds of km apart from each other.
+  const sparseCandidates = [
+    { lat: 10, lon: 10 },
+    { lat: 12, lon: 12 },
+    { lat: 30, lon: 30 },
+    { lat: 32, lon: 33 },
+    { lat: -20, lon: 100 },
+  ];
+  const profile = computeDestinationMobilityProfile(sparseCandidates);
+  assert.equal(profile.tier, "large_sparse");
+  assert.ok(profile.localityRadiusKm > 60);
+});
+
+test("computeDestinationMobilityProfile: a compact destination's radius is strictly tighter than a large sparse one's", () => {
+  const compact = computeDestinationMobilityProfile(
+    Array.from({ length: 5 }, (_, i) => ({ lat: 32 + i * 0.01, lon: 34 + i * 0.01 }))
+  );
+  const sparse = computeDestinationMobilityProfile([
+    { lat: 10, lon: 10 },
+    { lat: 15, lon: 20 },
+    { lat: 40, lon: 60 },
+    { lat: -10, lon: -30 },
+  ]);
+  assert.ok(compact.localityRadiusKm < sparse.localityRadiusKm);
+});
+
+test("computeDestinationMobilityProfile falls back to the pre-existing default when there isn't enough real geography to judge", () => {
+  const profile = computeDestinationMobilityProfile([{ lat: null, lon: null }, { lat: 1, lon: 1 }]);
+  assert.equal(profile.tier, "medium");
+});
+
+// Section (browser QA): enforceNormalDayLocality — the real bug from the
+// browser report (a "Jerusalem" day containing Makhtesh Ramon activities,
+// a "Tel Aviv" day containing Haifa content) reproduced with invented
+// City A/B/C geography, never real place names.
+const CITY_A_ANCHOR = { lat: 32.08, lon: 34.78 };
+const CITY_B_ANCHOR = { lat: 31.77, lon: 35.22 }; // ~75km from City A
+const CITY_C_ANCHOR = { lat: 30.6, lon: 34.8 }; // ~140km from City A — a distant future stay
+
+// buildItem's own lat/lon defaulting uses `??`, which substitutes its
+// default coordinate for an explicit `null` too — so a genuinely
+// coordinate-less fixture (the exact real-world shape of a Gemini item
+// with no lat/lon) must null them out AFTER construction, not through the
+// helper's own overrides.
+function buildCoordinatelessItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
+  return { ...buildItem(overrides), lat: null, lon: null, recommendationId: overrides.recommendationId ?? null };
+}
+
+test("enforceNormalDayLocality repairs a normal day's item that is far outside its own stay's locality radius", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    title: "A normal City A day",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildItem({ name: "Far Crater", slot: "afternoon", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.itemName === "Far Crater" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "Far Crater"));
+});
+
+test("enforceNormalDayLocality rejects an activity that genuinely belongs to a future stay's cluster, even if it's technically within this stay's own radius", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "medium" as const, localityRadiusKm: 90, normalDayTravelBudgetMinutes: 100 };
+  // An item much closer to City B (the NEXT stay) than to City A (today's stay).
+  const stolenItem = buildItem({ name: "City B Landmark", lat: CITY_B_ANCHOR.lat, lon: CITY_B_ANCHOR.lon });
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }), stolenItem],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.reason === "belongs_to_another_stay"));
+  assert.ok(!days[0].items.some((item) => item.name === "City B Landmark"));
+});
+
+// Transfer-day detour feasibility — real bug this closes: the old transfer
+// exemption only rejected an item that POSITIVELY matched some OTHER
+// modeled stay; an item simply far from everything (not near origin, not
+// near destination, not a real match to any known stay, genuinely NOT on
+// the way) sailed through with zero validation. City A (day 1) -> City B
+// (day 2, the transfer day), ~444.8km apart (~296.5min direct transfer,
+// leaving ~303.5min of real detour slack at "balanced" pace/600min daily
+// capacity) — verified with the real haversineKm/selectTransportMode/
+// estimateMinutesForMode primitives before writing these fixtures.
+const TRANSFER_CITY_A_ANCHOR = { lat: 0, lon: 0 };
+const TRANSFER_CITY_B_ANCHOR = { lat: 0, lon: 4.0 };
+const TRANSFER_TRIP_FRAME = buildTestFrame([
+  { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+  { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+]);
+const TRANSFER_AREA_ANCHORS = new Map([
+  ["City A", TRANSFER_CITY_A_ANCHOR],
+  ["City B", TRANSFER_CITY_B_ANCHOR],
+]);
+const TRANSFER_MOBILITY_PROFILE = { tier: "medium" as const, localityRadiusKm: 30, normalDayTravelBudgetMinutes: 100 };
+
+test("enforceNormalDayLocality (transfer day): an activity right next to the origin is accepted via the near-origin path, independent of detour math", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  // ~7.9km from City A (well within the 30km locality radius) but given a
+  // duration (350min) that WOULD fail real detour math (available slack is
+  // only ~303.5min) — if the near-origin bypass were broken and this fell
+  // through to detour math instead, it would be wrongly rejected.
+  const day = buildDay({
+    dayNumber: 2,
+    items: [buildItem({ name: "Near Origin Stop", lat: 0.05, lon: 0.05, estimatedDurationMinutes: 350 })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], TRANSFER_TRIP_FRAME, TRANSFER_AREA_ANCHORS, TRANSFER_MOBILITY_PROFILE, payload, profile);
+
+  assert.ok(!violations.some((violation) => violation.itemName === "Near Origin Stop"));
+  assert.ok(days[0].items.some((item) => item.name === "Near Origin Stop"));
+});
+
+test("enforceNormalDayLocality (transfer day): two individually-fine detour activities that together exceed the slack are correctly rejected in combination", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  // Both roughly on the direct A->B route (detour ~0), each well within the
+  // ~303.5min slack alone (200min), but 200+200=400min together exceeds it.
+  const day = buildDay({
+    dayNumber: 2,
+    items: [
+      buildItem({ name: "On-Route Stop 1", lat: 0, lon: 2.0, estimatedDurationMinutes: 200 }),
+      buildItem({ name: "On-Route Stop 2", lat: 0, lon: 2.0001, estimatedDurationMinutes: 200 }),
+    ],
+  });
+
+  const { violations } = enforceNormalDayLocality([day], TRANSFER_TRIP_FRAME, TRANSFER_AREA_ANCHORS, TRANSFER_MOBILITY_PROFILE, payload, profile);
+
+  const flagged = violations.filter((violation) => violation.reason === "infeasible_transfer_detour");
+  assert.equal(flagged.length, 1, "exactly one of the two must be rejected once combined with the other");
+});
+
+test("enforceNormalDayLocality (transfer day): an activity requiring a large detour that doesn't fit the slack is rejected", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  // ~598.7km from BOTH A and B (real detour ~502min) — far beyond the
+  // ~303.5min available slack.
+  const day = buildDay({
+    dayNumber: 2,
+    items: [buildItem({ name: "Way Off Route Stop", lat: 5.0, lon: 2.0, estimatedDurationMinutes: 60 })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], TRANSFER_TRIP_FRAME, TRANSFER_AREA_ANCHORS, TRANSFER_MOBILITY_PROFILE, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.itemName === "Way Off Route Stop" && violation.reason === "infeasible_transfer_detour"));
+  assert.ok(!days[0].items.some((item) => item.name === "Way Off Route Stop"));
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — enforceNormalDayLocality is the
+// terminal geographic gate every recent round has built around; its own
+// repair step used to hand pickReplacementRecommendation a day view that
+// still included the very item being repaired, so a candidate close only
+// to THAT flagged item (never to the stay's real anchor) could pass.
+test("enforceNormalDayLocality's own repair never selects a replacement that is close only to the flagged item, not to the stay's real anchor", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({
+        id: "fake-near-crater",
+        name: "Fake Nearby To Flagged Item Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        // Close to Far Crater (City C, ~140km from City A) — far from the
+        // stay's own real anchor (City A).
+        lat: CITY_C_ANCHOR.lat + 0.001,
+        lon: CITY_C_ANCHOR.lon + 0.001,
+      }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    title: "A normal City A day",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon, transportation: "רכב" }),
+      // Explicit "רכב" — buildItem's own default ("הליכה") at ~140km real
+      // distance would produce a travelMinutes so large the scheduler
+      // drops any replacement as overflow regardless of geography, which
+      // would mask whether the geographic check is what's really doing
+      // the rejecting here.
+      buildItem({ name: "Far Crater", slot: "afternoon", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon, transportation: "רכב" }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.itemName === "Far Crater" && violation.repaired));
+  assert.ok(
+    !days[0].items.some((item) => item.name === "Fake Nearby To Flagged Item Only"),
+    "a candidate close only to the flagged item being replaced must never be selected"
+  );
+});
+
+test("enforceNormalDayLocality never touches a locked/fixed-time outlier — reports it instead of moving it", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const lockedFarItem = buildItem({ name: "Locked Far Reservation", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon, locked: true });
+  const day = buildDay({ dayNumber: 1, items: [lockedFarItem] });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(days[0].items.some((item) => item.name === "Locked Far Reservation"), "a locked outlier must never be moved");
+  assert.ok(violations.some((violation) => violation.itemName === "Locked Far Reservation" && !violation.repaired));
+});
+
+// Spec "א-סימטריה בין normal לday-trip/transfer" — this test previously
+// relied on Gemini's own title text ("Day trip to the crater") to grant
+// the exemption. Rewritten with a GENUINE round-trip structure (3+ real
+// anchors, out and back to the same base) so it now proves the exemption
+// survives on real geometry alone — see the new deriveDayType tests below
+// for the acceptance criterion that a text label alone no longer works.
+// Real bug this closes: a day_trip label used to be an UNCONDITIONAL pass
+// on geography, regardless of how far or how thin the content actually
+// was — the exact shape of a real QA replay bug (a day_trip-category item
+// ~9459 minutes from its own day's base got verdict "passed" purely from
+// its day-type label). day_trip/transfer-without-real-data days are now
+// evaluated with the same real evaluateDayTripFeasibility math clusters
+// already use — a day-trip label is permission to be away from base, not
+// permission to skip geography. This test's original fixture (a single
+// 90-minute stop, ~187min round trip) is a real but marginal day trip
+// (valueRatio ~0.33, below the 0.4 threshold) — rewritten with a longer
+// visit so the SAME distance is a genuinely feasible one, preserving the
+// test's real intent ("a genuine day trip survives") rather than its
+// pre-feasibility-math accident of always passing regardless of value.
+test("enforceNormalDayLocality leaves a genuinely FEASIBLE day-trip day untouched even though its content sits far from the stay anchor", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const dayTrip = buildDay({
+    dayNumber: 1,
+    title: "A day out",
+    items: [
+      buildItem({ name: "Morning Departure", slot: "morning", plannedStartTime: "08:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      // ~140km from City A (~187min real round trip) with a substantial
+      // 200min visit — valueRatio ~0.52, a genuinely worthwhile day trip.
+      buildItem({
+        name: "Far Crater",
+        slot: "afternoon",
+        plannedStartTime: "12:00",
+        lat: CITY_C_ANCHOR.lat,
+        lon: CITY_C_ANCHOR.lon,
+        estimatedDurationMinutes: 200,
+      }),
+      buildItem({ name: "Evening Return", slot: "evening", plannedStartTime: "18:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+    ],
+  });
+
+  const { days } = enforceNormalDayLocality([dayTrip], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.deepEqual(days[0].items.map((item) => item.name), ["Morning Departure", "Far Crater", "Evening Return"]);
+});
+
+test("enforceNormalDayLocality repairs a day_trip-labeled item that is real-world infeasible from its own base (the Annapolis/Los-Angeles QA replay shape)", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  // A real, resolved POI (recommendationId + coordinates) thousands of km
+  // from its own day's base, labeled category "day_trip" — the exact real
+  // shape reported: a resolved place thousands of minutes away receiving
+  // an unconditional pass purely because of its day-type/category label.
+  // A genuine round-trip structure (isStructuralRoundTripDay: >=3 anchors,
+  // first/last within 5km of each other, a middle item >60min one-way) —
+  // the exact shape that earns real "day_trip" derivedDayType, matching
+  // how the real replay's own item actually got there.
+  const dayTrip = buildDay({
+    dayNumber: 1,
+    title: "A day out",
+    items: [
+      buildItem({ name: "Morning Departure", slot: "morning", plannedStartTime: "08:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildItem({
+        name: "Impossibly Far Landmark",
+        category: "day_trip",
+        slot: "afternoon",
+        plannedStartTime: "12:00",
+        recommendationId: "rec-impossibly-far",
+        lat: CITY_A_ANCHOR.lat + 40,
+        lon: CITY_A_ANCHOR.lon + 40,
+        estimatedDurationMinutes: 90,
+      }),
+      buildItem({ name: "Evening Return", slot: "evening", plannedStartTime: "18:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([dayTrip], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  const violation = violations.find((v) => v.itemName === "Impossibly Far Landmark");
+  assert.ok(violation, "a real POI thousands of minutes from its own base must never receive an unconditional pass");
+  assert.equal(violation?.reason, "infeasible_day_excursion");
+  assert.ok(!days[0].items.some((item) => item.name === "Impossibly Far Landmark"));
+});
+
+// ==================================================
+// PART: "GEMINI ITEMS ARE BYPASSING GEOGRAPHIC VALIDATION" — the real
+// reported bug: a coordinate-LESS Gemini-authored item (e.g. "Golden Gate
+// Bridge") used to skip enforceNormalDayLocality's whole check just
+// because it had no lat/lon. Invented City A/B/C geography only.
+// ==================================================
+
+test("1. a coordinate-less item whose location text matches a DIFFERENT known stay is rejected by canonical region", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      // No coordinates at all — the exact real-world shape of the reported bug.
+      buildCoordinatelessItem({ name: "Famous Bridge", location: "City B" }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.itemName === "Famous Bridge" && violation.reason === "unverified_region_mismatch" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "Famous Bridge"));
+});
+
+test("2. a coordinate-less item whose location text matches its OWN stay is accepted through canonical region", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [buildCoordinatelessItem({ name: "Local Landmark", location: "City A" })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.equal(violations.length, 0);
+  assert.ok(days[0].items.some((item) => item.name === "Local Landmark"));
+});
+
+// Spec "GEOGRAPHIC CORRECTNESS REDESIGN" §4/§10 — "geography should be
+// proven, not presumed." A normal-day item with no location text AND no
+// match in the trip's own known candidates is unproven, not innocent —
+// it is now repaired (real replacement first, free exploration second),
+// never left in place on the strength of "it can't be disproven." This is
+// a deliberate policy change from the previous pass (see git history).
+test("3. a coordinate-less item with NO location text and no candidate match is unproven, not presumed local, on a normal day", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildCoordinatelessItem({ name: "Unlabeled Mystery Item", location: "" })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((violation) => violation.itemName === "Unlabeled Mystery Item" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "Unlabeled Mystery Item"));
+});
+
+test("3b. a coordinate-less item that DOES match a real trip candidate by name is resolved to real coordinates and correctly kept", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ name: "Local Landmark", location: "City A", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon })],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  // The item arrived with no coordinates and no location text at all — it
+  // can only survive by being genuinely resolved against the real pool.
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildCoordinatelessItem({ name: "Local Landmark", location: "" })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.equal(violations.length, 0, "a real, resolved-to-nearby candidate must not be treated as unproven");
+  assert.ok(days[0].items.some((item) => item.name === "Local Landmark"));
+});
+
+test("3c. a coordinate-less item resolved to a real but genuinely distant candidate is still flagged as too far — resolution is not immunity", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ name: "Distant Landmark", location: "City B", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon })],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildCoordinatelessItem({ name: "Distant Landmark", location: "" })],
+  });
+
+  const { violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(
+    violations.some((violation) => violation.itemName === "Distant Landmark" && violation.reason === "too_far_from_base"),
+    "resolving real coordinates must still subject the item to the normal distance check, not exempt it"
+  );
+});
+
+// ==================================================
+// PART: "RESOLVER FALSE POSITIVES" — ambiguity rejection. Invented
+// geography only ("The Galleria" stands in for any generically-named real
+// place that legitimately exists in more than one metro — no place names
+// are hardcoded in the production logic itself, this is just the test's
+// own illustrative name).
+// ==================================================
+
+test("(a) two distinct, similarly-named candidates both crossing the resolver's threshold => the item stays unresolved and is treated as unproven", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({ name: "The Galleria", location: "City A", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      // A genuinely different real place sharing the exact same name, far away — real ambiguity, not a duplicate tag of the same venue.
+      buildRecommendation({ name: "The Galleria", location: "City C", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildCoordinatelessItem({ name: "The Galleria", location: "" })],
+  });
+
+  const { violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(
+    violations.some(
+      (violation) => violation.itemName === "The Galleria" && violation.geographySource === "unresolved" && violation.reason === "unverified_region_mismatch"
+    ),
+    "an ambiguous match must be reported as unresolved, never as a confident resolution to whichever candidate happened to be nearest"
+  );
+});
+
+test("(b) a single, certain recommendationId match resolves even when a similarly-named candidate also exists in the pool", () => {
+  const localGalleria = buildRecommendation({
+    id: "rec-local-galleria",
+    name: "The Galleria",
+    location: "City A",
+    lat: CITY_A_ANCHOR.lat,
+    lon: CITY_A_ANCHOR.lon,
+  });
+  const payload = buildPayload({
+    recommendations: [
+      localGalleria,
+      // A same-named, genuinely different real place elsewhere — must not poison the certain id match.
+      buildRecommendation({ name: "The Galleria", location: "City C", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildCoordinatelessItem({ name: "The Galleria", location: "", recommendationId: "rec-local-galleria" })],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.equal(violations.length, 0, "a certain recommendationId match must resolve cleanly despite the ambiguous name elsewhere in the pool");
+  assert.ok(days[0].items.some((item) => item.name === "The Galleria"));
+});
+
+// ==================================================
+// PART: "א-סימטריה בין normal לday-trip/transfer" — deriveDayType must be
+// derived from real TripFrame stay identity + coordinate geometry, never
+// from Gemini's own title/notes/transportation wording. The Hebrew request
+// asked for this to be verified explicitly; these are the acceptance tests.
+// ==================================================
+
+test("deriveDayType: a day whose real stay does not change is 'normal' even when Gemini's own text calls it a day trip", () => {
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+  const day = buildDay({
+    dayNumber: 2,
+    title: "Day trip to the crater", // Gemini's own words — must be ignored
+    notes: "יום טיול מרגש",
+    items: [buildItem({ name: "Only One Item", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon })], // too few anchors for genuine round-trip geometry
+  });
+
+  assert.equal(deriveDayType(day, tripFrame, null), "normal");
+});
+
+test("acceptance: a Gemini-labeled 'day trip' day whose real stay is unchanged is judged under full normal-day fail-closed rules", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day = buildDay({
+    dayNumber: 2,
+    title: "Day trip to the crater", // the label Gemini would use to try to escape the strict rule
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildItem({ name: "Far Crater", slot: "afternoon", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(
+    violations.some((violation) => violation.itemName === "Far Crater" && violation.repaired),
+    "the day-trip label alone must not exempt a far item on a day whose real stay never changed"
+  );
+  assert.ok(!days[0].items.some((item) => item.name === "Far Crater"));
+});
+
+test("deriveDayType: a day whose real TripFrame stay DOES change is 'transfer', regardless of text", () => {
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const day = buildDay({ dayNumber: 2, title: "Just an ordinary day", notes: "", items: [] });
+  assert.equal(deriveDayType(day, tripFrame, null), "transfer");
+});
+
+test("deriveDayType: a genuine coordinate round-trip is 'day_trip' even with no text hint at all", () => {
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const day = buildDay({
+    dayNumber: 1,
+    title: "",
+    notes: "",
+    items: [
+      buildItem({ name: "A", plannedStartTime: "08:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildItem({ name: "B", plannedStartTime: "12:00", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+      buildItem({ name: "C", plannedStartTime: "18:00", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+    ],
+  });
+  assert.equal(deriveDayType(day, tripFrame, null), "day_trip");
+});
+
+test("deriveDayType: arrival/departure are derived from the real flight-leg date, never text", () => {
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+  const window = {
+    earliestUsableTimeOnArrivalDay: { date: "2026-11-01", time: "14:00" },
+    latestUsableTimeOnDepartureDay: { date: "2026-11-03", time: "10:00" },
+  };
+  const arrivalDay = buildDay({ dayNumber: 1, date: "2026-11-01", title: "Ordinary title" });
+  const departureDay = buildDay({ dayNumber: 3, date: "2026-11-03", title: "Ordinary title" });
+  const middleDay = buildDay({ dayNumber: 2, date: "2026-11-02", title: "Ordinary title" });
+
+  assert.equal(deriveDayType(arrivalDay, tripFrame, window), "arrival");
+  assert.equal(deriveDayType(departureDay, tripFrame, window), "departure");
+  assert.equal(deriveDayType(middleDay, tripFrame, window), "normal");
+});
+
+// ==================================================
+// PART: "מכני, לא קריאה ידנית" — computeGeographyDiagnostics acceptance.
+// A real stay change (day 2) with NO transfer-sounding text at all (a
+// real dayTypeMismatch), and a coordinate-less item that only resolves
+// via a fuzzy name match against the trip's own candidate pool.
+// ==================================================
+
+test("computeGeographyDiagnostics: acceptance — shows a real dayTypeMismatch and a real fuzzyName resolution", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ name: "Old Town Market", location: "City A", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon })],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day1 = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [buildCoordinatelessItem({ name: "Old Town Market", location: "" })], // resolves via fuzzy name only
+  });
+  // Day 2 is a REAL stay change (City A -> City B) but its own text gives
+  // no hint of that at all — exactly the asymmetry the report investigated.
+  const day2 = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    title: "Just another day",
+    notes: "",
+    transportation: "הליכה",
+    items: [buildItem({ name: "City B Anchor", lat: CITY_B_ANCHOR.lat, lon: CITY_B_ANCHOR.lon })],
+  });
+
+  const diagnostics = computeGeographyDiagnostics(
+    [day1, day2],
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload,
+    profile,
+    null
+  );
+
+  // Print the full table — the acceptance ask was "show me the rows."
+  console.log("\n[computeGeographyDiagnostics acceptance demo]");
+  for (const day of diagnostics) {
+    console.log(
+      `day ${day.dayNumber} | owner=${day.ownerStay} | derived=${day.derivedDayType} | textual=${day.textualDayType} | mismatch=${day.dayTypeMismatch} | totalLeg=${day.totalLegMinutes} | maxLeg=${day.maxLegMinutes} | unresolved=${day.unresolvedItemCount}`
+    );
+    for (const item of day.items) {
+      console.log(
+        `  - ${item.itemName} | geoSource=${item.geoSource} | precision=${item.precision} | ownerStay=${item.ownerStay} | legMinutes=${item.legMinutes} | verdict=${item.verdict} | rule=${item.verdictRule}`
+      );
+    }
+  }
+
+  const day1Diag = diagnostics.find((d) => d.dayNumber === 1)!;
+  const day2Diag = diagnostics.find((d) => d.dayNumber === 2)!;
+
+  assert.equal(day2Diag.derivedDayType, "transfer", "day 2's real stay change must be detected structurally");
+  assert.equal(day2Diag.textualDayType, "normal", "day 2's own text gives no transfer hint at all");
+  assert.equal(day2Diag.dayTypeMismatch, true, "the two classifiers must be shown to disagree");
+
+  const fuzzyItem = day1Diag.items.find((item) => item.itemName === "Old Town Market")!;
+  assert.equal(fuzzyItem.geoSource, "fuzzyName");
+  assert.equal(fuzzyItem.precision, "point");
+  assert.equal(fuzzyItem.verdict, "passed", "a correctly-resolved, in-radius item must show as passed, not flagged");
+});
+
+// ==================================================
+// PART: real QA replay architectural pass — day-type authority, semantic
+// role, and the golden-replay regression (Annapolis/Los-Angeles shape).
+// ==================================================
+
+// Point E — day-type invariant: authority must come from the STRUCTURAL
+// classifier (derivedDayType), never the textual one, even when the two
+// disagree. Reuses the exact day1/day2 dayTypeMismatch shape from the
+// acceptance test above, but now also plants a genuinely wrong-owner item
+// on day 2 — proving the mismatch itself never causes geography to be
+// skipped (a mismatch used to be purely informational).
+test("day-type authority: a real dayTypeMismatch (derived=transfer, textual=normal) does not exempt genuinely wrong-owner content from being flagged", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day1 = buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "City A Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon })] });
+  // Day 2: a real stay change (derived=transfer) but its own text says
+  // nothing of the sort (textual=normal) — the SAME mismatch shape as the
+  // acceptance test — PLUS a genuinely wrong-owner item (belongs to
+  // neither City A nor City B) that must still be caught.
+  const day2 = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    title: "Just another day",
+    notes: "",
+    transportation: "הליכה",
+    items: [
+      buildItem({ name: "City B Anchor", lat: CITY_B_ANCHOR.lat, lon: CITY_B_ANCHOR.lon }),
+      buildItem({ name: "Genuinely Unrelated Place", lat: CITY_A_ANCHOR.lat + 40, lon: CITY_A_ANCHOR.lon + 40, estimatedDurationMinutes: 90 }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day1, day2], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(
+    violations.some((v) => v.itemName === "Genuinely Unrelated Place"),
+    "a dayTypeMismatch must never itself be a reason to skip geography validation"
+  );
+  assert.ok(!days[1].items.some((item) => item.name === "Genuinely Unrelated Place"));
+});
+
+// The other, more dangerous direction of the SAME invariant: prose that
+// FALSELY claims a transfer/day-trip (derived=normal — the real stay never
+// changes — but textual=transfer, from Gemini's own notes text) must never
+// grant the exemption. Authority must come from the real TripFrame stay
+// structure, never generated prose — this is the exact case that would
+// silently start passing if day-type authority were ever swapped from
+// derivedDayType to textualDayType.
+test("day-type authority: prose that falsely claims a transfer (textual=transfer, derived=normal — the real stay never changes) does not exempt wrong-owner content", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  // A SINGLE-phase trip — day 2 stays in the same real stay as day 1, so
+  // derivedDayType must be "normal" regardless of what the day's own text
+  // says.
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 2, startDayNumber: 1, endDayNumber: 2 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day1 = buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "City A Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon })] });
+  const day2 = buildDay({
+    dayNumber: 2,
+    cityRegion: "City A",
+    title: "יום מעבר", // falsely claims "transfer" — the real stay (tripFrame) never changes
+    notes: "",
+    transportation: "",
+    items: [
+      buildItem({ name: "City A Anchor 2", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      // ~70km — beyond this profile's own 25km locality radius (so the
+      // correct "normal day" strict check flags it), but well within a
+      // generous day-trip-style feasibility budget (so a wrongly-granted
+      // exemption would let it through). A thousands-of-km distance
+      // wouldn't discriminate this specific mutation: it's extreme enough
+      // to fail EITHER check, correct or wrongly-exempted alike.
+      buildItem({ name: "Genuinely Unrelated Place", lat: CITY_A_ANCHOR.lat + 0.63, lon: CITY_A_ANCHOR.lon, estimatedDurationMinutes: 90 }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day1, day2], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(
+    violations.some((v) => v.itemName === "Genuinely Unrelated Place"),
+    "prose falsely claiming a transfer must never exempt a day whose real stay never changed"
+  );
+  assert.ok(!days[1].items.some((item) => item.name === "Genuinely Unrelated Place"));
+});
+
+// Point B — semantic role: a synthetic free-time block (itemRole:
+// "free_time") must never be reported as a real, verified place — even
+// though its category ("attraction") is indistinguishable from a genuine
+// one, and even though its Hebrew display text ("free time to explore...")
+// is never inspected. This is exactly the reported shape: "זמן פנוי לגלות
+// את שיקגו בקצב שלכם", category attraction, geoSource unresolved, verdict
+// passed — the fix classifies it "n/a", not "unresolved"/"passed" as if it
+// were a validated real POI.
+test("semantic role: a synthetic free-time block is never classified as a real, verified place", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const freeTimeBlock = buildCoordinatelessItem({
+    name: "Free time to explore at your own pace",
+    category: "attraction",
+    itemRole: "free_time",
+    location: "",
+  });
+  const day = buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "City A Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }), freeTimeBlock] });
+
+  const diagnostics = computeGeographyDiagnostics([day], tripFrame, areaAnchors, mobilityProfile, payload, profile, null);
+  const item = diagnostics[0].items.find((entry) => entry.itemName === "Free time to explore at your own pace")!;
+
+  assert.equal(item.geoSource, "n/a", "a synthetic free-time block is not a real place claim at all — never 'unresolved' (which implies an unverifiable real one)");
+});
+
+// Point I — golden replay: the real captured shape (a resolved real POI
+// thousands of minutes from its assigned stay, receiving verdict
+// "passed"). Uses the REAL Annapolis/Los Angeles coordinates from the
+// actual QA replay (per the request's own allowance — the fixture may
+// contain real captured data even though the unit invariants above use
+// synthetic coordinates).
+test("golden replay: a resolved real POI thousands of minutes from its assigned stay can never receive verdict 'passed' (Annapolis/Los Angeles shape)", () => {
+  const LOS_ANGELES = { lat: 34.0522, lon: -118.2437 };
+  const ANNAPOLIS = { lat: 38.9784, lon: -76.4922 };
+
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "Los Angeles", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["Los Angeles", LOS_ANGELES]]);
+  const mobilityProfile = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+
+  // Same structural round-trip shape (departure/excursion/return) that
+  // earns a real "day_trip" derivedDayType — matching the real replay's
+  // own item category ("day_trip").
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "Los Angeles",
+    items: [
+      buildItem({ name: "Morning Departure", slot: "morning", plannedStartTime: "08:00", lat: LOS_ANGELES.lat, lon: LOS_ANGELES.lon }),
+      buildItem({
+        name: "Annapolis",
+        category: "day_trip",
+        recommendationId: "rec-annapolis",
+        slot: "afternoon",
+        plannedStartTime: "12:00",
+        lat: ANNAPOLIS.lat,
+        lon: ANNAPOLIS.lon,
+        estimatedDurationMinutes: 90,
+      }),
+      buildItem({ name: "Evening Return", slot: "evening", plannedStartTime: "18:00", lat: LOS_ANGELES.lat, lon: LOS_ANGELES.lon }),
+    ],
+  });
+
+  const diagnostics = computeGeographyDiagnostics([day], tripFrame, areaAnchors, mobilityProfile, payload, profile, null);
+  const annapolisDiag = diagnostics[0].items.find((entry) => entry.itemName === "Annapolis")!;
+
+  console.log(`[golden replay] Annapolis: legMinutes=${annapolisDiag.legMinutes}, verdict=${annapolisDiag.verdict}, rule=${annapolisDiag.verdictRule}`);
+
+  assert.ok((annapolisDiag.legMinutes ?? 0) > 5000, "sanity: this really is a cross-country, thousands-of-minutes distance");
+  assert.notEqual(annapolisDiag.verdict, "passed", "a real POI thousands of minutes from its assigned stay must never receive verdict 'passed'");
+  assert.equal(annapolisDiag.verdictRule, "enforceNormalDayLocality: infeasible_day_excursion");
+
+  // And the real repair pipeline actually removes it, not just flags it.
+  const { days } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.ok(!days[0].items.some((item) => item.name === "Annapolis"));
+});
+
+// ==================================================
+// PART: "FAIL CLOSED ON MISSING COMPARISON GEOMETRY" — a second, separate
+// real QA replay found the SAME symptom (ownerStay incompatible,
+// legMinutes: null, verdict: passed) via a DIFFERENT mechanism than the
+// day-trip exemption above: refineTripFrameWithGemini renamed a phase's
+// areaLabel to a broad display name (a real example: a specific city
+// relabeled to "California Coast") with no matching entry in areaAnchors
+// (built independently from the pool's own raw location text, never
+// re-derived after the rename) — the phase's anchor was silently
+// orphaned, and enforceNormalDayLocality's own "no anchor -> skip the
+// whole day" default let genuinely unrelated real POIs (New
+// York/Chicago/Tennessee content in the real replay) "pass" purely
+// because there was nothing to compare against. Synthetic City A/B — the
+// real broad-label bug is reproduced generically, not by name-matching
+// "California Coast".
+// ==================================================
+
+test("golden replay: a broad/relabeled stay with NO resolvable anchor cannot let a genuinely unrelated real POI 'pass'", () => {
+  const CITY_B_FAR = { lat: 60.0, lon: 60.0 }; // genuinely unrelated real city, far from City A
+
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  // The phase's OWN areaLabel ("Broad Regional Label") has NO entry in
+  // areaAnchors — the exact real desync: a relabeled/broad stay whose
+  // display name never matches any raw pool location text.
+  const tripFrame = buildTestFrame([{ areaLabel: "Broad Regional Label", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map<string, { lat: number; lon: number } | null>(); // deliberately empty — no anchor for "Broad Regional Label" at all
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "Broad Regional Label",
+    items: [
+      buildItem({ name: "Unrelated Landmark 1", recommendationId: "rec-unrelated-1", lat: CITY_B_FAR.lat, lon: CITY_B_FAR.lon }),
+      buildItem({ name: "Unrelated Landmark 2", recommendationId: "rec-unrelated-2", lat: CITY_B_FAR.lat + 0.01, lon: CITY_B_FAR.lon }),
+    ],
+  });
+
+  const diagnostics = computeGeographyDiagnostics([day], tripFrame, areaAnchors, mobilityProfile, payload, profile, null);
+  const item1 = diagnostics[0].items.find((entry) => entry.itemName === "Unrelated Landmark 1")!;
+
+  assert.equal(item1.legMinutes, null, "sanity: with no owner anchor, legMinutes genuinely cannot be computed");
+  assert.notEqual(item1.verdict, "passed", "a resolved real POI must never receive verdict 'passed' merely because its owning stay has no anchor to compare against");
+  assert.equal(item1.verdictRule, "enforceNormalDayLocality: unresolved_owner_geometry");
+
+  const summary = summarizeGeographyDiagnostics(diagnostics);
+  assert.equal(summary.realItemsWithNullLegGeometry, 2);
+  assert.equal(summary.realItemsWithUnresolvedOwnerGeometry, 2);
+  assert.equal(summary.ownerGeometryMissingDays, 1);
+
+  // The real repair pipeline actually flags/removes both — not a silent skip.
+  const { violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.equal(violations.filter((v) => v.reason === "unresolved_owner_geometry").length, 2);
+});
+
+test("4. a future-stay item with no coordinates cannot leak into the current stay's normal day", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const day1 = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildCoordinatelessItem({ name: "City B's Own Museum", location: "City B" }),
+    ],
+  });
+
+  const { days } = enforceNormalDayLocality([day1], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.ok(!days[0].items.some((item) => item.name === "City B's Own Museum"));
+});
+
+test("day-trip day: a coordinate-less item matching a DIFFERENT known stay is rejected, even though day-trip content is otherwise exempt", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const dayTrip = buildDay({
+    dayNumber: 1,
+    title: "Day trip from City A",
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Local Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      // Really City B's own content, mislabeled as a City-A day trip — the Chicago -> Point Reyes shape.
+      buildCoordinatelessItem({ name: "City B Landmark", location: "City B" }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([dayTrip], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "City B Landmark" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "City B Landmark"));
+});
+
+test("transfer day: an unrelated third-region item is rejected — the New Orleans -> Cleveland/Beverly-Hills/LAX shape", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+  const tripFrame = buildTestFrame([
+    { areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "City B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+    { areaLabel: "City C", nights: 1, startDayNumber: 3, endDayNumber: 3 },
+  ]);
+  const areaAnchors = new Map([
+    ["City A", CITY_A_ANCHOR],
+    ["City B", CITY_B_ANCHOR],
+    ["City C", CITY_C_ANCHOR],
+  ]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const transferDay = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    notes: "יום מעבר בין בסיסים",
+    transportation: "טיסה",
+    items: [
+      // Neither City B (today's stay) nor City A/nothing — a genuine third-region detour, matching City C exactly.
+      buildCoordinatelessItem({ name: "City C Detour", location: "City C" }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([transferDay], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "City C Detour" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "City C Detour"));
+});
+
+// ==================================================
+// PART: "AIRPORTS ARE NOT ATTRACTIONS" — enforceTransportRoleGuard
+// ==================================================
+
+test("enforceTransportRoleGuard repairs an airport used as a normal sightseeing item", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "City International Airport", category: "attraction" })],
+  });
+
+  const { days, violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "City International Airport" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "City International Airport"));
+});
+
+test("enforceTransportRoleGuard leaves an airport alone when it's already the legitimate transportation category", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "City International Airport", category: "transportation" })],
+  });
+
+  const { violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.equal(violations.length, 0);
+});
+
+test("enforceTransportRoleGuard leaves a real airport mention alone on a genuine transfer day", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    notes: "יום מעבר בין בסיסים",
+    items: [buildItem({ name: "City International Airport", category: "attraction" })],
+  });
+
+  const { violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.equal(violations.length, 0);
+});
+
+// Spec "תיקון גנרי, לא תיקון תשיעי" — enforceTransportRoleGuard's own
+// replacement call used to hand pickReplacementRecommendation a day view
+// that still included the airport/station item being repaired, so a
+// candidate close only to IT (never to the day's real anchor) could pass.
+test("enforceTransportRoleGuard never selects a replacement close only to the airport item itself, not to the day's real anchor", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({
+        id: "fake-near-airport",
+        name: "Fake Nearby To Airport Only",
+        category: "attraction",
+        location: "Nowhere Real",
+        // Close to the airport (11.26, 10) — far from the real base (10, 10).
+        lat: 11.261,
+        lon: 10.001,
+      }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    transportation: "רכב",
+    items: [
+      buildItem({ name: "Base Anchor", category: "attraction", lat: 10, lon: 10, transportation: "רכב" }),
+      // ~140km real distance, explicit "רכב" — the same real-walking-speed
+      // scheduling-overflow trap as the other new tests this round.
+      buildItem({ name: "City International Airport", category: "attraction", slot: "afternoon", lat: 11.26, lon: 10, transportation: "רכב" }),
+    ],
+  });
+
+  const { days } = enforceTransportRoleGuard([day], payload, profile);
+
+  assert.ok(!days[0].items.some((item) => item.name === "City International Airport"), "the airport item must not survive under its original name");
+  assert.ok(
+    !days[0].items.some((item) => item.name === "Fake Nearby To Airport Only"),
+    "a candidate close only to the airport item being replaced must never be selected"
+  );
+});
+
 // Real bug found during end-to-end QA generation (a live 10-day Israel
 // trip with zero real recommendation candidates, since Overpass was
 // unreachable): 7 of the 10 fallback days collapsed to just a lunch and a
@@ -2180,6 +4101,29 @@ test("buildFallbackAiItinerary fills non-meal slots with a generic activity plac
       !foodOnly,
       `day ${day.dayNumber} must have at least one non-food anchor even with zero real candidates, got: ${day.items.map((i) => i.category).join(", ")}`
     );
+  }
+});
+
+// Part "FOOD CLEANUP" — buildFallbackAiItinerary (trip-workspace.ts) has
+// its own, entirely separate meal-placeholder path from country-
+// itinerary-generation.ts's buildFallbackMealPlaceholder — a real gap
+// found during audit where the old "מסעדה מקומית באזור..."-style fake
+// business names still existed here even after the other path was fixed.
+// This confirms ONE behavior across both fallback paths now.
+test("buildFallbackAiItinerary's own meal fallback also produces a real meal opportunity, never an invented business name", () => {
+  const payload = buildPayload({
+    preferences: { ...basePreferences, startDate: "2026-09-01", endDate: "2026-09-02", tripPace: "balanced" },
+    recommendations: [],
+    selectedPlaces: [],
+  });
+
+  const fallback = buildFallbackAiItinerary(payload);
+  const mealItems = fallback.days.flatMap((day) => day.items).filter((item) => item.category === "cafe" || item.category === "restaurant");
+  assert.ok(mealItems.length > 0, "sanity check: this fixture does produce fallback meal items");
+  for (const mealItem of mealItems) {
+    assert.ok(isMealOpportunityMarker(mealItem), `"${mealItem.name}" must be recognized as a meal opportunity`);
+    assert.ok(mealItem.name.startsWith("🍽"), `"${mealItem.name}" must not read as an invented business name`);
+    assert.equal(mealItem.approximatePrice, null);
   }
 });
 
@@ -2216,22 +4160,65 @@ test("repairCrossRegionDayContent moves an already-wrong-region item to the othe
 });
 
 test("repairCrossRegionDayContent replaces a wrong-region item with a geographically-neutral local alternative when no other day fits", () => {
-  const payload = buildPayload({ recommendations: [], selectedPlaces: [] });
+  // A real candidate that exists only in the mutation-audit's original
+  // empty-pool version's blind spot: close only to the outlier itself,
+  // never to the day's real anchor (Tokyo Tower) — the same "outlier
+  // still counted as its own anchor" bug this function had, now fixed the
+  // same way repairNormalDayTravelOutliers was. transportation is
+  // explicitly "רכב" (car) and the distance kept moderate (~98km, still
+  // well past the 80km default CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM)
+  // rather than the real Tokyo-Kyoto ~370km — at buildItem's own default
+  // walking speed, that real distance produces a multi-day travelMinutes
+  // that the scheduler rejects as overflow regardless of geography,
+  // which would silently mask whether the geographic check is what's
+  // actually doing the rejecting here.
+  const nearOutlierFarFromTokyo = buildRecommendation({
+    id: "near-outlier-1",
+    name: "Fake Nearby To Outlier Only",
+    category: "attraction",
+    location: "Nowhere Real",
+    lat: 34.81,
+    lon: 139.77,
+  });
+  const payload = buildPayload({ recommendations: [nearOutlierFarFromTokyo], selectedPlaces: [] });
   const profile = buildTripPreferenceProfile(basePreferences, "Japan", 1);
 
-  const kyotoOutlier = buildItem({ name: "Kyoto Temple", location: "Kyoto", lat: 35.0157, lon: 135.7681 });
+  // ~98km (well past the 80km default CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM)
+  // rather than the real Tokyo-Kyoto ~370km — at buildItem's own default
+  // walking speed, that real distance produces a multi-day travelMinutes
+  // that the scheduler rejects as overflow regardless of geography, which
+  // would silently mask whether the geographic check is what's actually
+  // doing the rejecting here. Explicit "רכב" keeps the estimate realistic.
+  const distantOutlier = buildItem({ name: "Distant Outlier", location: "Nowhere Real", lat: 34.8, lon: 139.76, transportation: "רכב" });
+  // Tokyo Tower is locked — with only two items, analyzeDayGeography's
+  // pairwise cross-city check flags BOTH sides of the mismatched pair (it
+  // has no way to know which of the two is "the real base"), so
+  // repairCrossRegionDayContent would also try to "repair" Tokyo Tower
+  // itself first, against a day view that (correctly, per the fix) then
+  // excludes Tokyo Tower — leaving only the outlier as the sole
+  // "anchor" and letting a candidate close to the outlier slip through
+  // for THAT round. Locking Tokyo Tower makes it a protectedGeographicConflict
+  // instead (skipped, never removed as an anchor), so it stays the one
+  // real anchor Distant Outlier's own replacement is judged against.
   const dayOne = buildDay({
     dayNumber: 1,
     cityRegion: "Tokyo",
-    items: [buildItem({ name: "Tokyo Tower" }), kyotoOutlier],
+    transportation: "רכב",
+    items: [buildItem({ name: "Tokyo Tower", transportation: "רכב", locked: true }), distantOutlier],
   });
 
-  const { days } = repairCrossRegionDayContent([dayOne], payload, profile);
+  const { days, protectedGeographicConflicts } = repairCrossRegionDayContent([dayOne], payload, profile);
 
-  assert.ok(!days[0].items.some((item) => item.name === "Kyoto Temple"), "outlier must not survive under its original name");
+  assert.ok(days[0].items.some((item) => item.name === "Tokyo Tower"), "the locked real anchor must survive untouched");
+  assert.ok(!days[0].items.some((item) => item.name === "Distant Outlier"), "outlier must not survive under its original name");
+  assert.ok(
+    !days[0].items.some((item) => item.name === "Fake Nearby To Outlier Only"),
+    "a candidate close only to the outlier being replaced (not to the day's real anchor) must never be selected"
+  );
   const replacement = days[0].items.find((item) => item.name !== "Tokyo Tower");
   assert.ok(replacement, "outlier must be replaced, not silently dropped");
   assert.equal(replacement?.lat, null, "a placeholder replacement must be geographically neutral, never inherit the outlier's real coordinates");
+  assert.ok(protectedGeographicConflicts.length >= 1, "Tokyo Tower being (mutually) flagged and locked must still surface as a protected conflict, not silently vanish");
 });
 
 test("repairCrossRegionDayContent never moves, replaces, or removes a locked/fixed-time outlier — it reports a protectedGeographicConflict instead", () => {
@@ -2317,4 +4304,280 @@ test("passesValidation still passes despite a protectedGeographicConflict — pr
     ],
   });
   assert.equal(passesValidation(diagnostics), true);
+});
+
+// =====================================================================
+// ITINERARY-WIDE USAGE STATE — root-cause fix for the real 43-day US
+// replay (Times Square/Central Park first placed correctly by
+// deterministic_template in New York, then RE-inserted by locality_repair
+// into Austin/Philadelphia/Nashville/Chicago/Boston/etc., every one
+// reporting alreadyUsedAtInsertion:false). Every repair pass used to
+// rebuild its own "used" Set from only the single day it was actively
+// repairing, discarding every other day's content — these tests prove
+// the itinerary-wide ItineraryUsageState closes that gap for each of the
+// named repair paths, per spec §H's 10 required scenarios.
+// =====================================================================
+
+const USAGE_CITY_ANCHOR = { lat: 41.5, lon: -75.5 };
+
+// 1 & 4. A place already scheduled on day 1 must never be selected again
+// by locality_repair on a later day, even when it's the ONLY
+// geographically compatible candidate — same recommendationId collision.
+test("enforceNormalDayLocality never reinserts a real place already scheduled on an earlier day (itinerary-wide usage)", () => {
+  const placeA = buildRecommendation({
+    id: "place-a",
+    name: "Place A",
+    category: "attraction",
+    location: "City A",
+    lat: USAGE_CITY_ANCHOR.lat,
+    lon: USAGE_CITY_ANCHOR.lon,
+  });
+  const payload = buildPayload({ recommendations: [placeA] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 10);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 10, startDayNumber: 1, endDayNumber: 10 }]);
+  const areaAnchors = new Map([["City A", USAGE_CITY_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day1 = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [buildItem({ name: "Place A", recommendationId: "place-a", lat: USAGE_CITY_ANCHOR.lat, lon: USAGE_CITY_ANCHOR.lon })],
+  });
+  const day10 = buildDay({
+    dayNumber: 10,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "Local Anchor", lat: USAGE_CITY_ANCHOR.lat, lon: USAGE_CITY_ANCHOR.lon }),
+      // Far outside the locality radius — must be repaired. Place A is the
+      // ONLY candidate in the pool, so a broken "used" check would recycle it.
+      buildItem({ name: "Far Outlier", slot: "afternoon", lat: CITY_C_ANCHOR.lat, lon: CITY_C_ANCHOR.lon }),
+    ],
+  });
+
+  const { days } = enforceNormalDayLocality([day1, day10], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  const placeACount = days.flatMap((day) => day.items).filter((item) => item.recommendationId === "place-a").length;
+  assert.equal(placeACount, 1, "Place A must appear exactly once across the whole itinerary, never recycled onto day 10");
+  assert.ok(!days[1].items.some((item) => item.recommendationId === "place-a"));
+});
+
+// 2 & 3. Multiple sequential replacements in the SAME pass must see each
+// other's insertions immediately — and releasing an item for its OWN
+// replacement slot must never unblock a DIFFERENT identity.
+test("pickReplacementRecommendation: sequential replacements in one pass immediately see each other's insertions, and releasing an item never unblocks a different one", () => {
+  const placeB = buildRecommendation({ id: "place-b", name: "Place B", category: "attraction", location: "City A", lat: 10.001, lon: 10.001 });
+  const placeC = buildRecommendation({ id: "place-c", name: "Place C", category: "attraction", location: "City A", lat: 10.002, lon: 10.002 });
+  const payload = buildPayload({ recommendations: [placeB, placeC] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const anchor = buildItem({ name: "Anchor", lat: 10, lon: 10 });
+  const outlier1 = buildItem({ name: "Outlier 1", lat: 90, lon: 90, recommendationId: null });
+  const day = buildDay({ dayNumber: 1, items: [anchor, outlier1] });
+
+  const usageState = createItineraryUsageState();
+
+  // First repair selects a real candidate (Place B or C) and registers it.
+  const firstPick = pickReplacementRecommendation({ payload, day, item: outlier1, profile, usageState });
+  assert.ok(firstPick, "expected a real candidate to be found for the first replacement");
+  registerItineraryUsage(usageState, { recommendationId: firstPick!.id, name: firstPick!.name, lat: firstPick!.lat, lon: firstPick!.lon, itemRole: "real_place" as const });
+
+  // A second repair, same pass, same usageState, must immediately see the
+  // first pick as used and be forced onto the OTHER real candidate.
+  const outlier2 = buildItem({ name: "Outlier 2", lat: 91, lon: 91, recommendationId: null });
+  const secondPick = pickReplacementRecommendation({ payload, day: { ...day, items: [anchor, outlier2] }, item: outlier2, profile, usageState });
+  assert.ok(secondPick, "expected a real candidate to be found for the second replacement");
+  assert.notEqual(secondPick!.id, firstPick!.id, "the second replacement must never repeat the first pass's own selection");
+  registerItineraryUsage(usageState, { recommendationId: secondPick!.id, name: secondPick!.name, lat: secondPick!.lat, lon: secondPick!.lon, itemRole: "real_place" as const });
+
+  // Now replace the FIRST pick's own slot: releasing it must allow IT
+  // to be picked again (this is its own replacement slot), but the
+  // second pick's identity must remain blocked throughout.
+  releaseItineraryUsage(usageState, { recommendationId: firstPick!.id, name: firstPick!.name, lat: firstPick!.lat, lon: firstPick!.lon, itemRole: "real_place" as const });
+  assert.equal(isItineraryPlaceUsed(usageState, { id: firstPick!.id, name: firstPick!.name, lat: firstPick!.lat, lon: firstPick!.lon }), false, "releasing an item for its own replacement slot must unblock exactly that identity");
+  assert.equal(isItineraryPlaceUsed(usageState, { id: secondPick!.id, name: secondPick!.name, lat: secondPick!.lat, lon: secondPick!.lon }), true, "every OTHER identity must remain blocked while one specific item is being replaced");
+});
+
+// 5. A category alias — a different recommendationId claiming the same
+// normalized name + real coordinates — must still count as already used.
+test("isItineraryPlaceUsed rejects a category alias: different recommendationId, same normalized name + coordinates", () => {
+  const usageState = createItineraryUsageState();
+  registerItineraryUsage(usageState, {
+    recommendationId: "attraction-id",
+    name: "Golden Gate Park",
+    lat: 37.7694,
+    lon: -122.4862,
+    itemRole: "real_place",
+  });
+
+  const outdoorRecreationAlias = { id: "outdoor-recreation-id", name: "Golden Gate Park", lat: 37.7694, lon: -122.4862 };
+  assert.equal(
+    isItineraryPlaceUsed(usageState, outdoorRecreationAlias),
+    true,
+    "a different id claiming the same real place by name+coordinates must still be treated as already used"
+  );
+});
+
+// 6. When the legal pool is exhausted purely because every local candidate
+// is already used, that is the CORRECT outcome — the caller falls to a
+// placeholder, never a recycled real POI.
+test("buildLegalDayCandidatePool returns empty (not a recycled real POI) when every local candidate is already used", () => {
+  const onlyCandidate: TripRecommendation = buildRecommendation({ id: "only-one", name: "Only One", lat: 10, lon: 10 });
+  const usageState = createItineraryUsageState();
+  registerItineraryUsage(usageState, { recommendationId: "only-one", name: "Only One", lat: 10, lon: 10, itemRole: "real_place" as const });
+
+  const legalPool = buildLegalDayCandidatePool({
+    pool: [onlyCandidate],
+    ownerAnchors: [{ lat: 10, lon: 10 }],
+    usedToday: new Set(),
+    usageCounts: usageState.usageCounts,
+    usedRealPlaces: usageState.usedRealPlaces,
+  });
+
+  assert.deepEqual(legalPool, [], "the only real candidate is already used — an empty legal pool (leading to a placeholder) is the correct outcome, not recycling it");
+});
+
+// 7. opening_hours_repair must never reinsert a real POI already used
+// elsewhere in the itinerary, even when it's the only real candidate that
+// would otherwise fit.
+test("repairOpeningHoursViolations never reinserts a real place already used on another day", () => {
+  const placeA = buildRecommendation({
+    id: "place-a",
+    name: "Place A",
+    category: "nature",
+    location: "Eilat",
+    openingHours: "08:00-18:00",
+    lat: 29.55,
+    lon: 34.95,
+  });
+  const payload = buildPayload({ recommendations: [placeA] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Israel", 2);
+
+  const usedDay = buildDay({
+    dayNumber: 1,
+    cityRegion: "Eilat",
+    items: [buildItem({ name: "Place A", category: "nature", recommendationId: "place-a", lat: 29.55, lon: 34.95 })],
+  });
+  const violatingDay = buildDay({
+    dayNumber: 2,
+    cityRegion: "Eilat",
+    items: [
+      buildItem({ name: "Timna Park", category: "nature", openingHours: "08:00-16:00", plannedStartTime: "19:52", lat: 29.55, lon: 34.95 }),
+    ],
+  });
+
+  const [, repairedViolatingDay] = repairOpeningHoursViolations([usedDay, violatingDay], payload, profile);
+
+  assert.equal(
+    repairedViolatingDay.items.some((item) => item.recommendationId === "place-a"),
+    false,
+    "Place A is already used on day 1 and must never be reinserted on day 2"
+  );
+});
+
+// 8. day_fill must never reinsert a real POI already used elsewhere in the
+// itinerary.
+test("fillUnderfilledDay never reinserts a real place already used elsewhere (shared itinerary-wide usage state)", () => {
+  const placeA = buildRecommendation({ id: "place-a", name: "Place A", estimatedDurationMinutes: 150, lat: 35.681, lon: 139.767 });
+  const payload = buildPayload({ recommendations: [placeA] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
+
+  const usageState = buildItineraryUsageState([
+    buildDay({ dayNumber: 1, items: [buildItem({ name: "Place A", recommendationId: "place-a", lat: 35.681, lon: 139.767 })] }),
+  ]);
+  const emptyDay = buildDay({ dayNumber: 2, items: [] });
+
+  const filled = fillUnderfilledDay(emptyDay, payload, profile, usageState);
+
+  assert.equal(
+    filled.items.some((item) => item.recommendationId === "place-a"),
+    false,
+    "Place A is already used on day 1 (shared usageState) and must never be inserted into day 2's fill"
+  );
+});
+
+// 9. transfer_repair (enforceArrivalDepartureWindow's replacement path)
+// must never reinsert a real POI already used elsewhere in the itinerary.
+test("enforceArrivalDepartureWindow's replacement path never reinserts a real place already used on another day", () => {
+  const placeA = buildRecommendation({
+    id: "place-a",
+    name: "Place A",
+    category: "attraction",
+    location: "Marne-la-Vallée",
+    lat: 48.867,
+    lon: 2.781,
+  });
+  const payload = buildPayload({ recommendations: [placeA] });
+  const profile = buildTripPreferenceProfile(basePreferences, "France", 3);
+  const middleDay = buildDay({
+    dayNumber: 2,
+    date: "2026-09-16",
+    items: [buildItem({ name: "Place A", recommendationId: "place-a", lat: 48.867, lon: 2.781 })],
+  });
+  const departureDay = buildDay({
+    dayNumber: 3,
+    date: "2026-09-17",
+    cityRegion: "Marne-la-Vallée",
+    items: [
+      buildItem({
+        name: "Overrunning Stroll",
+        category: "attraction",
+        location: "Marne-la-Vallée",
+        shortDescription: "A national park hike",
+        slot: "morning",
+        plannedStartTime: "10:18",
+        estimatedDurationMinutes: 300,
+        lat: 48.867,
+        lon: 2.781,
+      }),
+    ],
+  });
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: { date: "2026-09-17", time: "13:15" } };
+
+  const [, repairedDeparture] = enforceArrivalDepartureWindow([middleDay, departureDay], payload, profile, window, 3);
+
+  assert.equal(
+    repairedDeparture.items.some((item) => item.recommendationId === "place-a"),
+    false,
+    "Place A is already used on day 2 and must never be reinserted on the departure day"
+  );
+});
+
+// 10. A Gemini-resolved duplicate (the SAME real place authored on two
+// different days by Gemini itself) must be caught and replaced at
+// ingestion, before any downstream repair pass ever sees it.
+test("repairPlan rejects a Gemini-authored duplicate at ingestion (same recommendationId across two days)", () => {
+  const duplicatePlace = buildRecommendation({
+    id: "dup-place",
+    name: "Duplicate Place",
+    category: "attraction",
+    location: "Tokyo",
+    lat: 35.681,
+    lon: 139.767,
+  });
+  const payload = buildPayload({ recommendations: [duplicatePlace] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Japan", 3);
+  const tripFrame = buildTestFrame([{ areaLabel: "Tokyo", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+
+  const rawItem = (): RawGeneratedItem => ({
+    name: "Duplicate Place",
+    category: "attraction",
+    location: "Tokyo",
+    shortDescription: "A real place Gemini authored twice",
+    slot: "morning",
+    plannedStartTime: "10:00",
+    estimatedDurationMinutes: 90,
+  });
+  const raw: RawGeneratedPlan = {
+    title: "Test Plan",
+    summary: "",
+    days: [
+      { dayNumber: 1, date: "2026-10-06", title: "Day 1", cityRegion: "Tokyo", accommodation: "Hotel", notes: "", transportation: "", items: [rawItem()] },
+      { dayNumber: 2, date: "2026-10-07", title: "Day 2", cityRegion: "Tokyo", accommodation: "Hotel", notes: "", transportation: "", items: [rawItem()] },
+      { dayNumber: 3, date: "2026-10-08", title: "Day 3", cityRegion: "Tokyo", accommodation: "Hotel", notes: "", transportation: "", items: [] },
+    ],
+  };
+
+  const result = repairPlan(raw, payload, profile, tripFrame, null, undefined, 1);
+
+  const duplicateCount = result.days.flatMap((day) => day.items).filter((item) => item.recommendationId === "dup-place").length;
+  assert.equal(duplicateCount, 1, "the same Gemini-authored real place must survive on only ONE day, the second occurrence rejected at ingestion");
 });

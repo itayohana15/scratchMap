@@ -55,6 +55,9 @@ export function useItineraryDialogController(iso: string) {
 
   const [activeItinerary, setActiveItinerary] = useState<CountryItineraryRecord | null>(null);
   const [draft, setDraft] = useState<CountryItineraryRecord | null>(null);
+  // Backs the new DeleteTripDialog (replacing window.confirm) — the
+  // itinerary awaiting confirmation, not yet actually deleted.
+  const [deleteTarget, setDeleteTarget] = useState<CountryItineraryRecord | null>(null);
 
   const { data: versions = [] } = useCountryItineraryVersions(iso, activeItinerary?.id);
 
@@ -186,17 +189,28 @@ export function useItineraryDialogController(iso: string) {
     }
   }
 
-  async function handleDelete(itineraryId: string) {
-    if (!window.confirm("למחוק את המסלול מההיסטוריה?")) return;
-    try {
-      await deleteItinerary.mutateAsync(itineraryId);
-      if (activeItinerary?.id === itineraryId) {
-        closeItinerary();
-      }
-      toast.success("המסלול נמחק");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "המחיקה נכשלה");
+  // Opens DeleteTripDialog for this itinerary — no window.confirm, no
+  // mutation call yet. requestDelete/cancelDelete/confirmDelete replace
+  // the old single handleDelete(itineraryId) that both asked and acted.
+  function requestDelete(itinerary: CountryItineraryRecord) {
+    setDeleteTarget(itinerary);
+  }
+
+  function cancelDelete() {
+    setDeleteTarget(null);
+  }
+
+  // Deliberately no try/catch/toast here — DeleteTripDialog itself owns
+  // the pending/error/success UI and shows the standardized success
+  // toast, so this only needs to run the mutation and let a rejection
+  // propagate for the dialog to catch.
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    await deleteItinerary.mutateAsync(deleteTarget.id);
+    if (activeItinerary?.id === deleteTarget.id) {
+      closeItinerary();
     }
+    setDeleteTarget(null);
   }
 
   async function handleDuplicate(itineraryId: string) {
@@ -280,6 +294,10 @@ export function useItineraryDialogController(iso: string) {
     isSaving: updateItinerary.isPending,
     isRegenerating: regenerateItinerary.isPending,
     isDuplicating: duplicateItinerary.isPending,
+    deleteTarget,
+    requestDelete,
+    cancelDelete,
+    confirmDelete,
     openItinerary,
     closeItinerary,
     closeModal,
@@ -291,7 +309,6 @@ export function useItineraryDialogController(iso: string) {
     moveItemToDay,
     saveDraft,
     handleArchive,
-    handleDelete,
     handleDuplicate,
     handleRegenerate,
     handleRestore,

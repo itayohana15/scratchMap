@@ -34,8 +34,9 @@ isoCountries.registerLocale(hebrewLocale);
 //    (its points all sit right at the boundary) -> shifted wins, collapses
 //    to a tiny sliver, so it correctly loses the "largest fragment" contest
 //    to Viti Levu and never renders as a world-spanning fill.
-// MapLibre's fitBounds/rendering accept longitudes outside +/-180 fine, so
-// no further conversion is needed downstream.
+// The geometry itself stays unwrapped when that keeps a fragment locally
+// coherent for rendering, but downstream focus logic still needs a separate
+// antimeridian-safe bbox in the canonical -180..180 domain.
 function normalizeFragment(coordinates) {
   const lons = coordinates[0].map(([lon]) => lon);
   const rawSpan = Math.max(...lons) - Math.min(...lons);
@@ -71,6 +72,62 @@ function bboxOfPolygon(coordinates) {
   return [west, south, east, north];
 }
 
+function normalizeLongitude(lon) {
+  const normalized = ((lon + 180) % 360 + 360) % 360 - 180;
+  return normalized === -180 && lon > 0 ? 180 : normalized;
+}
+
+function focusBboxOfPolygon(coordinates) {
+  const longitudes = [];
+  const latitudes = [];
+
+  for (const ring of coordinates) {
+    for (const [lon, lat] of ring) {
+      if (!Number.isFinite(lon) || !Number.isFinite(lat) || lat < -90 || lat > 90) continue;
+      longitudes.push(normalizeLongitude(lon));
+      latitudes.push(lat);
+    }
+  }
+
+  if (longitudes.length === 0 || latitudes.length === 0) return null;
+
+  const sorted = [...longitudes].sort((left, right) => left - right);
+  let largestGap = -Infinity;
+  let largestGapIndex = sorted.length - 1;
+
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const gap = sorted[index + 1] - sorted[index];
+    if (gap > largestGap) {
+      largestGap = gap;
+      largestGapIndex = index;
+    }
+  }
+
+  const wrapGap = sorted[0] + 360 - sorted[sorted.length - 1];
+  if (wrapGap > largestGap) {
+    largestGap = wrapGap;
+    largestGapIndex = sorted.length - 1;
+  }
+
+  const nextIndex = (largestGapIndex + 1) % sorted.length;
+  const start = sorted[nextIndex];
+  const rawEnd = sorted[largestGapIndex];
+  const end = largestGapIndex === sorted.length - 1 ? rawEnd : rawEnd + 360;
+
+  return [
+    normalizeLongitude(start),
+    Math.min(...latitudes),
+    normalizeLongitude(end),
+    Math.max(...latitudes),
+  ];
+}
+
+function assignFeatureBboxes(feature) {
+  const mainlandCoordinates = largestFragment(feature.geometry);
+  feature.properties.bbox = bboxOfPolygon(mainlandCoordinates);
+  feature.properties.focusBbox = focusBboxOfPolygon(mainlandCoordinates) ?? feature.properties.bbox;
+}
+
 // Natural Earth includes a handful of disputed/unofficial territories with
 // no ISO 3166-1 numeric code at all (their topojson `id` is undefined), so
 // they can never join to our `countries.iso_a2` column. Kosovo gets the
@@ -100,13 +157,7 @@ function mergeFeatures(features) {
     const fromFragments =
       from.geometry.type === "Polygon" ? [from.geometry.coordinates] : from.geometry.coordinates;
     into.geometry = { type: "MultiPolygon", coordinates: [...intoFragments, ...fromFragments] };
-
-    into.properties.bbox = [
-      Math.min(into.properties.bbox[0], from.properties.bbox[0]),
-      Math.min(into.properties.bbox[1], from.properties.bbox[1]),
-      Math.max(into.properties.bbox[2], from.properties.bbox[2]),
-      Math.max(into.properties.bbox[3], from.properties.bbox[3]),
-    ];
+    assignFeatureBboxes(into);
 
     features.splice(features.indexOf(from), 1);
   }
@@ -159,15 +210,7 @@ function mergeDuplicateIsoCodes(features) {
       f.geometry.type === "Polygon" ? [f.geometry.coordinates] : f.geometry.coordinates
     );
     primary.geometry = { type: "MultiPolygon", coordinates: [...primaryFragments, ...restFragments] };
-
-    for (const f of rest) {
-      primary.properties.bbox = [
-        Math.min(primary.properties.bbox[0], f.properties.bbox[0]),
-        Math.min(primary.properties.bbox[1], f.properties.bbox[1]),
-        Math.max(primary.properties.bbox[2], f.properties.bbox[2]),
-        Math.max(primary.properties.bbox[3], f.properties.bbox[3]),
-      ];
-    }
+    assignFeatureBboxes(primary);
 
     console.log(
       `Merged duplicate iso_a2 "${primary.properties.iso_a2}": ${group.map((f) => f.properties.name).join(" + ")}`
@@ -224,9 +267,6 @@ async function main() {
     }
 
     const normalizedGeometry = normalizeGeometry(feature.geometry);
-    const mainlandCoordinates = largestFragment(normalizedGeometry);
-    const featureBbox = bboxOfPolygon(mainlandCoordinates);
-
     features.push({
       type: "Feature",
       id: iso.iso_a2,
@@ -236,10 +276,12 @@ async function main() {
         name: feature.properties.name,
         iso_a2: iso.iso_a2,
         iso_a3: iso.iso_a3,
-        bbox: featureBbox,
+        bbox: [0, 0, 0, 0],
+        focusBbox: [0, 0, 0, 0],
       },
       geometry: normalizedGeometry,
     });
+    assignFeatureBboxes(features[features.length - 1]);
   }
 
   mergeFeatures(features);

@@ -5,13 +5,168 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { captureProviderFixture } from "@/lib/server/fixture-capture";
+import { isPlannerQaTraceEnabled } from "@/lib/planner-qa-trace";
 import type { RecommendationCategory } from "@/lib/trip-workspace";
 
-const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
+// Real production outage found via a live QA run: overpass-api.de was
+// unreachable (connection refused) from the deployment environment while
+// an independent mirror (kumi.systems) was reachable but rejected requests
+// with HTTP 429 — "Please include a meaningful User-Agent string with your
+// requests to avoid rate-limiting" — until one was sent. Two fixes, one
+// change: every request now carries a real User-Agent (getOverpassUserAgent
+// below) AND falls back across configured endpoints instead of depending
+// on a single instance. Order matters — the existing primary stays first.
+export const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
+
+// Same real, non-fake User-Agent convention already established for
+// Nominatim (places/nominatim.ts) — Overpass's own usage policy explicitly
+// asks for exactly this ("a meaningful User-Agent... to avoid
+// rate-limiting"), confirmed live: the same request without one gets 429
+// from kumi.systems, 200 with one. OVERPASS_USER_AGENT lets a real
+// deployment override with its own contact/URL if it has one; the default
+// never fabricates one.
+const DEFAULT_OVERPASS_USER_AGENT = "ScratchMap/1.0 (personal travel-tracking app, single user, low volume)";
+
+export function getOverpassUserAgent(): string {
+  return process.env.OVERPASS_USER_AGENT?.trim() || DEFAULT_OVERPASS_USER_AGENT;
+}
+
 // Country-wide area queries against the public Overpass instance can take
 // 10-20s; we lean on the 24h cache below so only the first load per
 // country+category ever pays that cost.
 const REQUEST_TIMEOUT_MS = 25_000;
+
+// Process-lifetime counter (not per-run — Overpass calls happen across
+// several separate API requests: recommendations, food, hotels, and any
+// nearby-search during generation, not just one call site) so a debug
+// session can tell "every Overpass call this session failed" (a synthetic/
+// fallback run) apart from "Overpass is genuinely reachable and mostly
+// returning real data" — spec ask: never silently let a fallback run look
+// like a production one. Exported for country-itinerary-generation.ts's
+// QA_DEBUG_GEOGRAPHY/CAPTURE_FIXTURES diagnostics; recordOverpassCall is
+// also exported so its counting logic is directly unit-testable without a
+// real network call.
+let overpassTotalCalls = 0;
+let overpassFailedCalls = 0;
+
+export function recordOverpassCall(succeeded: boolean): void {
+  overpassTotalCalls += 1;
+  if (!succeeded) overpassFailedCalls += 1;
+}
+
+export function getOverpassCallStats(): { totalCalls: number; failedCalls: number } {
+  return { totalCalls: overpassTotalCalls, failedCalls: overpassFailedCalls };
+}
+
+export function resetOverpassCallStats(): void {
+  overpassTotalCalls = 0;
+  overpassFailedCalls = 0;
+}
+
+// --- Centralized transport (endpoint fallback + User-Agent + timeout) ----
+// The ONE place every Overpass HTTP request goes through — previously each
+// of the three call sites below (checkOverpassAvailability,
+// executeOverpassQuery, queryNearbyPlaces) had its own duplicated fetch,
+// its own AbortController/timeout, and no User-Agent at all. Centralizing
+// here means endpoint fallback and the User-Agent fix apply everywhere at
+// once and can never drift apart between call sites again.
+
+type FetchLike = typeof fetch;
+
+function isRetryableStatus(status: number): boolean {
+  // 429 (rate-limited) and 5xx (server-side failure) are legitimately
+  // worth trying a different endpoint for — the SAME request might just
+  // work elsewhere. Any other 4xx (400 malformed query, 403, 404, ...) is
+  // a property of the request itself, not the endpoint — it would fail
+  // identically everywhere, so retrying it across every configured
+  // endpoint would just be a pointless storm, never a real recovery.
+  return status === 429 || (status >= 500 && status < 600);
+}
+
+interface OverpassAttemptFailure {
+  ok: false;
+  retryable: boolean;
+  reason: string;
+  status?: number;
+}
+
+async function fetchOverpassOnce(
+  endpoint: string,
+  query: string,
+  timeoutMs: number,
+  fetchImpl: FetchLike,
+  next?: { revalidate: number }
+): Promise<{ ok: true; response: Response } | OverpassAttemptFailure> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { "User-Agent": getOverpassUserAgent() },
+      body: new URLSearchParams({ data: query }),
+      signal: controller.signal,
+      ...(next ? { next } : {}),
+    });
+    if (res.ok) return { ok: true, response: res };
+    return { ok: false, retryable: isRetryableStatus(res.status), reason: `HTTP ${res.status}`, status: res.status };
+  } catch (error) {
+    // AbortError (our own timeout) and any other network-level throw
+    // (DNS failure, connection refused, ...) are both real transport
+    // problems a different endpoint might not have — always retryable.
+    const reason = error instanceof Error ? (error.name === "AbortError" ? "timeout" : error.message) : String(error);
+    return { ok: false, retryable: true, reason };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export type OverpassFetchOutcome =
+  | { kind: "success"; response: Response; endpoint: string }
+  | { kind: "failure"; endpoint: string; reason: string };
+
+/**
+ * Tries each configured endpoint in order (OVERPASS_ENDPOINTS by default —
+ * bounded, never more attempts than the configured list, no retry storm).
+ * Falls through to the next endpoint only for a retryable failure (network
+ * error, timeout, 429, 5xx); a non-retryable 4xx stops immediately. Every
+ * request carries a real User-Agent (getOverpassUserAgent). `fetchImpl` is
+ * injectable so tests never depend on real network/Overpass availability.
+ */
+export async function fetchOverpass(
+  query: string,
+  options: { timeoutMs?: number; endpoints?: string[]; fetchImpl?: FetchLike; next?: { revalidate: number } } = {}
+): Promise<OverpassFetchOutcome> {
+  const endpoints = options.endpoints ?? OVERPASS_ENDPOINTS;
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  let lastFailure: { endpoint: string; reason: string } | null = null;
+
+  for (const endpoint of endpoints) {
+    const attempt = await fetchOverpassOnce(endpoint, query, timeoutMs, fetchImpl, options.next);
+    if (attempt.ok) {
+      // Routine fallback mechanics, not a real problem (the request DID
+      // succeed) — QA-gated rather than always-on, since this fires on
+      // every retry during ordinary Overpass flakiness.
+      if (isPlannerQaTraceEnabled() && lastFailure) {
+        console.log("[Overpass] recovered via fallback endpoint", { endpoint, previousFailure: lastFailure });
+      }
+      return { kind: "success", response: attempt.response, endpoint };
+    }
+
+    if (isPlannerQaTraceEnabled()) {
+      console.log("[Overpass] endpoint attempt failed", { endpoint, reason: attempt.reason, retryable: attempt.retryable });
+    }
+
+    lastFailure = { endpoint, reason: attempt.reason };
+    if (!attempt.retryable) break;
+  }
+
+  return { kind: "failure", endpoint: lastFailure?.endpoint ?? endpoints[0], reason: lastFailure?.reason ?? "no endpoints configured" };
+}
 
 export interface OverpassPlace {
   name: string;
@@ -39,20 +194,12 @@ export interface OverpassPlace {
  * infer network/provider success from candidate count").
  */
 export async function checkOverpassAvailability(): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8_000);
-  try {
-    const res = await fetch(OVERPASS_ENDPOINT, {
-      method: "POST",
-      body: new URLSearchParams({ data: "[out:json][timeout:5];out count;" }),
-      signal: controller.signal,
-    });
-    return res.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
-  }
+  // Never cached (no `next` option) — this probe exists specifically to
+  // answer "is Overpass reachable right now", so a stale cached response
+  // would defeat its whole purpose.
+  const outcome = await fetchOverpass("[out:json][timeout:5];out count;", { timeoutMs: 8_000 });
+  recordOverpassCall(outcome.kind === "success");
+  return outcome.kind === "success";
 }
 
 type CountryBBox = [number, number, number, number];
@@ -274,40 +421,25 @@ export interface OverpassQueryOutcome {
 }
 
 async function executeOverpassQuery(query: string, limit: number): Promise<OverpassQueryOutcome> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(OVERPASS_ENDPOINT, {
-      method: "POST",
-      body: new URLSearchParams({ data: query }),
-      signal: controller.signal,
-      next: { revalidate: 60 * 60 * 24 },
-    });
-    if (!res.ok) {
-      // Degrading to [] is intentional (categories with no data just come
-      // back empty) — but a non-OK status (rate limit, 5xx) is a real
-      // provider failure, not "no results", so succeeded is false here even
-      // though the shape (empty array) looks identical to a legitimate
-      // zero-result query.
-      if (process.env.NODE_ENV !== "production") {
-        console.log("[Recommendations] Overpass request returned non-OK status", { status: res.status });
-      }
-      return { places: [], succeeded: false };
-    }
-
-    const data = (await res.json()) as OverpassResponse;
-    return { places: normalizeOverpassElements(data, limit), succeeded: true };
-  } catch (error) {
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[Recommendations] Overpass request failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  // Degrading to [] on failure is intentional (categories with no data
+  // just come back empty) — but a real provider failure (every endpoint
+  // exhausted) is not "no results", so succeeded is false here even though
+  // the shape (empty array) looks identical to a legitimate zero-result
+  // query.
+  const outcome = await fetchOverpass(query, { next: { revalidate: 60 * 60 * 24 } });
+  if (outcome.kind !== "success") {
+    recordOverpassCall(false);
+    // Every configured endpoint was exhausted for this query — a genuine
+    // provider-availability problem, kept visible as a real warning rather
+    // than gated behind a QA flag.
+    console.warn("[Recommendations] Overpass request failed", { endpoint: outcome.endpoint, reason: outcome.reason });
     return { places: [], succeeded: false };
-  } finally {
-    clearTimeout(timeout);
   }
+
+  const data = (await outcome.response.json()) as OverpassResponse;
+  captureProviderFixture("overpass", query, { query, response: data });
+  recordOverpassCall(true);
+  return { places: normalizeOverpassElements(data, limit), succeeded: true };
 }
 
 export async function queryOverpassPlaces(
@@ -419,18 +551,16 @@ export async function queryNearbyPlaces(
     out center 200;
   `;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20_000);
-  try {
-    const res = await fetch(OVERPASS_ENDPOINT, {
-      method: "POST",
-      body: new URLSearchParams({ data: query }),
-      signal: controller.signal,
-      next: { revalidate: 60 * 60 * 24 },
-    });
-    if (!res.ok) return [];
+  const outcome = await fetchOverpass(query, { timeoutMs: 20_000, next: { revalidate: 60 * 60 * 24 } });
+  if (outcome.kind !== "success") {
+    recordOverpassCall(false);
+    return [];
+  }
 
-    const data = (await res.json()) as OverpassResponse;
+  try {
+    const data = (await outcome.response.json()) as OverpassResponse;
+    captureProviderFixture("overpass", query, { query, response: data });
+    recordOverpassCall(true);
     const byCategory = new Map<NearbyCategory, NearbyPlace[]>();
 
     for (const el of data.elements) {
@@ -458,8 +588,9 @@ export async function queryNearbyPlaces(
       places.sort((left, right) => left.distanceMeters - right.distanceMeters).slice(0, perCategoryLimit)
     );
   } catch {
+    // A malformed response body (JSON parse failure) after a genuinely
+    // successful HTTP response — real, if rare; the transport itself
+    // already succeeded so recordOverpassCall(true) above stands.
     return [];
-  } finally {
-    clearTimeout(timeout);
   }
 }

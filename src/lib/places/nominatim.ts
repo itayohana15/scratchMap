@@ -3,6 +3,8 @@
 // and discourages high-volume client-side use — both are why this lives
 // behind our own API routes rather than being called directly from the
 // browser.
+import { captureProviderFixture } from "@/lib/server/fixture-capture";
+
 export interface GeocodedPlace {
   name: string;
   lat: number;
@@ -74,6 +76,7 @@ export async function searchPlaces(
   if (!res.ok) throw new Error(`Nominatim request failed (${res.status})`);
 
   const data = (await res.json()) as NominatimResult[];
+  captureProviderFixture("geocode", `${query}|${params.toString()}`, { query, params: params.toString(), response: data });
   return data.map((item) => ({
     name: item.name || item.display_name.split(",")[0],
     lat: parseFloat(item.lat),

@@ -18,7 +18,10 @@ function buildRanked(overrides: Partial<RankedHotel> = {}): RankedHotel {
     priceConfidence: "unavailable",
     ratingConfidence: "unavailable",
     averageActivityTravelMinutes: overrides.averageActivityTravelMinutes ?? null,
+    totalActivityTravelMinutes: overrides.totalActivityTravelMinutes ?? null,
+    maxActivityTravelMinutes: overrides.maxActivityTravelMinutes ?? null,
     airportTravelMinutes: overrides.airportTravelMinutes ?? null,
+    transferTravelMinutes: overrides.transferTravelMinutes ?? null,
     locationScore: overrides.locationScore ?? 50,
   };
 }

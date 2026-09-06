@@ -24,16 +24,6 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { CountryBanner } from "@/components/shared/country-banner";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -45,6 +35,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { DeleteTripDialog } from "@/components/trips/delete-trip-dialog";
+import { useDebugGeoFlag, useGeoResolutionDebugMap } from "@/lib/hooks/use-geo-resolution-debug";
 import { openItineraryPdfExport } from "@/lib/itinerary-pdf-export";
 import {
   Select,
@@ -53,7 +45,7 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatCurrency, formatDate, formatTripDateRange, tripDurationDays } from "@/lib/format";
+import { formatCurrency, formatDate, formatTripDateRange, formatTripDateRangeExpanded, tripDurationDays } from "@/lib/format";
 import { photoPublicUrl, usePhotosForItineraries } from "@/lib/queries/photos";
 import {
   useArchiveTripHubItinerary,
@@ -311,14 +303,11 @@ function useUpcomingTripCardActions(trip: TripHubTrip) {
     }
   }
 
+  // No try/catch/toast here — DeleteTripDialog owns the pending/error/
+  // success UI (including the standardized success toast) for every
+  // trip-delete entry point, this just runs the mutation.
   async function handleDelete() {
-    try {
-      await deleteTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
-      toast.success("הטיול נמחק");
-      setDeleteOpen(false);
-    } catch {
-      toast.error("מחיקת הטיול נכשלה");
-    }
+    await deleteTrip.mutateAsync({ isoA2: trip.isoA2, itineraryId: trip.id });
   }
 
   return {
@@ -348,6 +337,9 @@ function UpcomingCardMenuAndDialogs({
   onOpen: (trip: TripHubTrip) => void;
   onOpenCountryPage: (trip: TripHubTrip) => void;
 }) {
+  const debugGeoEnabled = useDebugGeoFlag();
+  const { data: geoResolutionOverride } = useGeoResolutionDebugMap(trip.isoA2, debugGeoEnabled);
+
   return (
     <>
       <DropdownMenu>
@@ -365,7 +357,7 @@ function UpcomingCardMenuAndDialogs({
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => {
-              const opened = openItineraryPdfExport(trip.itinerary, trip.countryName, trip.workspace);
+              const opened = openItineraryPdfExport(trip.itinerary, trip.countryName, trip.workspace, geoResolutionOverride ?? null);
               if (!opened) toast.error("לא ניתן לפתוח את חלון הייצוא. יש לאפשר חלונות קופצים בדפדפן.");
             }}
           >
@@ -410,25 +402,14 @@ function UpcomingCardMenuAndDialogs({
         </DialogContent>
       </Dialog>
 
-      <AlertDialog open={actions.deleteOpen} onOpenChange={actions.setDeleteOpen}>
-        <AlertDialogContent onClick={(event) => event.stopPropagation()}>
-          <AlertDialogHeader>
-            <AlertDialogTitle>למחוק את הטיול?</AlertDialogTitle>
-            <AlertDialogDescription>
-              פעולה זו תמחק את הטיול &quot;{trip.title}&quot; לצמיתות, כולל המסלול, ההזמנות והיומן שלו.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>ביטול</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={actions.handleDelete}
-            >
-              מחיקה
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <DeleteTripDialog
+        open={actions.deleteOpen}
+        onOpenChange={actions.setDeleteOpen}
+        tripName={trip.title}
+        tripDates={formatTripDateRangeExpanded(trip.startDate, trip.endDate)}
+        tripDuration={`${trip.daysCount} ימים`}
+        onConfirm={actions.handleDelete}
+      />
     </>
   );
 }

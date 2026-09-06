@@ -10,6 +10,8 @@ interface HotelSearchArgs {
   lon: number | null;
   activityClusters: Array<{ lat: number; lon: number }>;
   airportCoords: { lat: number; lon: number } | null;
+  /** Adjacent-stay anchors (previous/next stay) for stay-to-stay transfer compatibility (spec "HOTEL RANKING PRIORITY" #3). Optional — omitted for a trip with no adjacent stay in either direction. */
+  transferAnchors?: Array<{ lat: number; lon: number }>;
 }
 
 interface HotelSearchResponse {
@@ -25,6 +27,9 @@ async function fetchHotelRecommendations(args: HotelSearchArgs): Promise<HotelSe
   if (args.airportCoords) {
     params.set("airportLat", String(args.airportCoords.lat));
     params.set("airportLon", String(args.airportCoords.lon));
+  }
+  if (args.transferAnchors && args.transferAnchors.length > 0) {
+    params.set("transferAnchors", args.transferAnchors.map((anchor) => `${anchor.lat},${anchor.lon}`).join(";"));
   }
 
   const res = await fetch(`/api/countries/${args.iso.toLowerCase()}/hotels?${params.toString()}`);
@@ -46,6 +51,7 @@ export function useHotelRecommendations(args: HotelSearchArgs) {
       args.lon,
       args.activityClusters.length,
       args.airportCoords?.lat ?? null,
+      args.transferAnchors?.length ?? 0,
     ],
     queryFn: () => fetchHotelRecommendations(args),
     enabled: args.lat != null && args.lon != null,

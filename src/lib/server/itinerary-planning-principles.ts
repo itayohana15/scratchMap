@@ -20,6 +20,14 @@ import type { RecommendationCategory } from "../trip-workspace";
  * - Long (17+ days): geographic phases, varied experience categories, rest days.
  */
 
+// A cluster/area whose content takes at least this long is worth a
+// dedicated overnight base on its own merits — roughly "more than half a
+// normal sightseeing day." Single source of truth for both this file's
+// buildTripFramePhases (area significance) and route-optimization.ts's
+// decideClusterRole (cluster role) — not an arbitrary country-specific
+// number, and never duplicated between the two.
+export const OVERNIGHT_WORTHY_MINUTES = 240;
+
 export type TripLengthBucketId =
   | "micro_city"
   | "single_base"
@@ -130,10 +138,38 @@ export interface TripFramePhase {
   intent: "city" | "nature" | "coast" | "historic" | "mixed";
 }
 
+/**
+ * A geographically real but non-overnight cluster explicitly attached to
+ * the nearest surviving overnight phase (spec "DAY-TRIP CLUSTER" — never a
+ * competing hotel base). Carried on the TripFrame so the generation prompt
+ * can turn it into an explicit day trip FROM that base, and so debug/QA
+ * output can show why it exists (spec "REQUIRED DEBUG/QA DATA").
+ */
+export interface TripFrameDayTripHint {
+  areaLabel: string;
+  attachedToAreaLabel: string;
+  requiredTimeMinutes: number;
+}
+
+/** Spec "REQUIRED DEBUG/QA DATA" — development-only visibility into why the cluster/stay structure came out the way it did; never surfaced in normal production UI. */
+export interface TripFramePlanningTrace {
+  clusterCount: number;
+  overnightClusterAreas: string[];
+  dayTripClusterAreas: string[];
+  mergedClusterAreas: string[];
+  skippedClusterAreas: string[];
+  backtrackingReordered: boolean;
+  shortStayMerges: string[];
+}
+
 export interface TripFrame {
   bucketId: TripLengthBucketId;
   phases: TripFramePhase[];
   source: "deterministic" | "ai";
+  /** Optional — absent when the deterministic frame was built with no real geographic clustering data (e.g. no coordinates at all in the candidate pool) or by any older code path. */
+  dayTripHints?: TripFrameDayTripHint[];
+  /** Optional — development-only planning trace (spec "REQUIRED DEBUG/QA DATA"). */
+  planningTrace?: TripFramePlanningTrace;
 }
 
 export function findFramePhaseForDay(frame: TripFrame, dayNumber: number): TripFramePhase | null {
@@ -251,6 +287,107 @@ function mergePhase(frame: TripFrame, removeIndex: number, intoIndex: number): T
   return { ...frame, phases };
 }
 
+export interface ShortStayViabilityResult {
+  worthOvernight: boolean;
+  benefitMinutes: number;
+  costMinutes: number;
+  reason: string;
+}
+
+/**
+ * Spec "WIRE SHORT-STAY VIABILITY" — a real cost/benefit comparison for a
+ * 1-night stay: its own content time vs. the real transfer cost of adding
+ * a hotel change. Any of the three legitimate-1-night reasons the spec
+ * names short-circuits to "keep it" without needing the numeric
+ * comparison at all. THE single production short-stay evaluator —
+ * route-optimization.ts re-exports this exact function rather than a
+ * parallel implementation.
+ */
+export function evaluateShortStayViability(args: {
+  clusterRequiredTimeMinutes: number;
+  transferMinutesFromPrevious: number | null;
+  transferMinutesToNext: number | null;
+  isFixedReservation?: boolean;
+  isRemoteUniqueDestination?: boolean;
+  isNecessaryAirportPositioning?: boolean;
+}): ShortStayViabilityResult {
+  if (args.isFixedReservation || args.isRemoteUniqueDestination || args.isNecessaryAirportPositioning) {
+    return {
+      worthOvernight: true,
+      benefitMinutes: args.clusterRequiredTimeMinutes,
+      costMinutes: (args.transferMinutesFromPrevious ?? 0) + (args.transferMinutesToNext ?? 0),
+      reason: "legitimate 1-night stay (fixed reservation, remote unique destination, or airport positioning)",
+    };
+  }
+
+  const costMinutes = (args.transferMinutesFromPrevious ?? 0) + (args.transferMinutesToNext ?? 0);
+  const benefitMinutes = args.clusterRequiredTimeMinutes;
+  const worthOvernight = benefitMinutes > costMinutes;
+  return {
+    worthOvernight,
+    benefitMinutes,
+    costMinutes,
+    reason: worthOvernight
+      ? "the cluster's own content time exceeds the real transfer cost of a hotel change"
+      : "the real transfer cost outweighs this cluster's own content time",
+  };
+}
+
+/**
+ * Spec "WIRE SHORT-STAY VIABILITY" — a real production pass run once right
+ * after buildTripFramePhases, before any day content exists. Every
+ * INTERIOR 1-night phase (never the first/last — those are far more often
+ * a legitimate arrival/departure adjustment, spec "KEEP LEGITIMATE
+ * ONE-NIGHT STAYS") is checked against its own real inbound/outbound
+ * transition cost (buildStayTransitions — the same real distance/mode/
+ * time math used everywhere else) and merged into whichever neighbor has
+ * the smaller real transfer cost when it fails. Bounded: a single sweep
+ * over the phases that existed when the pass started — each iteration
+ * either advances or shrinks the phase list, so it always terminates.
+ */
+export function applyShortStayViabilityRepair(
+  frame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  areaWeights: Map<string, number>
+): { frame: TripFrame; mergedAreas: string[] } {
+  let currentFrame = frame;
+  const mergedAreas: string[] = [];
+  let index = 1;
+
+  while (index < currentFrame.phases.length - 1) {
+    const phase = currentFrame.phases[index];
+    if (phase.nights !== 1) {
+      index += 1;
+      continue;
+    }
+
+    const transitions = buildStayTransitions(currentFrame, areaAnchors);
+    const inboundIndex = transitions.findIndex((transition) => transition.dayNumber === phase.startDayNumber);
+    const inbound = inboundIndex >= 0 ? transitions[inboundIndex] : null;
+    const outbound = inboundIndex >= 0 ? (transitions[inboundIndex + 1] ?? null) : null;
+
+    const evaluation = evaluateShortStayViability({
+      clusterRequiredTimeMinutes: Math.max(1, areaWeights.get(phase.areaLabel) ?? 0),
+      transferMinutesFromPrevious: inbound?.estimatedTravelMinutes ?? null,
+      transferMinutesToNext: outbound?.estimatedTravelMinutes ?? null,
+    });
+
+    if (evaluation.worthOvernight) {
+      index += 1;
+      continue;
+    }
+
+    mergedAreas.push(phase.areaLabel);
+    const mergeIntoPrevious =
+      (inbound?.estimatedTravelMinutes ?? Infinity) <= (outbound?.estimatedTravelMinutes ?? Infinity);
+    currentFrame = mergePhase(currentFrame, index, mergeIntoPrevious ? index - 1 : index + 1);
+    // Don't advance `index` — a different phase now occupies this
+    // position after the merge, and it deserves its own check.
+  }
+
+  return { frame: currentFrame, mergedAreas };
+}
+
 /**
  * Section A1-A4 — ONE generic structural repair attempt for ONE impossible
  * stay transition (between phases[phaseIndex-1] and phases[phaseIndex]),
@@ -363,6 +500,92 @@ export function reorderAreasForDepartureFeasibility(
 }
 
 /**
+ * Spec "WIRE BACKTRACKING" — a generic, coordinate-only reversal count: for
+ * every interior stop, the direction of the incoming leg is compared to
+ * the outgoing leg; a sharp reversal (heading substantially back the way
+ * it came) counts as one unit of backtracking. 0 for a straight/coherent
+ * A→B→C progression; higher for a route that doubles back on itself
+ * (A→C→A→B→C). No country/region-specific logic anywhere in this
+ * function — pure vector geometry on real coordinates. THE single
+ * production backtracking detector — route-optimization.ts's
+ * computeItineraryTravelMetrics and this file's own
+ * reorderAreasToMinimizeBacktracking both call this same function.
+ */
+export function detectBacktracking(orderedAnchors: Array<{ lat: number; lon: number }>): number {
+  if (orderedAnchors.length < 3) return 0;
+  let backtrackCount = 0;
+  for (let i = 1; i < orderedAnchors.length - 1; i += 1) {
+    const prev = orderedAnchors[i - 1];
+    const curr = orderedAnchors[i];
+    const next = orderedAnchors[i + 1];
+    const v1 = { x: curr.lon - prev.lon, y: curr.lat - prev.lat };
+    const v2 = { x: next.lon - curr.lon, y: next.lat - curr.lat };
+    const mag1 = Math.hypot(v1.x, v1.y);
+    const mag2 = Math.hypot(v2.x, v2.y);
+    if (mag1 === 0 || mag2 === 0) continue;
+    const cosAngle = (v1.x * v2.x + v1.y * v2.y) / (mag1 * mag2);
+    // cosAngle near -1 means the route reversed direction almost entirely.
+    if (cosAngle < -0.3) backtrackCount += 1;
+  }
+  return backtrackCount;
+}
+
+/**
+ * Spec "WIRE BACKTRACKING" — a real, generic route reorder: greedy
+ * nearest-neighbor from the heaviest-weighted (first-ranked) area, which
+ * naturally tends to avoid doubling back. Only ever adopted when it
+ * genuinely scores fewer backtracks than the original order (never a
+ * regression) — areas with no known real anchor are left in their
+ * original relative order (can't reason about geography with nothing
+ * real to compare). A single deterministic pass, not an iterative
+ * optimizer — bounded by construction.
+ */
+export function reorderAreasToMinimizeBacktracking(
+  rankedAreas: string[],
+  areaAnchors: Map<string, { lat: number; lon: number } | null>
+): string[] {
+  if (rankedAreas.length <= 2) return rankedAreas;
+
+  const withAnchor = rankedAreas.filter((area) => areaAnchors.get(area) != null);
+  if (withAnchor.length < 3) return rankedAreas; // not enough real geography to reason about
+
+  const originalAnchors = rankedAreas.map((area) => areaAnchors.get(area)).filter((a): a is { lat: number; lon: number } => a != null);
+  const originalScore = detectBacktracking(originalAnchors);
+  if (originalScore === 0) return rankedAreas; // already coherent
+
+  const remaining = new Set(rankedAreas);
+  const ordered: string[] = [rankedAreas[0]];
+  remaining.delete(rankedAreas[0]);
+
+  while (remaining.size > 0) {
+    const lastAnchor = areaAnchors.get(ordered[ordered.length - 1]);
+    let nearest: string | null = null;
+    let nearestDistance = Infinity;
+    for (const candidate of remaining) {
+      const candidateAnchor = areaAnchors.get(candidate);
+      const distance =
+        lastAnchor && candidateAnchor ? haversineKm(lastAnchor.lat, lastAnchor.lon, candidateAnchor.lat, candidateAnchor.lon) : Infinity;
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = candidate;
+      }
+    }
+    // No real anchor to compare against any remaining candidate — keep the
+    // original relative order for whatever's left rather than guessing.
+    if (nearest == null) {
+      for (const candidate of remaining) ordered.push(candidate);
+      break;
+    }
+    ordered.push(nearest);
+    remaining.delete(nearest);
+  }
+
+  const reorderedAnchors = ordered.map((area) => areaAnchors.get(area)).filter((a): a is { lat: number; lon: number } => a != null);
+  const reorderedScore = detectBacktracking(reorderedAnchors);
+  return reorderedScore < originalScore ? ordered : rankedAreas;
+}
+
+/**
  * Pure geography-first phase distribution: given ranked area weights (e.g.
  * how many real candidate places fall in each area) and a bucket's base
  * count range, picks base cities and distributes the trip's days across
@@ -370,6 +593,57 @@ export function reorderAreasForDepartureFeasibility(
  * safe as the guaranteed fallback when an AI refinement call is unavailable
  * or fails.
  */
+/**
+ * Spec "WIRE NIGHT ALLOCATION" — nights proportional to each cluster/area's
+ * own real required content time, not spread evenly by count. Every
+ * cluster gets at least 1 night; rounding surplus/deficit is resolved on
+ * the largest cluster(s) first so the total always matches `totalNights`
+ * exactly. THE single production night-allocation algorithm — both
+ * buildTripFramePhases below and route-optimization.ts's cluster-based
+ * callers use this same function, not two parallel implementations.
+ */
+export function allocateNightsForClusters(
+  clusters: Array<{ clusterRequiredTimeMinutes: number }>,
+  totalNights: number
+): number[] {
+  if (clusters.length === 0) return [];
+  if (clusters.length >= totalNights) {
+    // Not enough nights for one each — give the largest clusters priority.
+    const order = clusters
+      .map((cluster, index) => ({ index, minutes: cluster.clusterRequiredTimeMinutes }))
+      .sort((left, right) => right.minutes - left.minutes);
+    const nights = new Array(clusters.length).fill(0);
+    for (let i = 0; i < totalNights; i += 1) nights[order[i].index] = 1;
+    return nights;
+  }
+
+  const totalMinutes = clusters.reduce((sum, cluster) => sum + cluster.clusterRequiredTimeMinutes, 0);
+  const rawShares = clusters.map((cluster) =>
+    totalMinutes > 0 ? (cluster.clusterRequiredTimeMinutes / totalMinutes) * totalNights : totalNights / clusters.length
+  );
+  const nights = rawShares.map((share) => Math.max(1, Math.round(share)));
+  let diff = totalNights - nights.reduce((sum, n) => sum + n, 0);
+  // Rounding can over/under-shoot the total by a few nights — resolve on
+  // the largest cluster(s) first, and never drop a cluster below 1 night.
+  const byMinutesDesc = clusters
+    .map((cluster, index) => ({ index, minutes: cluster.clusterRequiredTimeMinutes }))
+    .sort((left, right) => right.minutes - left.minutes);
+  let cursor = 0;
+  while (diff !== 0 && byMinutesDesc.length > 0) {
+    const target = byMinutesDesc[cursor % byMinutesDesc.length].index;
+    if (diff > 0) {
+      nights[target] += 1;
+      diff -= 1;
+    } else if (nights[target] > 1) {
+      nights[target] -= 1;
+      diff += 1;
+    }
+    cursor += 1;
+    if (cursor > byMinutesDesc.length * totalNights + 10) break; // safety valve, never loops forever
+  }
+  return nights;
+}
+
 export function buildTripFramePhases(
   rankedAreas: string[],
   areaWeights: Map<string, number>,
@@ -395,34 +669,45 @@ export function buildTripFramePhases(
   if (pinnedArea?.trim()) {
     baseCount = 1;
   } else {
-    const totalWeightAll = orderedAreas.reduce((sum, area) => sum + Math.max(1, areaWeights.get(area) ?? 1), 0);
+    // Significance is absolute ("does this area alone have enough content
+    // for a real day"), not a share of the whole trip's weight — a
+    // relative threshold self-defeats on geographically diverse trips: the
+    // more real areas a trip has, the smaller each one's share, however
+    // substantial its own content, so a wide-ranging trip could see EVERY
+    // area fall short and collapse to the bucket's floor regardless of how
+    // much real content exists. OVERNIGHT_WORTHY_MINUTES is the same bar
+    // decideClusterRole already uses to decide a cluster deserves its own
+    // overnight base in the first place.
     const significantAreaCount = orderedAreas.filter((area) => {
       const weight = Math.max(1, areaWeights.get(area) ?? 1);
-      return weight / totalWeightAll >= 0.12;
+      return weight >= OVERNIGHT_WORTHY_MINUTES;
     }).length;
-    baseCount = Math.min(Math.max(bucket.minBases, significantAreaCount), bucket.maxBases);
+    // The bucket table's own boundaries already imply roughly how many
+    // extra days justify one more base (e.g. slow_travel's own entry point
+    // is minDays/maxBases = 25/10 = 2.5 days/base) — for the one truly
+    // open-ended bucket (maxDays: null), that same ratio keeps scaling the
+    // ceiling past the entry point instead of freezing it at the bucket's
+    // minimum-day-count value, so a 90-day trip isn't held to the same
+    // ceiling as a 25-day one.
+    const effectiveMaxBases =
+      bucket.maxDays == null
+        ? Math.max(bucket.maxBases, Math.round(safeDayCount / (bucket.minDays / bucket.maxBases)))
+        : bucket.maxBases;
+    baseCount = Math.min(Math.max(bucket.minBases, significantAreaCount), effectiveMaxBases);
   }
 
   const maxBasesForData = Math.max(1, Math.min(baseCount, orderedAreas.length, safeDayCount));
   const selectedAreas = orderedAreas.slice(0, maxBasesForData);
 
+  // Section "WIRE NIGHT ALLOCATION" — ONE production source of truth:
+  // allocateNightsForClusters (below) is the same function route-
+  // optimization.ts's cluster-based callers use, not a second parallel
+  // algorithm reimplemented inline here.
   const weights = selectedAreas.map((area) => Math.max(1, areaWeights.get(area) ?? 1));
-  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-  const dayShares = weights.map((weight) => Math.max(1, Math.floor((weight / totalWeight) * safeDayCount)));
-
-  let remainder = safeDayCount - dayShares.reduce((sum, value) => sum + value, 0);
-  let cursor = 0;
-  while (remainder > 0) {
-    dayShares[cursor % dayShares.length] += 1;
-    remainder -= 1;
-    cursor += 1;
-  }
-  while (remainder < 0) {
-    const largestIndex = dayShares.indexOf(Math.max(...dayShares));
-    if (dayShares[largestIndex] <= 1) break;
-    dayShares[largestIndex] -= 1;
-    remainder += 1;
-  }
+  const dayShares = allocateNightsForClusters(
+    weights.map((weight) => ({ clusterRequiredTimeMinutes: weight })),
+    safeDayCount
+  );
 
   const phases: TripFramePhase[] = [];
   let cursorDay = 1;

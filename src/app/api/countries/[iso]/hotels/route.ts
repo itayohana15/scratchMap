@@ -36,13 +36,14 @@ export async function GET(request: Request) {
   }
 
   const activityClusters = parseCoordPairs(searchParams.get("activityClusters"));
+  const transferAnchors = parseCoordPairs(searchParams.get("transferAnchors"));
   const airportLat = Number(searchParams.get("airportLat"));
   const airportLon = Number(searchParams.get("airportLon"));
   const airportCoords =
     Number.isFinite(airportLat) && Number.isFinite(airportLon) ? { lat: airportLat, lon: airportLon } : null;
 
   const candidates = await findHotelCandidates(lat, lon, RADIUS_METERS, CANDIDATE_LIMIT);
-  const ranked = rankHotels(candidates, activityClusters, airportCoords).slice(0, RANKED_LIMIT);
+  const ranked = rankHotels(candidates, activityClusters, airportCoords, transferAnchors).slice(0, RANKED_LIMIT);
 
   return NextResponse.json({
     hotels: ranked,

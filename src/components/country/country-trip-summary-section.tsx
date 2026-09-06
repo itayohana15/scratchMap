@@ -13,7 +13,9 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatCurrency, formatDate } from "@/lib/format";
+import { DeleteTripDialog } from "@/components/trips/delete-trip-dialog";
+import { formatCurrency, formatDate, formatTripDateRangeExpanded } from "@/lib/format";
+import { itineraryDisplayTitle } from "@/lib/itinerary-pdf-export";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { useCountryTripSummary } from "@/lib/hooks/use-country-trip-summary";
 import { createWorkspaceFromItineraryRecord, type CountryItineraryRecord } from "@/lib/itineraries";
@@ -88,10 +90,27 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
       onRegenerate={dialog.handleRegenerate}
       onRestore={dialog.handleRestore}
       onArchive={dialog.handleArchive}
-      onDelete={dialog.handleDelete}
+      onDelete={dialog.requestDelete}
       onExport={dialog.exportItinerary}
     />
   );
+
+  const deleteDialogElement = dialog.deleteTarget ? (
+    <DeleteTripDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) dialog.cancelDelete();
+      }}
+      tripName={itineraryDisplayTitle(dialog.deleteTarget, country.name)}
+      tripDates={formatTripDateRangeExpanded(
+        dialog.deleteTarget.startDate,
+        dialog.deleteTarget.endDate,
+        dialog.deleteTarget.preferencesSnapshot.partialDate
+      )}
+      tripDuration={`${dialog.deleteTarget.daysCount} ימים`}
+      onConfirm={dialog.confirmDelete}
+    />
+  ) : null;
 
   if (summary.completed.length === 0) {
     return (
@@ -108,6 +127,7 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
           />
         ) : null}
         {dialogElement}
+        {deleteDialogElement}
       </div>
     );
   }
@@ -316,6 +336,7 @@ export function CountryTripSummarySection({ iso, country }: CountryTripSummarySe
       ) : null}
 
       {dialogElement}
+      {deleteDialogElement}
     </div>
   );
 }

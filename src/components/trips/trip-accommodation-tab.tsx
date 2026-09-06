@@ -1,21 +1,31 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BedDouble, Check, MapPin, RotateCcw, Scale } from "lucide-react";
+import { AlertTriangle, BedDouble, Check, MapPin, RotateCcw, Scale } from "lucide-react";
 
 import { HotelComparisonDialog } from "@/components/trips/hotel-comparison-dialog";
 import { HotelModal } from "@/components/trips/hotel-modal";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { findAirportByIata } from "@/lib/facts/airports-data";
 import { formatCurrency, formatDate } from "@/lib/format";
 import {
   buildHotelSelectionPatch,
+  deriveHotelLocationQualityLabel,
   isHotelExplicitlySelected,
   toggleHotelComparisonSelection,
 } from "@/lib/hotel-ui-helpers";
 import { useHotelRecommendations } from "@/lib/hooks/use-hotel-recommendations";
 import { recalculateStayRouting, resolveStayAnchorCoordinates } from "@/lib/stay-routing";
-import type { TripFlights, TripItineraryDay } from "@/lib/trip-workspace";
+import {
+  computeDestinationMobilityProfile,
+  computeStayActivityCenter,
+  isMeaningfulStayActivityItem,
+  type DestinationMobilityProfile,
+  type StayActivityCenterResult,
+  type TripFlights,
+  type TripItineraryDay,
+} from "@/lib/trip-workspace";
 import type { RankedHotel } from "@/lib/hotels";
 
 interface StayBlock {
@@ -29,19 +39,19 @@ interface StayBlock {
   totalCost: number | null;
   notes: string;
   dayIds: string[];
-  /** Centroid of every real-coordinate item across the stay's days — the trip's own planned activity area for this base (spec item 29). */
-  activityCentroid: { lat: number; lon: number } | null;
+  /** Every real, meaningful (non-transportation/practical, non-placeholder) activity coordinate across ALL of the stay's days — spec "MULTI-DAY STAY": ranking/center must use every day, never just day 1. */
+  activityCoordinates: Array<{ lat: number; lon: number }>;
+  /** Real, outlier-resistant medoid center of activityCoordinates (spec "ACCOMMODATION SHOULD FOLLOW THE ACTIVITY CLUSTER") — the point hotel search/ranking is anchored on, never a naive average. */
+  activityCenter: StayActivityCenterResult;
 }
 
-/** Groups consecutive days sharing the same accommodation into one stay block (spec §17), now also tracking which days it spans for hotel-selection patching (spec item 34) and a real activity centroid (spec items 28-30). */
-function buildStayBlocks(days: TripItineraryDay[]): StayBlock[] {
-  const blocks: StayBlock[] = [];
+/** Groups consecutive days sharing the same accommodation into one stay block (spec §17), now also tracking which days it spans for hotel-selection patching (spec item 34) and a real, outlier-resistant activity center (spec "ACCOMMODATION SHOULD FOLLOW THE ACTIVITY CLUSTER"). */
+function buildStayBlocks(days: TripItineraryDay[], mobilityProfile: DestinationMobilityProfile): StayBlock[] {
+  const blocks: Array<Omit<StayBlock, "activityCenter"> & { activityCenter?: StayActivityCenterResult }> = [];
   for (const day of days) {
     const accommodation = day.accommodation.trim();
     if (!accommodation) continue;
-    const coords = day.items.filter((item) => item.lat != null && item.lon != null) as Array<
-      { lat: number; lon: number }
-    >;
+    const coords = day.items.filter(isMeaningfulStayActivityItem) as Array<{ lat: number; lon: number }>;
     const last = blocks[blocks.length - 1];
     if (last && last.accommodation === accommodation) {
       last.endDate = day.date || last.endDate;
@@ -51,14 +61,7 @@ function buildStayBlocks(days: TripItineraryDay[]): StayBlock[] {
           ? (last.totalCost ?? 0) + (day.accommodationCost ?? 0)
           : null;
       last.dayIds.push(day.id);
-      if (coords.length > 0) {
-        const existing = last.activityCentroid;
-        const allCoords = existing ? [existing, ...coords] : coords;
-        last.activityCentroid = {
-          lat: allCoords.reduce((sum, c) => sum + c.lat, 0) / allCoords.length,
-          lon: allCoords.reduce((sum, c) => sum + c.lon, 0) / allCoords.length,
-        };
-      }
+      last.activityCoordinates.push(...coords);
       continue;
     }
     blocks.push({
@@ -72,16 +75,13 @@ function buildStayBlocks(days: TripItineraryDay[]): StayBlock[] {
       totalCost: day.accommodationCost,
       notes: day.notes,
       dayIds: [day.id],
-      activityCentroid:
-        coords.length > 0
-          ? {
-              lat: coords.reduce((sum, c) => sum + c.lat, 0) / coords.length,
-              lon: coords.reduce((sum, c) => sum + c.lon, 0) / coords.length,
-            }
-          : null,
+      activityCoordinates: coords,
     });
   }
-  return blocks;
+  return blocks.map((block) => ({
+    ...block,
+    activityCenter: computeStayActivityCenter(block.activityCoordinates, mobilityProfile.localityRadiusKm),
+  }));
 }
 
 function HotelRowSkeleton() {
@@ -101,12 +101,19 @@ function HotelPicker({
   isoA2,
   countryName,
   stayDays,
+  mobilityProfile,
+  transferAnchors,
+  airportCoords,
   onSelect,
 }: {
   stay: StayBlock;
   isoA2: string;
   countryName: string;
   stayDays: TripItineraryDay[];
+  mobilityProfile: DestinationMobilityProfile;
+  /** Adjacent-stay anchors (spec "HOTEL RANKING PRIORITY" #3 — compatibility with the transfer). */
+  transferAnchors: Array<{ lat: number; lon: number }>;
+  airportCoords: { lat: number; lon: number } | null;
   onSelect: (hotel: RankedHotel) => void;
 }) {
   const [detailsHotel, setDetailsHotel] = useState<RankedHotel | null>(null);
@@ -114,12 +121,17 @@ function HotelPicker({
   const [compareNames, setCompareNames] = useState<Set<string>>(new Set());
   const [justSelectedName, setJustSelectedName] = useState<string | null>(null);
 
+  const activityCenter = stay.activityCenter.center;
   const { data, isLoading, isError, refetch, isRefetching } = useHotelRecommendations({
     iso: isoA2,
-    lat: stay.activityCentroid?.lat ?? null,
-    lon: stay.activityCentroid?.lon ?? null,
-    activityClusters: stay.activityCentroid ? [stay.activityCentroid] : [],
-    airportCoords: null,
+    // Section: "HOTEL SEARCH AREA" — anchored on the stay's real, medoid
+    // activity center, never a generic city/area point, so search actually
+    // covers the part of the city the stay's own activities are in.
+    lat: activityCenter?.lat ?? null,
+    lon: activityCenter?.lon ?? null,
+    activityClusters: stay.activityCoordinates,
+    airportCoords,
+    transferAnchors,
   });
 
   // Brief, real feedback the instant a selection is made (spec item 8) —
@@ -136,7 +148,7 @@ function HotelPicker({
     setJustSelectedName(hotel.name);
   }
 
-  if (!stay.activityCentroid) {
+  if (!activityCenter) {
     return (
       <p className="text-xs text-muted-foreground">
         עדיין אין מספיק פעילויות עם מיקום ידוע בבסיס הזה כדי להציע מלונות אמיתיים.
@@ -144,9 +156,20 @@ function HotelPicker({
     );
   }
 
+  // Section "MULTIPLE ACTIVITY CLUSTERS" — a large share of this stay's
+  // real activities sit far from its own main cluster. A hotel choice must
+  // not quietly hide that by picking a midpoint; surface it instead.
+  const structureConcernBanner = stay.activityCenter.structureConcern ? (
+    <p className="flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
+      <AlertTriangle className="size-3.5 shrink-0" />
+      הפעילויות בבסיס הזה מפוזרות על פני אזור רחב — כדאי לשקול טיול יום נפרד או בסיס נוסף במקום להסתמך על מלון אחד שמשרת את כולן.
+    </p>
+  ) : null;
+
   if (isLoading) {
     return (
       <div className="space-y-1.5">
+        {structureConcernBanner}
         <HotelRowSkeleton />
         <HotelRowSkeleton />
         <HotelRowSkeleton />
@@ -156,24 +179,33 @@ function HotelPicker({
 
   if (isError) {
     return (
-      <div className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2.5 text-sm">
-        <span className="text-destructive">לא הצלחנו לטעון מלונות באזור הזה</span>
-        <Button type="button" variant="outline" size="sm" className="gap-1" onClick={() => void refetch()} disabled={isRefetching}>
-          <RotateCcw className="size-3.5" />
-          נסה שוב
-        </Button>
+      <div className="space-y-1.5">
+        {structureConcernBanner}
+        <div className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2.5 text-sm">
+          <span className="text-destructive">לא הצלחנו לטעון מלונות באזור הזה</span>
+          <Button type="button" variant="outline" size="sm" className="gap-1" onClick={() => void refetch()} disabled={isRefetching}>
+            <RotateCcw className="size-3.5" />
+            נסה שוב
+          </Button>
+        </div>
       </div>
     );
   }
 
   if (!data || data.hotels.length === 0) {
-    return <p className="text-xs text-muted-foreground">לא נמצאו מלונות אמיתיים באזור זה כרגע.</p>;
+    return (
+      <div className="space-y-1.5">
+        {structureConcernBanner}
+        <p className="text-xs text-muted-foreground">לא נמצאו מלונות אמיתיים באזור זה כרגע.</p>
+      </div>
+    );
   }
 
   const compared = data.hotels.filter((hotel) => compareNames.has(hotel.name));
 
   return (
     <div className="space-y-2">
+      {structureConcernBanner}
       <p className="text-xs text-muted-foreground">
         אזור לינה מומלץ: קרוב לרוב הפעילויות המתוכננות בבסיס זה. מקור הנתונים: OpenStreetMap — מחיר ודירוג אינם זמינים.
       </p>
@@ -190,7 +222,10 @@ function HotelPicker({
             />
             <div className="min-w-0 flex-1">
               <p className="truncate font-medium">{hotel.name}</p>
-              <p className="text-xs text-muted-foreground">התאמה למסלול {hotel.locationScore}%</p>
+              <p className="text-xs text-muted-foreground">
+                התאמה למסלול {hotel.locationScore}% ·{" "}
+                {deriveHotelLocationQualityLabel(hotel.averageActivityTravelMinutes, mobilityProfile.normalDayTravelBudgetMinutes)}
+              </p>
             </div>
             {justSelectedName === hotel.name ? (
               <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
@@ -251,7 +286,13 @@ export function TripAccommodationTab({
   flights?: TripFlights;
   onPatchDay: (dayId: string, updater: (day: TripItineraryDay) => TripItineraryDay) => void;
 }) {
-  const stays = buildStayBlocks(days);
+  // Same locality model the planner itself uses (spec "SAME MOBILITY
+  // PROFILE" — never a separate, unrelated hotel-distance rule): derived
+  // once from every real activity coordinate across the whole trip.
+  const mobilityProfile = computeDestinationMobilityProfile(
+    days.flatMap((day) => day.items.filter(isMeaningfulStayActivityItem))
+  );
+  const stays = buildStayBlocks(days, mobilityProfile);
   const [openPickerIndex, setOpenPickerIndex] = useState<number | null>(null);
 
   if (stays.length === 0) {
@@ -270,12 +311,15 @@ export function TripAccommodationTab({
       hotelCoordinates: block.accommodationLat != null && block.accommodationLon != null
         ? { lat: block.accommodationLat, lon: block.accommodationLon }
         : null,
-      activityCentroid: block.activityCentroid,
+      activityCentroid: block.activityCenter.center,
     });
   }
 
   function selectHotel(stay: StayBlock, hotel: RankedHotel) {
-    const patch = buildHotelSelectionPatch(hotel, stay.activityCentroid ? [stay.activityCentroid] : []);
+    // Section "USER-SELECTED HOTEL" — the choice is honored as-is; this
+    // only computes a real, visible mismatch warning (never a rejection),
+    // using the SAME locality radius the planner uses for this destination.
+    const patch = buildHotelSelectionPatch(hotel, stay.activityCoordinates, mobilityProfile.localityRadiusKm);
     const stayIndex = stays.indexOf(stay);
     const isFirstStay = stayIndex === 0;
     const isFinalStay = stayIndex === stays.length - 1;
@@ -353,13 +397,32 @@ export function TripAccommodationTab({
               </Button>
             </div>
             {openPickerIndex === index ? (
-              <HotelPicker
-                stay={stay}
-                isoA2={isoA2}
-                countryName={countryName}
-                stayDays={stayDays}
-                onSelect={(hotel) => selectHotel(stay, hotel)}
-              />
+              (() => {
+                const isFirstStay = index === 0;
+                const isFinalStay = index === stays.length - 1;
+                const transferAnchors = [
+                  isFirstStay ? null : resolveAnchor(stays[index - 1]),
+                  isFinalStay ? null : resolveAnchor(stays[index + 1]),
+                ].filter((anchor): anchor is { lat: number; lon: number } => anchor != null);
+                const relevantAirportIata = isFirstStay
+                  ? flights?.outbound?.arrivalAirport || null
+                  : isFinalStay
+                    ? flights?.return?.departureAirport || null
+                    : null;
+                const airport = relevantAirportIata ? findAirportByIata(relevantAirportIata) : null;
+                return (
+                  <HotelPicker
+                    stay={stay}
+                    isoA2={isoA2}
+                    countryName={countryName}
+                    stayDays={stayDays}
+                    mobilityProfile={mobilityProfile}
+                    transferAnchors={transferAnchors}
+                    airportCoords={airport ? { lat: airport.lat, lon: airport.lon } : null}
+                    onSelect={(hotel) => selectHotel(stay, hotel)}
+                  />
+                );
+              })()
             ) : null}
           </div>
         );

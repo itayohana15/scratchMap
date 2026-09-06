@@ -1264,6 +1264,143 @@ test("analyzeDayGeography detects cross-city mixing, long travel, and food-heavy
   assert.equal(diagnostics.isTransferDay, false);
 });
 
+// Real bug found via a real 44-day US QA run: duplicateRestaurants,
+// foodDominant, and mealSpacingViolations all filtered by isFoodCategory
+// alone, so a meal-opportunity placeholder (no recommendationId, no
+// coordinates, by design — "not a real POI the traveler picks from the
+// food tab") got validated as a real restaurant. Fixed by reusing
+// duplicatePlaces' own real-place test (isRealPlaceCandidate). Invented
+// synthetic geography ("Test City") — no real-world place name.
+function buildPlanWithDay(day: AiGeneratedDay): AiItineraryResponse {
+  return {
+    title: "Test Trip",
+    summary: "",
+    totalEstimatedCost: 500,
+    estimatedTransportCost: 0,
+    averageDailyCost: 500,
+    costPerTraveler: 500,
+    categoryBreakdown: { attractions: 0, food: 0, transportation: 0, accommodation: 0, other: 0 },
+    days: [day],
+  };
+}
+const testProfile = buildTripPreferenceProfile(basePreferences, "Test Country", 1);
+
+test("duplicateRestaurants: two identical meal-opportunity placeholders are not a duplicate restaurant", () => {
+  const placeholderA = {
+    ...buildItem({ name: "🍽 Recommended lunch spot", category: "cafe", slot: "lunch" }),
+    lat: null,
+    lon: null,
+  };
+  const placeholderB = {
+    ...buildItem({ name: "🍽 Recommended lunch spot", category: "restaurant", slot: "dinner" }),
+    lat: null,
+    lon: null,
+  };
+  const day = buildDay({ items: [placeholderA, placeholderB] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.duplicateRestaurants, 0);
+});
+
+test("duplicateRestaurants: two identical real restaurants ARE a duplicate restaurant", () => {
+  const realA = buildItem({
+    name: "Test City Diner",
+    category: "restaurant",
+    slot: "lunch",
+    recommendationId: "rec-diner-1",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const realB = buildItem({
+    name: "Test City Diner",
+    category: "restaurant",
+    slot: "dinner",
+    recommendationId: "rec-diner-2",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const day = buildDay({ items: [realA, realB] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.duplicateRestaurants, 1);
+});
+
+test("foodDominantDays: a day of only meal-opportunity placeholders is not food-dominant", () => {
+  const placeholderLunch = {
+    ...buildItem({ name: "🍽 Recommended lunch spot", category: "cafe", slot: "lunch" }),
+    lat: null,
+    lon: null,
+  };
+  const placeholderDinner = {
+    ...buildItem({ name: "🍽 Recommended dinner spot", category: "restaurant", slot: "dinner" }),
+    lat: null,
+    lon: null,
+  };
+  const day = buildDay({ items: [placeholderLunch, placeholderDinner] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.foodDominantDays, 0);
+});
+
+test("foodDominantDays: a day of real food items with no real anchor IS food-dominant", () => {
+  const realLunch = buildItem({
+    name: "Test City Cafe",
+    category: "cafe",
+    slot: "lunch",
+    recommendationId: "rec-cafe-1",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const realDinner = buildItem({
+    name: "Test City Bistro",
+    category: "restaurant",
+    slot: "dinner",
+    recommendationId: "rec-bistro-1",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const day = buildDay({ items: [realLunch, realDinner] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.foodDominantDays, 1);
+});
+
+test("mealSpacingViolations: two close-together meal-opportunity placeholders are not a spacing violation", () => {
+  const placeholderLunch = {
+    ...buildItem({ name: "🍽 Recommended lunch spot", category: "cafe", slot: "lunch", plannedStartTime: "12:00" }),
+    lat: null,
+    lon: null,
+  };
+  const placeholderDinner = {
+    ...buildItem({ name: "🍽 Recommended dinner spot", category: "restaurant", slot: "dinner", plannedStartTime: "14:00" }),
+    lat: null,
+    lon: null,
+  };
+  const day = buildDay({ items: [placeholderLunch, placeholderDinner] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.mealSpacingViolations, 0);
+});
+
+test("mealSpacingViolations: two close-together REAL food items ARE a spacing violation", () => {
+  const realLunch = buildItem({
+    name: "Test City Cafe",
+    category: "cafe",
+    slot: "lunch",
+    plannedStartTime: "12:00",
+    recommendationId: "rec-cafe-2",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const realDinner = buildItem({
+    name: "Test City Bistro",
+    category: "restaurant",
+    slot: "dinner",
+    plannedStartTime: "14:00",
+    recommendationId: "rec-bistro-2",
+    lat: 10.0,
+    lon: 10.0,
+  });
+  const day = buildDay({ items: [realLunch, realDinner] });
+  const diagnostics = collectPlanDiagnostics(buildPlanWithDay(day), testProfile);
+  assert.equal(diagnostics.mealSpacingViolations, 1);
+});
+
 // Spec test 83: Western Wall → Israel Museum (~2km apart in Jerusalem) must
 // not be trusted as an implausibly fast walk just because the AI said so —
 // the real distance-based estimate should surface it as a genuinely long

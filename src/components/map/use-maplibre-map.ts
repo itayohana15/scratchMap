@@ -15,6 +15,11 @@ import {
   countryFillColorExpression,
   OCEAN_COLOR,
 } from "@/components/map/country-layer";
+import {
+  computeCountryFeatureMapFocus,
+  logMapFocus,
+  toUnwrappedMapBbox,
+} from "@/lib/map/focus";
 import { loadMaplibreGl } from "@/lib/map/load-maplibre";
 import type { CountryFeatureCollection, CountryFeatureProperties } from "@/lib/map/geo";
 import type { Status } from "@/lib/supabase/types";
@@ -356,13 +361,22 @@ export function useMaplibreMap({ isDark, onCountryClick, geojson }: UseMaplibreM
     [ready]
   );
 
-  const flyToBbox = useCallback((bbox: [number, number, number, number]) => {
+  const flyToCountryFeature = useCallback((feature: Feature<Polygon | MultiPolygon, CountryFeatureProperties>) => {
     const map = mapRef.current;
     if (!map) return;
+
+    const focus = computeCountryFeatureMapFocus(feature);
+    if (!focus) return;
+
+    const unwrappedBbox = toUnwrappedMapBbox(focus.bbox);
     const bounds: LngLatBoundsLike = [
-      [bbox[0], bbox[1]],
-      [bbox[2], bbox[3]],
+      [unwrappedBbox[0], unwrappedBbox[1]],
+      [unwrappedBbox[2], unwrappedBbox[3]],
     ];
+
+    const camera = map.cameraForBounds(bounds, { padding: 64, maxZoom: 6.5 });
+    logMapFocus("world-fitBounds", feature.properties.iso_a2, focus, camera?.zoom);
+
     map.fitBounds(bounds, { padding: 64, duration: 1400, essential: true, maxZoom: 6.5 });
   }, []);
 
@@ -372,5 +386,5 @@ export function useMaplibreMap({ isDark, onCountryClick, geojson }: UseMaplibreM
     map.flyTo({ center: WORLD_VIEW.center, zoom: WORLD_VIEW.zoom, duration: 1200, essential: true });
   }, []);
 
-  return { containerRef, mapRef, ready, syncCountryStatuses, flyToBbox, resetToWorld };
+  return { containerRef, mapRef, ready, syncCountryStatuses, flyToCountryFeature, resetToWorld };
 }

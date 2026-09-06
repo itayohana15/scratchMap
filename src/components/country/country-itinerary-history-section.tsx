@@ -14,9 +14,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DeleteTripDialog } from "@/components/trips/delete-trip-dialog";
 import type { CountryItineraryRecord, CountryItineraryStatus } from "@/lib/itineraries";
 import { itineraryDisplayTitle, openItineraryPdfExport } from "@/lib/itinerary-pdf-export";
 import { formatCurrency, formatTripDateRangeExpanded } from "@/lib/format";
+import { useDebugGeoFlag, useGeoResolutionDebugMap } from "@/lib/hooks/use-geo-resolution-debug";
 import { useItineraryDialogController } from "@/lib/hooks/use-itinerary-dialog-controller";
 import { useCountryItineraries, useUpdateCountryItinerary } from "@/lib/queries/country-itineraries";
 import type { Tables } from "@/lib/supabase/types";
@@ -85,7 +87,9 @@ export function CountryItineraryHistorySection({
 
   const [activeFilter, setActiveFilter] = useState<HistoryFilter | "all">("all");
 
-  const { handleDelete } = useItineraryDialogController(iso);
+  const { deleteTarget, requestDelete, cancelDelete, confirmDelete } = useItineraryDialogController(iso);
+  const debugGeoEnabled = useDebugGeoFlag();
+  const { data: geoResolutionOverride } = useGeoResolutionDebugMap(iso, debugGeoEnabled);
 
   function openTrip(itinerary: CountryItineraryRecord) {
     router.push(`/trips/${itinerary.id}`);
@@ -115,7 +119,7 @@ export function CountryItineraryHistorySection({
   }
 
   function exportItineraryPdf(itinerary: CountryItineraryRecord) {
-    const opened = openItineraryPdfExport(itinerary, country.name);
+    const opened = openItineraryPdfExport(itinerary, country.name, undefined, geoResolutionOverride ?? null);
     if (!opened) {
       toast.error("לא ניתן לפתוח את חלון הייצוא. יש לאפשר חלונות קופצים בדפדפן.");
     }
@@ -270,7 +274,7 @@ export function CountryItineraryHistorySection({
                         variant="destructive"
                         onClick={(event) => {
                           event.stopPropagation();
-                          void handleDelete(itinerary.id);
+                          requestDelete(itinerary);
                         }}
                       >
                         <Trash2 className="size-4" />
@@ -338,6 +342,23 @@ export function CountryItineraryHistorySection({
           ))}
         </div>
       )}
+
+      {deleteTarget ? (
+        <DeleteTripDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) cancelDelete();
+          }}
+          tripName={itineraryDisplayTitle(deleteTarget, country.name)}
+          tripDates={formatTripDateRangeExpanded(
+            deleteTarget.startDate,
+            deleteTarget.endDate,
+            deleteTarget.preferencesSnapshot.partialDate
+          )}
+          tripDuration={`${deleteTarget.daysCount} ימים`}
+          onConfirm={confirmDelete}
+        />
+      ) : null}
     </div>
   );
 }

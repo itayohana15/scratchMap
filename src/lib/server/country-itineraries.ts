@@ -39,6 +39,7 @@ import {
   type TripItineraryItem,
 } from "@/lib/trip-workspace";
 import { isMissingCountryItineraryStorageError, toCountryItineraryStorageError } from "@/lib/server/country-itinerary-storage";
+import { isPlannerQaTraceEnabled } from "@/lib/planner-qa-trace";
 
 type DbClient = SupabaseClient<Database>;
 
@@ -317,8 +318,15 @@ async function loadPersonalizationSummary(supabase: DbClient): Promise<string | 
   }
 }
 
+// Hygiene pass — this used to fire on every non-production request
+// (NODE_ENV !== "production"), flooding the server terminal on every
+// `npm run dev` trip generation with no way to turn it off short of
+// building for production. Gated behind the same QA/debug flags every
+// other generation-time diagnostic already uses (QA_DEBUG_GEOGRAPHY,
+// CAPTURE_FIXTURES, PLANNER_QA_TRACE) — silent by default, and a
+// deliberate QA run still gets these stage markers.
 function devLog(message: string, details?: Record<string, unknown>) {
-  if (process.env.NODE_ENV === "production") return;
+  if (!isPlannerQaTraceEnabled()) return;
   if (details) console.log(`[Itinerary] ${message}`, details);
   else console.log(`[Itinerary] ${message}`);
 }

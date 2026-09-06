@@ -1,6 +1,11 @@
 import { differenceInCalendarDays, parseISO } from "date-fns";
 
 import { formatTripDateRange } from "@/lib/format";
+import {
+  isPlannerQaTraceEnabled,
+  tracePlaceInsertion,
+  tracePoolStage,
+} from "@/lib/planner-qa-trace";
 
 export type TripPhase = "planning" | "booked" | "currently_traveling" | "completed";
 export type ItineraryGenerationMode =
@@ -690,9 +695,29 @@ export interface AiItineraryRequest {
   overpassAvailable?: "available" | "unavailable" | "partial" | null;
 }
 
+/**
+ * Authoritative structured schedule-item role (spec "SEPARATE NON-PLACE
+ * SCHEDULE ITEMS") — set explicitly at creation by every synthetic-item
+ * builder (createFallbackMealPlaceholder, createFallbackActivityPlaceholder,
+ * createFallbackPracticalItem, buildFreeExplorationReplacement,
+ * buildFallbackMealPlaceholder), never inferred later from display text or
+ * category. A meal-opportunity/free-time/practical block must never be
+ * treated as an equivalent to a real POI just because its `category` field
+ * happens to read "restaurant"/"attraction"/etc for scheduling-slot
+ * purposes — this is the ONE authoritative signal geography validation and
+ * duplicate tracking key off, deliberately independent of `category`.
+ * Absent (undefined) on any item built before this field existed, or on a
+ * genuine Gemini-authored real-place item — both are treated as
+ * "real_place" by the one shared helper that reads this (isSyntheticScheduleItem,
+ * itinerary-generation-constraints.ts), so nothing regresses silently.
+ */
+export type ScheduleItemRole = "real_place" | "meal_opportunity" | "free_time" | "transit_practical";
+
 export interface AiGeneratedItem {
   name: string;
   category: RecommendationCategory;
+  /** See ScheduleItemRole's own docstring — absent means "real_place" (backward compatible default), never inferred from category/text by consumers. */
+  itemRole?: ScheduleItemRole;
   location: string;
   shortDescription: string;
   slot: DayPart;
@@ -1343,7 +1368,7 @@ export function haversineKm(
   return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-const FUZZY_DUPLICATE_MAX_KM = 0.15; // ~150m
+export const FUZZY_DUPLICATE_MAX_KM = 0.15; // ~150m
 
 // Strips parenthetical suffixes ("Mtatsminda Park (Funicular)" ->
 // "mtatsminda park") and punctuation so differently-worded mentions of the
@@ -1379,6 +1404,99 @@ export function isFuzzyDuplicatePlace(a: FuzzyPlaceRecord, b: FuzzyPlaceRecord):
   // side, the strict slug match alone is treated as sufficient.
   if (a.lat == null || a.lon == null || b.lat == null || b.lon == null) return true;
   return haversineKm(a.lat, a.lon, b.lat, b.lon) <= FUZZY_DUPLICATE_MAX_KM;
+}
+
+// Real root cause of a whole class of production duplicates (a real 43-day
+// US replay: Times Square/Central Park first placed correctly in New York,
+// then RE-inserted by locality_repair into Austin/Philadelphia/Nashville/
+// Chicago/Boston/etc., all reporting alreadyUsedAtInsertion:false even
+// though the same recommendationId already existed elsewhere in the SAME
+// itinerary) — every one of enforceNormalDayLocality/repairDayGeography/
+// repairCrossRegionDayContent/repairNormalDayTravelOutliers/
+// repairOpeningHoursViolations/enforceArrivalDepartureWindow/
+// enforceTransportRoleGuard used to rebuild its own "used" Set fresh from
+// ONLY the single day it was actively repairing, discarding every other
+// day's content — a real, resolved place used on day 2 was structurally
+// invisible to a repair running on day 30, so a candidate that was
+// genuinely already scheduled elsewhere always looked "unused" from that
+// day-local vantage point. One authoritative, itinerary-wide tracker
+// closes this at the root: every mutation-capable repair pass builds this
+// ONCE from the CURRENT (already-mutated-by-earlier-passes) days, releases
+// an item's usage the moment it's removed, and registers a replacement's
+// usage the moment it's inserted — so a later replacement within the SAME
+// pass, or a later pass entirely, sees the up-to-date picture instead of a
+// stale pre-repair snapshot. Same dual identity semantics duplicate
+// diagnostics already use (buildPlaceKey/computeCanonicalPlaceIdentity): an
+// exact recommendationId collision OR a fuzzy normalized-name+coordinate
+// collision both count as "already used" — a category alias (the same
+// physical place returned under two different candidate-list categories)
+// can never bypass this by presenting under a different id-less shape.
+export interface ItineraryUsageState {
+  /** recommendationId -> how many real (non-synthetic) items in the current itinerary currently claim it. */
+  usageCounts: Map<string, number>;
+  /** One entry per real (non-synthetic) item currently in the itinerary — a multiset, not a Set, so releasing one specific occurrence never removes a genuinely separate duplicate elsewhere. */
+  usedRealPlaces: FuzzyPlaceRecord[];
+}
+
+/** A synthetic schedule item (free time/meal opportunity/practical block — see ScheduleItemRole) never represents a real, trackable physical place, regardless of whether it happens to carry coordinates. */
+function isRealPlaceForUsageTracking(
+  item: Pick<AiGeneratedItem, "recommendationId" | "lat" | "lon" | "itemRole">
+): boolean {
+  if (item.itemRole != null && item.itemRole !== "real_place") return false;
+  return Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
+}
+
+export function createItineraryUsageState(): ItineraryUsageState {
+  return { usageCounts: new Map(), usedRealPlaces: [] };
+}
+
+/** Fresh state from the CURRENT itinerary (spec "before each mutation-capable repair pass: build canonical usage state from the CURRENT itinerary") — never from a snapshot taken before earlier passes/mutations. */
+export function buildItineraryUsageState(days: Pick<AiGeneratedDay, "items">[]): ItineraryUsageState {
+  const state = createItineraryUsageState();
+  for (const day of days) {
+    for (const item of day.items) {
+      registerItineraryUsage(state, item);
+    }
+  }
+  return state;
+}
+
+/** Called the moment a real item is inserted/kept — spec "when a replacement is inserted, immediately mark its canonical identity used." */
+export function registerItineraryUsage(
+  state: ItineraryUsageState,
+  item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "itemRole">
+): void {
+  if (!isRealPlaceForUsageTracking(item)) return;
+  if (item.recommendationId) {
+    state.usageCounts.set(item.recommendationId, (state.usageCounts.get(item.recommendationId) ?? 0) + 1);
+  }
+  state.usedRealPlaces.push({ nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon });
+}
+
+/** Called the moment a real item is removed/replaced — spec "when an item is removed, decrement/remove its usage." Removes exactly ONE matching occurrence (multiset semantics), never every occurrence of that identity. */
+export function releaseItineraryUsage(
+  state: ItineraryUsageState,
+  item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "itemRole">
+): void {
+  if (!isRealPlaceForUsageTracking(item)) return;
+  if (item.recommendationId) {
+    const current = state.usageCounts.get(item.recommendationId) ?? 0;
+    if (current <= 1) state.usageCounts.delete(item.recommendationId);
+    else state.usageCounts.set(item.recommendationId, current - 1);
+  }
+  const record: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(item.name), lat: item.lat, lon: item.lon };
+  const index = state.usedRealPlaces.findIndex((candidate) => isFuzzyDuplicatePlace(candidate, record));
+  if (index !== -1) state.usedRealPlaces.splice(index, 1);
+}
+
+/** Spec §B — "must not use recommendationId-only membership if diagnostics use broader identity": true on an exact id collision OR a fuzzy name+coordinate collision, exactly the two forms collectPlanDiagnostics' own duplicate check treats as the same physical place. */
+export function isItineraryPlaceUsed(
+  state: ItineraryUsageState,
+  candidate: { id?: string | null; name: string; lat: number | null; lon: number | null }
+): boolean {
+  if (candidate.id && (state.usageCounts.get(candidate.id) ?? 0) > 0) return true;
+  const record: FuzzyPlaceRecord = { nameSlug: normalizePlaceNameSlug(candidate.name), lat: candidate.lat, lon: candidate.lon };
+  return state.usedRealPlaces.some((used) => isFuzzyDuplicatePlace(used, record));
 }
 
 // A hotel more than this from EVERY one of the stay's own activity
@@ -1483,6 +1601,247 @@ export function isCandidateGeographicallyCompatibleWithDay(
   return anchorsWithCoordinates.some(
     (anchor) => haversineKm(anchor.lat, anchor.lon, candidate.lat, candidate.lon) < maxDistanceKm
   );
+}
+
+/**
+ * Spec "LEGAL PER-DAY CANDIDATE POOL" — the ONE function that decides which
+ * real candidates are even ELIGIBLE for a given day, before any scoring
+ * happens. Extracted from what used to be four filters duplicated inline
+ * inside selectFallbackCandidate (below) — same logic, now named, testable
+ * on its own, and reusable by any other caller instead of being
+ * re-duplicated. Never a global unrestricted pool: already-used real
+ * places (by id, by usage count, and by fuzzy name+coordinate identity —
+ * the same identity collectPlanDiagnostics itself flags duplicates with)
+ * are excluded first, then the same hard geographic gate
+ * (isCandidateGeographicallyCompatibleWithDay) every other
+ * replacement/fallback path already uses decides real-world eligibility.
+ */
+export function buildLegalDayCandidatePool(args: {
+  pool: TripRecommendation[];
+  ownerAnchors: Array<{ lat: number | null; lon: number | null }>;
+  maxDistanceKm?: number;
+  isDayTripDay?: boolean;
+  usedToday: Set<string>;
+  usageCounts: Map<string, number>;
+  usedRealPlaces: FuzzyPlaceRecord[];
+  /** Observability only (spec "LEGAL POOL OBSERVABILITY") — omitting it changes nothing but the trace, never the returned pool. */
+  dayNumber?: number;
+}): TripRecommendation[] {
+  const dayNumber = args.dayNumber ?? 0;
+  tracePoolStage({ dayNumber, stage: "raw", size: args.pool.length });
+
+  const afterUsedFilter = args.pool
+    .filter((candidate) => !args.usedToday.has(candidate.id))
+    .filter((candidate) => (args.usageCounts.get(candidate.id) ?? 0) === 0)
+    .filter((candidate) => {
+      const candidateRecord: FuzzyPlaceRecord = {
+        nameSlug: normalizePlaceNameSlug(candidate.name),
+        lat: candidate.lat,
+        lon: candidate.lon,
+      };
+      return !args.usedRealPlaces.some((used) => isFuzzyDuplicatePlace(used, candidateRecord));
+    });
+  tracePoolStage({ dayNumber, stage: "after_global_used_filter", size: afterUsedFilter.length });
+
+  const finalLegalPool = afterUsedFilter.filter((candidate) =>
+    isCandidateGeographicallyCompatibleWithDay(candidate, args.ownerAnchors, {
+      maxDistanceKm: args.maxDistanceKm,
+      isDayTripDay: args.isDayTripDay,
+    })
+  );
+  tracePoolStage({ dayNumber, stage: "after_geography_filter", size: finalLegalPool.length });
+  tracePoolStage({ dayNumber, stage: "final_legal_pool", size: finalLegalPool.length });
+  if (finalLegalPool.length === 0 && isPlannerQaTraceEnabled()) {
+    console.log("[PlannerQA] LEGAL_POOL_EXHAUSTED", { dayNumber, rawPoolSize: args.pool.length, afterUsedFilter: afterUsedFilter.length });
+  }
+
+  return finalLegalPool;
+}
+
+// Locality-first architecture (browser QA finding) — a single worldwide
+// fixed 80km threshold treats a compact, dense destination (many real
+// attractions close together) the same as a large, sparse one, which is
+// exactly backwards: 80km is enormous in a dense country and modest in a
+// sparse one. Derived purely from the candidate pool's OWN geography
+// (median nearest-neighbor spacing between real candidates) — never a
+// country/region name — so a genuinely dense destination gets a tight
+// locality radius and a genuinely sparse one gets a looser one, with no
+// per-destination special-casing anywhere in this file.
+export type DestinationMobilityTier = "compact" | "medium" | "large_sparse";
+
+export interface DestinationMobilityProfile {
+  tier: DestinationMobilityTier;
+  /** Replaces the old fixed CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM default for this specific trip. */
+  localityRadiusKm: number;
+  /** A normal (non-day-trip, non-transfer) day's real travel budget, in minutes — used the same way MAX_NORMAL_DAY_TRAVEL_MINUTES already is, just adaptive. */
+  normalDayTravelBudgetMinutes: number;
+}
+
+const DEFAULT_MOBILITY_PROFILE: DestinationMobilityProfile = {
+  tier: "medium",
+  localityRadiusKm: CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM,
+  normalDayTravelBudgetMinutes: 120,
+};
+
+/**
+ * Median nearest-neighbor spacing among real candidate coordinates — a
+ * genuine density signal (unlike the overall bounding-box extent, which a
+ * geographically elongated-but-locally-dense country like Israel would
+ * otherwise misclassify as "sparse"). Fewer than 3 real coordinates means
+ * there's not enough real geography to derive anything from — the
+ * pre-existing fixed default is the honest fallback, not a guess.
+ */
+export function computeDestinationMobilityProfile(
+  candidates: Array<{ lat: number | null; lon: number | null }>
+): DestinationMobilityProfile {
+  const points = candidates.filter(
+    (candidate): candidate is { lat: number; lon: number } => candidate.lat != null && candidate.lon != null
+  );
+  if (points.length < 3) return DEFAULT_MOBILITY_PROFILE;
+
+  const nearestNeighborDistances = points
+    .map((point, index) => {
+      let nearest = Infinity;
+      for (let other = 0; other < points.length; other += 1) {
+        if (other === index) continue;
+        const distanceKm = haversineKm(point.lat, point.lon, points[other].lat, points[other].lon);
+        if (distanceKm > 0 && distanceKm < nearest) nearest = distanceKm;
+      }
+      return nearest;
+    })
+    .filter((distanceKm) => Number.isFinite(distanceKm))
+    .sort((left, right) => left - right);
+
+  if (nearestNeighborDistances.length === 0) return DEFAULT_MOBILITY_PROFILE;
+  const medianSpacingKm = nearestNeighborDistances[Math.floor(nearestNeighborDistances.length / 2)];
+
+  if (medianSpacingKm <= 5) {
+    return { tier: "compact", localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  }
+  if (medianSpacingKm <= 20) {
+    return { tier: "medium", localityRadiusKm: 60, normalDayTravelBudgetMinutes: 100 };
+  }
+  return { tier: "large_sparse", localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+}
+
+/**
+ * Whether an item is a real, geography-bearing activity that should count
+ * toward a stay's own activity center — excludes transportation/practical
+ * items and, by requiring real coordinates, every generic free-time or
+ * fallback-meal placeholder too (buildFreeExplorationReplacement and
+ * buildFallbackMealPlaceholder both always null out lat/lon, so this filter
+ * excludes them without needing to name them directly).
+ */
+/**
+ * A "meal opportunity" — a recommended meal TIME WINDOW inserted when no
+ * real restaurant candidate exists (server's buildFallbackMealPlaceholder/
+ * buildFreeExplorationReplacement), never an invented business (spec
+ * "MEAL OPPORTUNITIES"/"REMOVE GENERIC FAKE RESTAURANTS"). Reuses the SAME
+ * isRealPlace signal already used everywhere else in this codebase
+ * (no recommendationId AND no real coordinates) rather than a new field —
+ * a food-category item with neither is, by construction, never a real
+ * place. Drives both the day timeline's distinct rendering (spec "must not
+ * look like real activity cards") and the missingMeals/protection logic,
+ * which continue to treat it exactly like any other food item (same
+ * category), so no other repair/validation pass needs to change.
+ */
+export function isMealOpportunityMarker(item: {
+  category: RecommendationCategory;
+  lat: number | null;
+  lon: number | null;
+  recommendationId: string | null;
+}): boolean {
+  return (item.category === "restaurant" || item.category === "cafe") && item.lat == null && item.lon == null && !item.recommendationId;
+}
+
+export function isMeaningfulStayActivityItem(item: {
+  category: RecommendationCategory;
+  lat: number | null;
+  lon: number | null;
+}): boolean {
+  if (item.lat == null || item.lon == null) return false;
+  return item.category !== "transportation" && item.category !== "practical";
+}
+
+export interface StayActivityCenterResult {
+  /** A real point from the stay's own activities (a medoid, never a synthetic average) — null when there is nothing real to anchor on. */
+  center: { lat: number; lon: number } | null;
+  /** Average real distance from the center to the activities actually used for it. */
+  spreadKm: number;
+  /** How many of the input points fell inside the tight cluster around the center. */
+  primaryClusterSize: number;
+  /** Total real activity points considered. */
+  totalConsideredCount: number;
+  /** True when a large share of the stay's own real activities sit far outside its main cluster — the geometry itself suggests the STAY may be poorly structured (spec: "hotel choice must not hide a bad stay structure"), not just a hotel-placement nuance. */
+  structureConcern: boolean;
+}
+
+/** Sum of real distances from one point to every other point in the set — the point minimizing this is the medoid: an ACTUAL activity location, never a synthetic average that no real place occupies and that one distant outlier can drag off-cluster. */
+function findMedoid(points: Array<{ lat: number; lon: number }>): { lat: number; lon: number } | null {
+  if (points.length === 0) return null;
+  if (points.length === 1) return points[0];
+  let best = points[0];
+  let bestTotal = Infinity;
+  for (const candidate of points) {
+    let total = 0;
+    for (const other of points) {
+      if (other === candidate) continue;
+      total += haversineKm(candidate.lat, candidate.lon, other.lat, other.lon);
+    }
+    if (total < bestTotal) {
+      bestTotal = total;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * A stay's real, outlier-resistant activity center (spec "ACCOMMODATION
+ * SHOULD FOLLOW THE ACTIVITY CLUSTER") — the point hotel search/ranking
+ * should be anchored on, never a naive arithmetic average of every
+ * coordinate (one far activity can drag a plain average away from where
+ * the stay's real activities actually are). Two-pass medoid: an initial
+ * medoid over every point, then a refined medoid over only the points that
+ * actually fall within `localityRadiusKm` of it — so a minority of distant
+ * points (a day trip's own destination, a genuine geographic outlier)
+ * cannot influence the final center at all, matching the SAME locality
+ * radius already used everywhere else for this trip (spec "SAME MOBILITY
+ * PROFILE" — never a separate, unrelated hotel-distance rule).
+ */
+export function computeStayActivityCenter(
+  points: Array<{ lat: number; lon: number }>,
+  localityRadiusKm: number = CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM
+): StayActivityCenterResult {
+  if (points.length === 0) {
+    return { center: null, spreadKm: 0, primaryClusterSize: 0, totalConsideredCount: 0, structureConcern: false };
+  }
+
+  const initialCenter = findMedoid(points)!;
+  const primaryCluster = points.filter(
+    (point) => haversineKm(initialCenter.lat, initialCenter.lon, point.lat, point.lon) <= localityRadiusKm
+  );
+  const center = primaryCluster.length > 0 ? (findMedoid(primaryCluster) ?? initialCenter) : initialCenter;
+
+  const spreadPool = primaryCluster.length > 0 ? primaryCluster : points;
+  const spreadKm =
+    spreadPool.reduce((sum, point) => sum + haversineKm(center.lat, center.lon, point.lat, point.lon), 0) /
+    spreadPool.length;
+
+  // A majority of real activities falling outside the main cluster means
+  // there IS no single sensible hotel area — flagged for the caller to
+  // surface, never silently resolved by picking a midpoint (spec
+  // "MULTIPLE ACTIVITY CLUSTERS" / "STAY CREATION SHOULD CONSIDER
+  // HOTELABILITY").
+  const structureConcern = points.length >= 2 && primaryCluster.length / points.length < 0.6;
+
+  return {
+    center,
+    spreadKm: Math.round(spreadKm * 10) / 10,
+    primaryClusterSize: primaryCluster.length,
+    totalConsideredCount: points.length,
+    structureConcern,
+  };
 }
 
 export type DayOptimizeMode = "fewer_transfers" | "less_walking";
@@ -1669,7 +2028,7 @@ function sanitizeCandidates(candidates: TripRecommendation[]) {
     .sort((left, right) => categoryPriority(right.category) - categoryPriority(left.category));
 }
 
-function slotTime(slot: DayPart) {
+export function slotTime(slot: DayPart) {
   switch (slot) {
     case "morning":
       return "09:00";
@@ -2114,75 +2473,73 @@ export function selectFallbackCandidate(args: {
   selectedIds: Set<string>;
   preferredKeywords: string[];
   avoidKeywords: string[];
+  /** Observability only (spec "DETERMINISTIC FALLBACK PROVENANCE") — omitting it changes nothing but the trace. */
+  dayNumber?: number;
 }) {
-  // The day's FIRST pick has no existingItems to compare against yet —
-  // isCandidateGeographicallyCompatibleWithDay correctly declines to judge
-  // in that case (nothing established, don't block on missing data), which
-  // used to leave the very first activity of a day with literally zero
-  // geographic constraint (scoreFallbackCandidate's own km-based penalty
-  // only ever applies once there's a previousItem). The pool's own
-  // real-coordinate members that already share the day's assigned
-  // preferredArea label give an area-appropriate reference to judge
-  // against even before anything is actually placed yet.
-  const preferredAreaAnchors =
-    args.existingItems.length === 0 && args.preferredArea
-      ? args.pool.filter(
-          (candidate) => fallbackAreaLabel(candidate.location).toLowerCase() === args.preferredArea.toLowerCase()
-        )
-      : [];
+  // Real bug found via a real 44-day US QA run: this used to be seeded only
+  // when existingItems was empty ("the day's first pick has nothing to
+  // compare against yet"). But a transfer/practical day's FIRST item is
+  // createFallbackPracticalItem's own logistics block (lat/lon both null,
+  // pushed before this loop ever runs) — so existingItems was already
+  // non-empty by the time selectFallbackCandidate ran at all, this never
+  // seeded, and geographicAnchors had zero real coordinates for the WHOLE
+  // day. isCandidateGeographicallyCompatibleWithDay correctly declines to
+  // judge with no coordinate anchors (by design, for callers where nothing
+  // is established yet) — but here something WAS establishable: the pool's
+  // own real-coordinate members sharing the day's assigned preferredArea
+  // label. That's a real bug found in production (Chicago's day pulling in
+  // Point Reyes, Boston's day pulling in Houston's Galleria) — always
+  // included now, not just for the day's very first pick, so a
+  // coordinate-less practical item can never silently disable the filter
+  // for the rest of the day.
+  const preferredAreaAnchors = args.preferredArea
+    ? args.pool.filter(
+        (candidate) => fallbackAreaLabel(candidate.location).toLowerCase() === args.preferredArea.toLowerCase()
+      )
+    : [];
   const geographicAnchors: Array<{ lat: number | null; lon: number | null }> = [
     ...args.existingItems,
     ...preferredAreaAnchors,
   ];
 
-  const ranked = args.pool
-    .filter((candidate) => !args.usedToday.has(candidate.id))
-    // Real bug found in live production use (a real 10-day Israel trip
-    // with a genuine, abundant Overpass candidate pool): usageCounts was
-    // only ever a soft scoring penalty (-18 per prior use, below) — a
-    // candidate that scored well on category/area/keyword match (routinely
-    // +50-100+) could still outrank every never-used alternative once the
-    // pool's best-fitting candidates for a slot were exhausted relative to
-    // trip length, so the SAME real restaurant/attraction got picked again
-    // on a later day. collectPlanDiagnostics correctly flagged this as a
-    // real cross-day duplicate — but that flagged the FALLBACK template
-    // itself, the last-resort path with no further repair step, so the
-    // whole generation hard-failed with PLAN_NOT_FEASIBLE instead of
-    // degrading to a placeholder. A real place already used anywhere in
-    // the trip is now hard-excluded, the same "never reuse a specific
-    // place, ever" rule the Gemini-repair pipeline's own
-    // pickReplacementRecommendation/pickNearbyMealRecommendation already
-    // enforce via usedPlaceKeys — ranked coming back empty here already
-    // falls through to a real, honest placeholder (createFallbackMealPlaceholder/
-    // createFallbackActivityPlaceholder), never a silent gap.
-    .filter((candidate) => (args.usageCounts.get(candidate.id) ?? 0) === 0)
-    // The SAME real place can appear under a different id (fetched
-    // independently per category — see usedRealPlaces' own comment at its
-    // declaration) — the id-only filter just above misses that. Uses the
-    // exact fuzzy name+coordinate identity collectPlanDiagnostics itself
-    // uses to flag a duplicate, so this can never disagree with it.
-    .filter((candidate) => {
-      const candidateRecord: FuzzyPlaceRecord = {
-        nameSlug: normalizePlaceNameSlug(candidate.name),
-        lat: candidate.lat,
-        lon: candidate.lon,
-      };
-      return !args.usedRealPlaces.some((used) => isFuzzyDuplicatePlace(used, candidateRecord));
-    })
-    // Generic worldwide architecture (Phase 5/14): same hard geographic
-    // gate as pickReplacementRecommendation — the fallback template's own
-    // area preference (preferredArea) was only ever a soft scoring bonus
-    // in scoreFallbackCandidate below, so a candidate that scored well on
-    // category/time-of-day/budget could still win from a genuinely
-    // different city. This is the deterministic template used whenever
-    // real Gemini generation fails validation, so it runs disproportionately
-    // often — real bug found in live QA: a "Tel Aviv" day containing
-    // Haifa's Bahá'í Gardens, among other cross-city leaks.
-    .filter((candidate) =>
-      isCandidateGeographicallyCompatibleWithDay(candidate, geographicAnchors, {
-        isDayTripDay: args.template.kind === "day_trip",
-      })
-    )
+  // Spec "LEGAL PER-DAY CANDIDATE POOL" / "DETERMINISTIC FALLBACK DUPLICATE
+  // EXHAUSTION" — real bug found in live production use (a real 10-day
+  // Israel trip with a genuine, abundant Overpass candidate pool):
+  // usageCounts was only ever a soft scoring penalty (-18 per prior use,
+  // below) — a candidate that scored well on category/area/keyword match
+  // (routinely +50-100+) could still outrank every never-used alternative
+  // once the pool's best-fitting candidates for a slot were exhausted
+  // relative to trip length, so the SAME real restaurant/attraction got
+  // picked again on a later day. collectPlanDiagnostics correctly flagged
+  // this as a real cross-day duplicate — but that flagged the FALLBACK
+  // template itself, the last-resort path with no further repair step, so
+  // the whole generation hard-failed with PLAN_NOT_FEASIBLE instead of
+  // degrading to a placeholder. buildLegalDayCandidatePool hard-excludes
+  // an already-used real place (by id, by usage count, and by the same
+  // fuzzy name+coordinate identity collectPlanDiagnostics itself flags
+  // duplicates with — a real place can appear under a different id when
+  // fetched independently per category) — ranked coming back empty here
+  // already falls through to a real, honest placeholder
+  // (createFallbackMealPlaceholder/createFallbackActivityPlaceholder),
+  // never a silent gap, never a repeat merely to fill space. The same hard
+  // geographic gate (isCandidateGeographicallyCompatibleWithDay) closes
+  // the OTHER real bug this pool exists for: the fallback template's area
+  // preference (preferredArea) was only ever a soft scoring bonus in
+  // scoreFallbackCandidate below, so a candidate that scored well on
+  // category/time-of-day/budget could still win from a genuinely
+  // different city — real bug found in live QA: a "Tel Aviv" day
+  // containing Haifa's Bahá'í Gardens, among other cross-city leaks.
+  const legalPool = buildLegalDayCandidatePool({
+    pool: args.pool,
+    ownerAnchors: geographicAnchors,
+    isDayTripDay: args.template.kind === "day_trip",
+    usedToday: args.usedToday,
+    usageCounts: args.usageCounts,
+    usedRealPlaces: args.usedRealPlaces,
+    dayNumber: args.dayNumber,
+  });
+
+  const ranked = legalPool
     .map((candidate) => ({
       candidate,
       score: scoreFallbackCandidate(
@@ -2199,7 +2556,24 @@ export function selectFallbackCandidate(args: {
     }))
     .sort((left, right) => right.score - left.score);
 
-  return ranked[0]?.candidate ?? null;
+  const selected = ranked[0]?.candidate ?? null;
+  if (selected) {
+    tracePlaceInsertion({
+      item: { recommendationId: selected.id, name: selected.name, lat: selected.lat, lon: selected.lon, category: selected.category, itemRole: "real_place" },
+      normalizedName: normalizePlaceNameSlug(selected.name),
+      dayNumber: args.dayNumber ?? 0,
+      source: "deterministic_template",
+      action: "INSERT",
+      ownerStay: args.preferredArea,
+      dayType: args.template.kind,
+      alreadyUsedAtInsertion: args.usedToday.has(selected.id) || (args.usageCounts.get(selected.id) ?? 0) > 0,
+      candidatePoolSize: args.pool.length,
+      legalPoolSize: legalPool.length,
+      passedLegalPool: true,
+      reason: `scoreFallbackCandidate top-ranked of ${ranked.length} legal candidates`,
+    });
+  }
+  return selected;
 }
 
 // Same reasoning as buildFreeExplorationReplacement's phrase rotation
@@ -2207,15 +2581,19 @@ export function selectFallbackCandidate(args: {
 // several days with no id/coordinates to distinguish them would otherwise
 // read as a duplicate place to buildItemKey's fallback tier, failing the
 // whole plan over harmless repeated filler content.
+// Section "FOOD CLEANUP" — same 🍽/"recommended time" meal-opportunity
+// phrasing as buildFallbackMealPlaceholder (country-itinerary-generation.ts)
+// and buildFreeExplorationReplacement's food branch. One behavior across
+// every fallback path, never an invented business name.
 const FALLBACK_LUNCH_PHRASES = [
-  (area: string) => `אזור אוכל מקומי ב${area}`,
-  (area: string) => `שוק או פינת אוכל ב${area}`,
-  (area: string) => `עצירת צהריים גמישה באזור ${area}`,
+  (area: string) => `🍽 זמן מומלץ לארוחת צהריים באזור ${area}`,
+  (area: string) => `🍽 חלון זמן גמיש לארוחת צהריים ליד ${area}`,
+  (area: string) => `🍽 הפסקת צהריים מומלצת באזור ${area}`,
 ];
 const FALLBACK_DINNER_PHRASES = [
-  (area: string) => `ארוחת ערב באזור ${area}`,
-  (area: string) => `מסעדה מקומית באזור ${area}`,
-  (area: string) => `ארוחת ערב גמישה ליד ${area}`,
+  (area: string) => `🍽 זמן מומלץ לארוחת ערב באזור ${area}`,
+  (area: string) => `🍽 חלון זמן גמיש לארוחת ערב ליד ${area}`,
+  (area: string) => `🍽 הפסקת ערב מומלצת באזור ${area}`,
 ];
 
 // Same phrase-rotation reasoning as FALLBACK_LUNCH_PHRASES/FALLBACK_DINNER_PHRASES
@@ -2255,6 +2633,7 @@ function createFallbackActivityPlaceholder(
   return {
     name,
     category: "attraction",
+    itemRole: "free_time",
     location: dayArea || input.countryName,
     shortDescription:
       "אם אין המלצה ספציפית זמינה, שוטטו באזור הפעילויות של אותו יום — רחובות מרכזיים, נקודות תצפית או שכונות סמוכות שוות גילוי.",
@@ -2298,15 +2677,17 @@ function createFallbackMealPlaceholder(
   const name = dayArea
     ? phrases[dayNumber % phrases.length](dayArea)
     : slot === "lunch"
-      ? "שוק או אזור אוכל מקומי"
-      : "אזור אוכל מומלץ לערב";
+      ? "🍽 זמן מומלץ לארוחת צהריים"
+      : "🍽 זמן מומלץ לארוחת ערב";
 
   return {
     name,
     category: slot === "lunch" ? "cafe" : "restaurant",
+    itemRole: "meal_opportunity",
     location: dayArea || input.countryName,
-    shortDescription:
-      "אם אין מקום ספציפי זמין, חפשו מסעדות, דוכנים או קפה טובים ממש באזור הפעילויות של אותו יום.",
+    shortDescription: dayArea
+      ? `זהו חלון זמן מומלץ לארוחה באזור ${dayArea} — לא מסעדה קונקרטית. אפשר לבחור מסעדה אמיתית וקרובה בלשונית "אוכל".`
+      : `זהו חלון זמן מומלץ לארוחה — לא מסעדה קונקרטית. אפשר לבחור מסעדה אמיתית וקרובה בלשונית "אוכל".`,
     slot,
     plannedStartTime: slotTime(slot),
     estimatedDurationMinutes: slot === "lunch" ? 60 : 75,
@@ -2346,6 +2727,7 @@ function createFallbackPracticalItem(
     return {
       name: "צ'ק-אאוט, שמירת מזוודות ומעבר לבסיס הבא",
       category: "practical",
+      itemRole: "transit_practical",
       location: dayArea || input.countryName,
       shortDescription: "בלוק פרקטי ליציאה מהלינה, נסיעה מסודרת וצ'ק-אין לפני שמעמיסים עוד פעילויות.",
       slot: "morning",
@@ -2382,6 +2764,7 @@ function createFallbackPracticalItem(
     return {
       name: "חלון סידורים, כביסה ותכנון המשך",
       category: "practical",
+      itemRole: "transit_practical",
       location: dayArea || input.countryName,
       shortDescription: "זמן ייעודי לקניית כרטיסים, כביסה, סידורים קטנים ותכנון רגוע של הימים הבאים.",
       slot: "morning",
@@ -2496,6 +2879,7 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         selectedIds,
         preferredKeywords,
         avoidKeywords,
+        dayNumber,
       });
 
       if (!next) {

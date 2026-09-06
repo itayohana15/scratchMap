@@ -31,8 +31,14 @@ export interface ActivityCluster {
 export interface RankedHotel extends HotelCandidate {
   /** Average one-way travel time to the trip's own planned activity clusters, in minutes. Null when no clusters were given. */
   averageActivityTravelMinutes: number | null;
+  /** Sum of one-way travel time to every given activity cluster, in minutes — the real "how much total daily commuting will this hotel cost across the whole stay" figure, not just one average point. Null when no clusters were given. */
+  totalActivityTravelMinutes: number | null;
+  /** The single longest one-way hop to any given activity cluster, in minutes — surfaces a hotel that looks fine on average but creates one genuinely bad daily commute. Null when no clusters were given. */
+  maxActivityTravelMinutes: number | null;
   /** One-way travel time to the relevant airport, in minutes. Null when no airport coordinates were given. */
   airportTravelMinutes: number | null;
+  /** Average one-way travel time to the given adjacent-stay transfer anchors (previous/next stay), in minutes — compatibility with the stay-to-stay transition, not just this stay's own activities. Null when none were given. */
+  transferTravelMinutes: number | null;
   /** 0-100, weighted mostly toward activity proximity (spec item 28 — "geography should be heavily weighted"). Purely relative to the other candidates, not an absolute quality claim — price/rating aren't available to factor in. */
   locationScore: number;
 }
@@ -70,11 +76,20 @@ export async function findHotelCandidates(
  * ratingScore are omitted rather than guessed, since no real data exists
  * for them). Sorted best-first; the caller slices to the top 5-10 (spec
  * item 26).
+ *
+ * `activityClusters` should be every real activity point for the WHOLE
+ * stay (every day it covers, not just day 1) so average/total/max genuinely
+ * reflect the entire stay. `transferAnchors` (optional) are adjacent-stay
+ * points — the previous stay's anchor, the next stay's anchor, or an
+ * airport for a terminal stay — factored in as a smaller "does this hotel
+ * also fit the stay-to-stay transition" signal, never as strong as actual
+ * activity proximity.
  */
 export function rankHotels(
   candidates: HotelCandidate[],
   activityClusters: ActivityCluster[],
-  airportCoords: { lat: number; lon: number } | null
+  airportCoords: { lat: number; lon: number } | null,
+  transferAnchors: Array<{ lat: number; lon: number }> = []
 ): RankedHotel[] {
   return candidates
     .map((hotel) => {
@@ -85,9 +100,22 @@ export function rankHotels(
         activityTravelTimes.length > 0
           ? Math.round(activityTravelTimes.reduce((sum, minutes) => sum + minutes, 0) / activityTravelTimes.length)
           : null;
+      const totalActivityTravelMinutes =
+        activityTravelTimes.length > 0
+          ? Math.round(activityTravelTimes.reduce((sum, minutes) => sum + minutes, 0))
+          : null;
+      const maxActivityTravelMinutes =
+        activityTravelTimes.length > 0 ? Math.round(Math.max(...activityTravelTimes)) : null;
       const airportTravelMinutes = airportCoords
         ? estimateTravelMinutes(hotel.lat, hotel.lon, airportCoords.lat, airportCoords.lon, "balanced", "")
         : null;
+      const transferTravelTimes = transferAnchors.map((anchor) =>
+        estimateTravelMinutes(hotel.lat, hotel.lon, anchor.lat, anchor.lon, "balanced", "")
+      );
+      const transferTravelMinutes =
+        transferTravelTimes.length > 0
+          ? Math.round(transferTravelTimes.reduce((sum, minutes) => sum + minutes, 0) / transferTravelTimes.length)
+          : null;
 
       // Lower travel time -> higher score, floored at 0. A fixed neutral
       // 50 when a signal is entirely missing (no clusters/airport given)
@@ -95,12 +123,23 @@ export function rankHotels(
       const activityProximityScore =
         averageActivityTravelMinutes != null ? Math.max(0, 100 - averageActivityTravelMinutes * 2) : 50;
       const airportScore = airportTravelMinutes != null ? Math.max(0, 100 - airportTravelMinutes) : 50;
-      const locationScore = Math.round(activityProximityScore * 0.7 + airportScore * 0.3);
+      const transferScore = transferTravelMinutes != null ? Math.max(0, 100 - transferTravelMinutes) : null;
+      // Transfer compatibility only earns its own weight slice when a real
+      // transfer anchor was actually given — otherwise the original
+      // activity/airport split is preserved exactly, so every existing
+      // caller (none of which pass transferAnchors) sees no score change.
+      const locationScore =
+        transferScore != null
+          ? Math.round(activityProximityScore * 0.6 + airportScore * 0.25 + transferScore * 0.15)
+          : Math.round(activityProximityScore * 0.7 + airportScore * 0.3);
 
       return {
         ...hotel,
         averageActivityTravelMinutes,
+        totalActivityTravelMinutes,
+        maxActivityTravelMinutes,
         airportTravelMinutes,
+        transferTravelMinutes,
         locationScore,
       };
     })
