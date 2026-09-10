@@ -13,6 +13,7 @@ import {
   haversineKm,
   isFuzzyDuplicatePlace,
   normalizePlaceNameSlug,
+  deriveDailyCapacityMinutes,
   type FuzzyPlaceRecord,
 } from "../trip-workspace";
 import {
@@ -662,14 +663,14 @@ function isFoodCategory(category: RecommendationCategory) {
   return category === "restaurant" || category === "cafe";
 }
 
-// The single source of truth for "how much real activity time fits in a
-// day," pace-driven — used both by buildTripPreferenceProfile (below) and
-// by route-optimization.ts's day-trip feasibility math (usableMinutes),
-// which needs the same number without building an entire
-// TripPreferenceProfile just to read one field off it.
-export function deriveDailyCapacityMinutes(tripPace: TripPreferences["tripPace"]): number {
-  return tripPace === "relaxed" ? 480 : tripPace === "balanced" ? 600 : 720;
-}
+// deriveDailyCapacityMinutes now lives in trip-workspace.ts (spec
+// "DAY-LEVEL POI GEOGRAPHY / LEGALITY" — the deterministic fallback
+// template builder there needs the same real capacity number to wire real
+// day-trip feasibility into buildLegalDayCandidatePool/
+// selectFallbackCandidate, and trip-workspace.ts cannot import from this
+// file). Re-exported here so every existing caller of THIS module is
+// unaffected.
+export { deriveDailyCapacityMinutes } from "../trip-workspace";
 
 // Real bug found via a real 44-day US QA run: duplicateRestaurants,
 // foodDominant, and mealSpacingViolations all filtered by isFoodCategory

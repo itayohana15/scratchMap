@@ -21,7 +21,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { formatTripDateRange } from "@/lib/format";
 import { useWorldCountriesGeoJson } from "@/lib/map/geo";
 import { useCitiesByCountry } from "@/lib/queries/cities";
-import { useCountries, useCountryByIso } from "@/lib/queries/countries";
+import { useCountryByIso, useMapCountryStatuses } from "@/lib/queries/countries";
 import { useTripHubTrips } from "@/lib/queries/trip-hub";
 import { getCompletedTrips, getUpcomingTrips, groupTripsByCountry } from "@/lib/travel-passport";
 import type { Status, Tables } from "@/lib/supabase/types";
@@ -73,7 +73,7 @@ export function WorldMap() {
   const deferredCountryQuery = useDeferredValue(countryQuery);
 
   const { data: geojson, isLoading: isGeoJsonLoading } = useWorldCountriesGeoJson();
-  const { data: countries } = useCountries();
+  const { data: mapCountryStatuses } = useMapCountryStatuses();
   const { data: selectedCountry } = useCountryByIso(selectedIso ?? undefined);
   const { data: cities } = useCitiesByCountry(selectedCountry?.id);
   const { data: trips = [] } = useTripHubTrips();
@@ -100,14 +100,30 @@ export function WorldMap() {
   const { containerRef, mapRef, ready, syncCountryStatuses, flyToCountryFeature, resetToWorld } =
     useMaplibreMap({ isDark, onCountryClick: handleCountryClick, geojson });
 
+  // Spec "PART B — MAP STATUS MUST BE SERVER AUTHORITATIVE" — the effective
+  // country travel status is computed on the SERVER (see
+  // /api/map/countries -> loadEffectiveCountryStatuses) from persisted
+  // trips + the manual `countries.status` fallback for trip-less
+  // countries. The client only renders it; it never re-derives the rule
+  // from the trip list. `useTripHubTrips()` remains only for the
+  // "upcoming"/"visited" sidebar sections below, which are trip-LIST
+  // rendering, not the status business decision.
+  const effectiveStatusesByIso = useMemo(() => {
+    const merged: Record<string, Status> = {};
+    for (const country of mapCountryStatuses ?? []) {
+      merged[country.iso_a2.toUpperCase()] = country.effectiveStatus;
+    }
+    return merged;
+  }, [mapCountryStatuses]);
+
   useEffect(() => {
-    if (!ready || !countries) return;
+    if (!ready || !mapCountryStatuses) return;
     const statuses: Record<string, Status> = {};
-    for (const country of countries) {
-      statuses[country.iso_a2] = country.status;
+    for (const country of mapCountryStatuses) {
+      statuses[country.iso_a2] = country.effectiveStatus;
     }
     syncCountryStatuses(statuses);
-  }, [ready, countries, syncCountryStatuses]);
+  }, [ready, mapCountryStatuses, syncCountryStatuses]);
 
   const handleBackToWorld = useCallback(() => {
     resetToWorld();
@@ -134,19 +150,15 @@ export function WorldMap() {
   const searchableCountries = useMemo(() => {
     if (!geojson) return [];
 
-    const statusesByIso = new Map(
-      (countries ?? []).map((country) => [country.iso_a2.toUpperCase(), country.status])
-    );
-
     return geojson.features
       .map((feature) => ({
         iso: feature.properties.iso_a2,
         iso3: feature.properties.iso_a3,
         name: feature.properties.name,
-        status: statusesByIso.get(feature.properties.iso_a2.toUpperCase()),
+        status: effectiveStatusesByIso[feature.properties.iso_a2.toUpperCase()],
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
-  }, [countries, geojson]);
+  }, [effectiveStatusesByIso, geojson]);
 
   const filteredCountries = useMemo(() => {
     const normalizedQuery = normalizeCountryQuery(deferredCountryQuery);

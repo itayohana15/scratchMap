@@ -6,6 +6,7 @@ import {
   tracePlaceInsertion,
   tracePoolStage,
 } from "@/lib/planner-qa-trace";
+import { estimateMinutesForMode, selectTransportMode } from "@/lib/transport-mode";
 
 export type TripPhase = "planning" | "booked" | "currently_traveling" | "completed";
 export type ItineraryGenerationMode =
@@ -773,6 +774,16 @@ export interface AiGeneratedItem {
 export interface AiGeneratedDay {
   dayNumber: number;
   date: string;
+  /**
+   * Generation-internal: the id of the TripFrame phase that structurally
+   * OWNS this day (spec "ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER").
+   * Stamped by normalizeDayOwnershipToFrame once the final frame is known;
+   * every presentation/content field below — title, cityRegion,
+   * accommodation, synthetic item labels — is derived from or validated
+   * against this owner, never the other way around. Absent on days that
+   * predate ownership binding or map to no phase.
+   */
+  phaseId?: string;
   title: string;
   cityRegion: string;
   /** Content-derived, always computed regardless of the AI's own title (spec items 49/50) — see inferDayThemeLabel. */
@@ -1564,6 +1575,278 @@ export function estimateTravelMinutes(
  */
 export const CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM = 80;
 
+// Moved here from itinerary-generation-constraints.ts (spec "DAY-LEVEL POI
+// GEOGRAPHY / LEGALITY") — the single source of truth for "how much real
+// activity time fits in a day," pace-driven. The deterministic fallback
+// template builder (buildFallbackAiItinerary, below) needs this same real
+// number to wire real day-trip feasibility into its own candidate pool,
+// and this file cannot import from itinerary-generation-constraints.ts
+// (which itself imports FROM this file).
+export function deriveDailyCapacityMinutes(tripPace: TripPreferences["tripPace"]): number {
+  return tripPace === "relaxed" ? 480 : tripPace === "balanced" ? 600 : 720;
+}
+
+// =====================================================================
+// DAY-LEVEL POI GEOGRAPHY / LEGALITY — root-cause fix for a real generated
+// PDF: "Seattle day containing Grand Canyon National Park", "Seattle day
+// containing Yosemite", "San Francisco day containing Mount Rushmore",
+// "Chicago day containing Griffith Observatory (Los Angeles)". Traced to
+// ONE exact line: this file's own isCandidateGeographicallyCompatibleWithDay
+// used to read `if (args.isDayTripDay) return true;` — an UNCONDITIONAL
+// pass, zero feasibility math, for ANY candidate whenever the day was
+// classified (via isDayTripDay's own textual/structural heuristic) as a
+// day trip. Every one of pickReplacementRecommendation's ~15 repair call
+// sites, plus diversifyActivities, ensureWeatherBackup, the meal-repair
+// path, and selectFallbackCandidate (the deterministic fallback template)
+// all route through this ONE function — so a day merely LOOKING like a
+// day trip (Gemini's own title wording, or a structural out-and-back
+// shape) silently disabled the entire geographic gate for every one of
+// them. enforceNormalDayLocality's own real evaluateDayTripFeasibility
+// math (country-itinerary-generation.ts) correctly DETECTED an infeasible
+// excursion — but its own repair step then called
+// pickReplacementRecommendation to find a replacement, which used this
+// SAME broken filter, so the "fix" could re-select an equally (or the
+// very same) infeasible candidate, since geography was never actually
+// constrained during replacement search.
+//
+// evaluateScheduledPlaceLegality below is the ONE authoritative legality
+// function every insertion boundary must now go through (spec §B/§G) —
+// day type is a STRUCTURAL input, never inferred from a category label or
+// prose (spec §I), and missing geometry always fails closed (spec §F),
+// never defaults to legal.
+// =====================================================================
+
+// Day-trip round-trip feasibility (base -> excursion -> base). Moved here
+// (was route-optimization.ts) so both the day-level legality function
+// below AND the cluster-level day-trip-hint feasibility check
+// (computeDayTripClusterFeasibility, still in route-optimization.ts,
+// re-exported from here) share the exact same pure decision — never two
+// competing day-trip feasibility rules.
+export interface DayTripFeasibilityInput {
+  outboundTravelMinutes: number;
+  returnTravelMinutes: number;
+  internalTravelMinutes: number;
+  visitMinutes: number;
+  usableMinutes: number;
+}
+
+export interface DayTripFeasibility extends DayTripFeasibilityInput {
+  totalMinutes: number;
+  valueRatio: number;
+  feasible: boolean;
+  reason: "ok" | "exceeds_time_budget" | "low_value_ratio";
+}
+
+/** At least this share of a day trip's total time budget must be real visit time, not travel, or the excursion isn't worth the trip. */
+export const DAY_TRIP_MIN_VALUE_RATIO = 0.4;
+
+export function evaluateDayTripFeasibility(input: DayTripFeasibilityInput): DayTripFeasibility {
+  const totalMinutes =
+    input.outboundTravelMinutes + input.returnTravelMinutes + input.internalTravelMinutes + input.visitMinutes;
+  const valueRatio = totalMinutes > 0 ? input.visitMinutes / totalMinutes : 0;
+  const withinBudget = totalMinutes <= input.usableMinutes;
+  const meetsValueRatio = valueRatio >= DAY_TRIP_MIN_VALUE_RATIO;
+
+  return {
+    ...input,
+    totalMinutes,
+    valueRatio,
+    feasible: withinBudget && meetsValueRatio,
+    reason: !withinBudget ? "exceeds_time_budget" : !meetsValueRatio ? "low_value_ratio" : "ok",
+  };
+}
+
+// Transfer-day detour/corridor feasibility (origin -> candidate ->
+// destination vs. the direct origin -> destination leg). Moved here for
+// the same reason as evaluateDayTripFeasibility above — re-exported from
+// route-optimization.ts for existing callers.
+export interface TransferDetourInput {
+  /** t(origin, candidate) */
+  outboundToCandidateMinutes: number;
+  /** t(candidate, destination) */
+  candidateToDestinationMinutes: number;
+  /** t(origin, destination) — the direct transfer leg itself */
+  directTransferMinutes: number;
+  visitMinutes: number;
+  /** The transfer day's total leftover time budget for detour activities (dailyCapacityMinutes - directTransferMinutes), before this candidate. */
+  availableSlackMinutes: number;
+  /** Detour+visit minutes already committed to earlier detour activities the same day. */
+  usedSlackMinutes: number;
+}
+
+export interface TransferDetourFeasibility {
+  detourMinutes: number;
+  totalMinutes: number;
+  remainingSlackMinutes: number;
+  feasible: boolean;
+  reason: "ok" | "exceeds_available_slack";
+}
+
+/** detour(P) = t(origin,P) + t(P,destination) - t(origin,destination), clamped at 0 (a "negative detour" has no physical meaning — genuinely on the way). */
+export function evaluateTransferDetourFeasibility(input: TransferDetourInput): TransferDetourFeasibility {
+  const detourMinutes = Math.max(
+    0,
+    input.outboundToCandidateMinutes + input.candidateToDestinationMinutes - input.directTransferMinutes
+  );
+  const totalMinutes = detourMinutes + input.visitMinutes;
+  const remainingSlackBefore = input.availableSlackMinutes - input.usedSlackMinutes;
+  const feasible = totalMinutes <= remainingSlackBefore;
+
+  return {
+    detourMinutes,
+    totalMinutes,
+    remainingSlackMinutes: remainingSlackBefore - totalMinutes,
+    feasible,
+    reason: feasible ? "ok" : "exceeds_available_slack",
+  };
+}
+
+/** Structural day type — authoritative, never inferred from category/prose (spec §I). "arrival"/"departure" are treated exactly like "normal" for locality purposes (their own window constraints are handled elsewhere). */
+export type ScheduledDayType = "normal" | "day_trip" | "transfer" | "arrival" | "departure";
+
+export interface ScheduledPlaceLegalityInput {
+  placeLat: number | null;
+  placeLon: number | null;
+  dayType: ScheduledDayType;
+  /** This day's own stay/base anchor — required for every rule; null (unresolved geometry) always fails closed, never defaults to legal (spec §F). */
+  stayAnchor: { lat: number; lon: number } | null;
+  mobilityProfile: DestinationMobilityProfile;
+  dailyCapacityMinutes: number;
+  visitMinutes?: number | null;
+  /** Only meaningful for dayType "transfer" — the real modeled origin/destination + direct transfer time. Any missing means real transfer data isn't available, and this fails closed rather than guessing. */
+  transferOrigin?: { lat: number; lon: number } | null;
+  transferDestination?: { lat: number; lon: number } | null;
+  directTransferMinutes?: number | null;
+  usedTransferSlackMinutes?: number;
+}
+
+export type ScheduledPlaceLegalityRule =
+  | "normal_day_local"
+  | "day_trip_round_trip"
+  | "transfer_corridor"
+  | "invalid_missing_geometry"
+  | "invalid_normal_day_distance"
+  | "invalid_day_trip_feasibility"
+  | "invalid_transfer_detour";
+
+export interface ScheduledPlaceLegalityResult {
+  legal: boolean;
+  rule: ScheduledPlaceLegalityRule;
+  travelMinutes: number | null;
+  detourMinutes?: number;
+  evidence: Record<string, unknown>;
+}
+
+/**
+ * Spec §B "ONE FINAL REAL-PLACE LEGALITY FUNCTION" — every insertion
+ * boundary that places a real POI into a generated day must go through
+ * this. Coordinates and modeled travel feasibility are authoritative
+ * (spec PRIMARY PRODUCT INVARIANT) — never a category label, textual
+ * location, Gemini prose, or ownerStay string. Missing geometry always
+ * fails closed (spec §F) — this NEVER returns legal:true when it cannot
+ * actually compute the comparison. Synthetic items (FreeTimeBlock/
+ * MealOpportunity/practical blocks) must never be passed to this at all
+ * (spec §F) — that's the caller's own responsibility, gated by
+ * itemRole/isSyntheticScheduleItem, same as every other real-place check
+ * in this codebase.
+ */
+export function evaluateScheduledPlaceLegality(input: ScheduledPlaceLegalityInput): ScheduledPlaceLegalityResult {
+  if (input.placeLat == null || input.placeLon == null || !input.stayAnchor) {
+    return {
+      legal: false,
+      rule: "invalid_missing_geometry",
+      travelMinutes: null,
+      evidence: {
+        hasPlaceCoordinates: input.placeLat != null && input.placeLon != null,
+        hasStayAnchor: input.stayAnchor != null,
+      },
+    };
+  }
+
+  const distanceFromStayKm = haversineKm(input.stayAnchor.lat, input.stayAnchor.lon, input.placeLat, input.placeLon);
+  const visitMinutes = input.visitMinutes ?? 90;
+
+  if (input.dayType === "transfer") {
+    if (!input.transferOrigin || !input.transferDestination || input.directTransferMinutes == null) {
+      return {
+        legal: false,
+        rule: "invalid_missing_geometry",
+        travelMinutes: null,
+        evidence: { reason: "transfer day requires a real modeled origin/destination/directTransferMinutes" },
+      };
+    }
+    const distanceFromOriginKm = haversineKm(input.transferOrigin.lat, input.transferOrigin.lon, input.placeLat, input.placeLon);
+    const distanceFromDestinationKm = haversineKm(
+      input.transferDestination.lat,
+      input.transferDestination.lon,
+      input.placeLat,
+      input.placeLon
+    );
+    const nearOrigin = distanceFromOriginKm <= input.mobilityProfile.localityRadiusKm;
+    const nearDestination = distanceFromDestinationKm <= input.mobilityProfile.localityRadiusKm;
+    if (nearOrigin || nearDestination) {
+      return {
+        legal: true,
+        rule: "transfer_corridor",
+        travelMinutes: 0,
+        evidence: { distanceFromOriginKm, distanceFromDestinationKm, note: "already within locality radius of origin or destination" },
+      };
+    }
+
+    const outboundMinutes = estimateMinutesForMode(distanceFromOriginKm, selectTransportMode(distanceFromOriginKm, { isIntercity: true }));
+    const toDestinationMinutes = estimateMinutesForMode(
+      distanceFromDestinationKm,
+      selectTransportMode(distanceFromDestinationKm, { isIntercity: true })
+    );
+    const availableSlackMinutes = Math.max(0, input.dailyCapacityMinutes - input.directTransferMinutes);
+    const detour = evaluateTransferDetourFeasibility({
+      outboundToCandidateMinutes: outboundMinutes,
+      candidateToDestinationMinutes: toDestinationMinutes,
+      directTransferMinutes: input.directTransferMinutes,
+      visitMinutes,
+      availableSlackMinutes,
+      usedSlackMinutes: input.usedTransferSlackMinutes ?? 0,
+    });
+
+    return {
+      legal: detour.feasible,
+      rule: detour.feasible ? "transfer_corridor" : "invalid_transfer_detour",
+      travelMinutes: outboundMinutes + toDestinationMinutes,
+      detourMinutes: detour.detourMinutes,
+      evidence: { distanceFromOriginKm, distanceFromDestinationKm, detour },
+    };
+  }
+
+  if (input.dayType === "day_trip") {
+    const outboundMinutes = estimateMinutesForMode(distanceFromStayKm, selectTransportMode(distanceFromStayKm, { isIntercity: true }));
+    const feasibility = evaluateDayTripFeasibility({
+      outboundTravelMinutes: outboundMinutes,
+      returnTravelMinutes: outboundMinutes,
+      internalTravelMinutes: 0,
+      visitMinutes,
+      usableMinutes: input.dailyCapacityMinutes,
+    });
+    return {
+      legal: feasibility.feasible,
+      rule: feasibility.feasible ? "day_trip_round_trip" : "invalid_day_trip_feasibility",
+      travelMinutes: outboundMinutes * 2,
+      evidence: { distanceFromStayKm, feasibility },
+    };
+  }
+
+  // normal / arrival / departure — the same local-radius rule.
+  const legal = distanceFromStayKm <= input.mobilityProfile.localityRadiusKm;
+  return {
+    legal,
+    rule: legal ? "normal_day_local" : "invalid_normal_day_distance",
+    travelMinutes: estimateMinutesForMode(distanceFromStayKm, selectTransportMode(distanceFromStayKm, { isIntercity: distanceFromStayKm > TRANSIT_MAX_KM_FOR_LEGALITY })),
+    evidence: { distanceFromStayKm, localityRadiusKm: input.mobilityProfile.localityRadiusKm },
+  };
+}
+
+/** Matches transport-mode.ts's own local/intercity boundary reasoning — a plain informational travelMinutes estimate for the evidence trail, never used to decide legality itself (distance vs. localityRadiusKm already decided that above). */
+const TRANSIT_MAX_KM_FOR_LEGALITY = 5;
+
 /**
  * Generic worldwide architecture (Phase 5/14): a HARD geographic gate, not
  * just a scoring signal. Real bug found in real-world QA: a day labeled
@@ -1582,16 +1865,45 @@ export const CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM = 80;
  * compare against) or a candidate with no coordinates of its own can't be
  * judged either way — this never blocks generation on missing geographic
  * data, it only rejects a candidate that IS demonstrably far from
- * everything already anchoring the day. A deliberate day-trip day is the
- * one explicit exemption (isDayTripDay), since being far from the day's
- * own base is the entire point of a day trip.
+ * everything already anchoring the day.
+ *
+ * Root-cause fix (spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" — a real
+ * generated PDF: Seattle days containing Grand Canyon/Yosemite, a San
+ * Francisco day containing Mount Rushmore, a Chicago day containing the
+ * Griffith Observatory) — this used to read `if (args.isDayTripDay) return
+ * true;`, an UNCONDITIONAL pass with ZERO feasibility math for ANY
+ * candidate whenever the day merely LOOKED like a day trip. A deliberate
+ * day-trip day is no longer a free pass — `dayTripContext`, when supplied,
+ * routes the decision through evaluateScheduledPlaceLegality's real
+ * round-trip math instead (spec §D); omitting it (or any day type other
+ * than day_trip) falls through to the normal distance-to-existing-anchors
+ * rule below, exactly as before this fix.
  */
 export function isCandidateGeographicallyCompatibleWithDay(
-  candidate: { lat: number | null; lon: number | null },
+  candidate: { lat: number | null; lon: number | null; estimatedDurationMinutes?: number | null },
   existingAnchors: Array<{ lat: number | null; lon: number | null }>,
-  args: { maxDistanceKm?: number; isDayTripDay?: boolean }
+  args: {
+    maxDistanceKm?: number;
+    /** Real day-trip feasibility context — the ONLY way a candidate may be judged against something other than the day's existing anchors. Never a bare boolean (spec §I "category must not grant geographic privilege"). */
+    dayTripContext?: {
+      baseAnchor: { lat: number; lon: number } | null;
+      mobilityProfile: DestinationMobilityProfile;
+      dailyCapacityMinutes: number;
+    };
+  }
 ): boolean {
-  if (args.isDayTripDay) return true;
+  if (args.dayTripContext) {
+    if (candidate.lat == null || candidate.lon == null) return true; // no candidate geometry to judge — same pre-existing behavior as below
+    return evaluateScheduledPlaceLegality({
+      placeLat: candidate.lat,
+      placeLon: candidate.lon,
+      dayType: "day_trip",
+      stayAnchor: args.dayTripContext.baseAnchor,
+      mobilityProfile: args.dayTripContext.mobilityProfile,
+      dailyCapacityMinutes: args.dayTripContext.dailyCapacityMinutes,
+      visitMinutes: candidate.estimatedDurationMinutes,
+    }).legal;
+  }
   if (candidate.lat == null || candidate.lon == null) return true;
 
   const anchorsWithCoordinates = existingAnchors.filter((anchor) => anchor.lat != null && anchor.lon != null);
@@ -1621,6 +1933,8 @@ export function buildLegalDayCandidatePool(args: {
   ownerAnchors: Array<{ lat: number | null; lon: number | null }>;
   maxDistanceKm?: number;
   isDayTripDay?: boolean;
+  /** Real day-trip feasibility context (spec §D) — required to actually grant the day-trip exemption; without it (e.g. no real base anchor resolved yet) a day_trip-flagged day still falls through to the normal distance-to-owner-anchors rule below, never an unconditional pass. */
+  dayTripFeasibilityContext?: { baseAnchor: { lat: number; lon: number } | null; mobilityProfile: DestinationMobilityProfile; dailyCapacityMinutes: number };
   usedToday: Set<string>;
   usageCounts: Map<string, number>;
   usedRealPlaces: FuzzyPlaceRecord[];
@@ -1646,7 +1960,7 @@ export function buildLegalDayCandidatePool(args: {
   const finalLegalPool = afterUsedFilter.filter((candidate) =>
     isCandidateGeographicallyCompatibleWithDay(candidate, args.ownerAnchors, {
       maxDistanceKm: args.maxDistanceKm,
-      isDayTripDay: args.isDayTripDay,
+      dayTripContext: args.isDayTripDay ? args.dayTripFeasibilityContext : undefined,
     })
   );
   tracePoolStage({ dayNumber, stage: "after_geography_filter", size: finalLegalPool.length });
@@ -2475,6 +2789,8 @@ export function selectFallbackCandidate(args: {
   avoidKeywords: string[];
   /** Observability only (spec "DETERMINISTIC FALLBACK PROVENANCE") — omitting it changes nothing but the trace. */
   dayNumber?: number;
+  /** Real day-trip feasibility context (spec §D/§G) — baseAnchor is computed internally below (the centroid of this day's own current real geography); a caller only needs to supply the trip-wide mobility profile + capacity. Omitting this means a day_trip-kind fallback template falls through to the normal distance rule, never an unconditional pass. */
+  dayTripFeasibilityContext?: { mobilityProfile: DestinationMobilityProfile; dailyCapacityMinutes: number };
 }) {
   // Real bug found via a real 44-day US QA run: this used to be seeded only
   // when existingItems was empty ("the day's first pick has nothing to
@@ -2529,10 +2845,29 @@ export function selectFallbackCandidate(args: {
   // category/time-of-day/budget could still win from a genuinely
   // different city — real bug found in live QA: a "Tel Aviv" day
   // containing Haifa's Bahá'í Gardens, among other cross-city leaks.
+  // Spec §D — the day-trip base anchor is the centroid of this day's own
+  // current real geography (existing items + preferred-area candidates),
+  // never a fabricated point; no real anchor means the exemption below
+  // fails closed (dayTripFeasibilityContext with baseAnchor:null), same as
+  // every other legality path in this pass.
+  const geographicAnchorsWithCoordinates = geographicAnchors.filter(
+    (anchor): anchor is { lat: number; lon: number } => anchor.lat != null && anchor.lon != null
+  );
+  const dayTripBaseAnchor =
+    geographicAnchorsWithCoordinates.length > 0
+      ? {
+          lat: geographicAnchorsWithCoordinates.reduce((sum, a) => sum + a.lat, 0) / geographicAnchorsWithCoordinates.length,
+          lon: geographicAnchorsWithCoordinates.reduce((sum, a) => sum + a.lon, 0) / geographicAnchorsWithCoordinates.length,
+        }
+      : null;
+
   const legalPool = buildLegalDayCandidatePool({
     pool: args.pool,
     ownerAnchors: geographicAnchors,
     isDayTripDay: args.template.kind === "day_trip",
+    dayTripFeasibilityContext: args.dayTripFeasibilityContext
+      ? { baseAnchor: dayTripBaseAnchor, ...args.dayTripFeasibilityContext }
+      : undefined,
     usedToday: args.usedToday,
     usageCounts: args.usageCounts,
     usedRealPlaces: args.usedRealPlaces,
@@ -2846,6 +3181,13 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
   );
   const avoidKeywords = parsePreferenceKeywords(input.preferences.placesToAvoid);
   const baseStayLength = dayCount >= 14 ? 3 : dayCount > 7 ? 2 : 1;
+  // Spec §D/§G — real day-trip feasibility context for this fallback
+  // template's own candidate selection, so a "day_trip"-kind fallback day
+  // can never grant an unconditional geographic pass either.
+  const fallbackMobilityProfile = computeDestinationMobilityProfile(
+    recommendationPool.map((candidate) => ({ lat: candidate.lat, lon: candidate.lon }))
+  );
+  const fallbackDailyCapacityMinutes = deriveDailyCapacityMinutes(input.preferences.tripPace);
 
   for (let dayNumber = 1; dayNumber <= dayCount; dayNumber += 1) {
     const items: AiGeneratedItem[] = [];
@@ -2880,6 +3222,7 @@ export function buildFallbackAiItinerary(input: AiItineraryRequest): AiItinerary
         preferredKeywords,
         avoidKeywords,
         dayNumber,
+        dayTripFeasibilityContext: { mobilityProfile: fallbackMobilityProfile, dailyCapacityMinutes: fallbackDailyCapacityMinutes },
       });
 
       if (!next) {

@@ -228,21 +228,62 @@ export function buildGlobalTimeline(trips: TripHubTrip[]): TimelineEntry[] {
 }
 
 /**
- * Reuses the existing 3-state map Status ("visited"|"planned"|"not_visited")
- * as-is — derived from real trip data instead of the disconnected
- * `countries.status` DB column. "Currently traveling" is intentionally NOT
- * a 4th map color (would require a DB enum migration touching unrelated
- * country-CRUD UI); it's surfaced separately as a banner/link.
+ * Spec "MAP COUNTRY STATUS MUST BE DERIVED FROM TRIPS" — the ONE
+ * authoritative rule for a single country's travel status, reused by
+ * every surface that shows one (map fill, sidebar, filters, country
+ * detail panel, dashboard counts). Root-cause fix: `countries.status` is
+ * a manually-set DB column with exactly three write paths (a status
+ * dropdown, a generic upsert, and an auto-insert on first `/countries/
+ * [iso]` visit) and ZERO trip-driven writers — creating, deleting, or
+ * editing a trip never touches it, so it silently drifts from reality.
+ * This function is the fix: status is never stored, always recomputed
+ * from the trip list actually in hand.
+ *
+ * Rules (spec, verbatim):
+ *  - VISITED: at least one trip that has started — trip.startDate <=
+ *    today (today's local/destination calendar date, not a UTC
+ *    timestamp), OR a trip already known complete/active/archived-after-
+ *    starting regardless of a parseable date. Reuses TripHubTrip.hasStarted
+ *    (trip-hub.ts), which already implements exactly this predicate
+ *    (status==="completed" || status==="active" ||
+ *    Boolean(startDate && startDate<=today)) against the SAME
+ *    destination-local date every other itinerary-status computation in
+ *    this codebase uses (getDestinationDateString) — never a second,
+ *    competing date system. A trip starting exactly today is VISITED
+ *    (startDate<=today), never "planned".
+ *  - PLANNED: no started trip, but at least one trip exists at all
+ *    (a future-dated trip, or one with no date yet — "in planning" still
+ *    means a real trip exists).
+ *  - NOT_VISITED: no trips for this country at all.
+ *  - Precedence VISITED > PLANNED > NOT_VISITED — a later, future trip to
+ *    an already-visited country can never downgrade it.
+ */
+export function deriveCountryTravelStatus(trips: Pick<TripHubTrip, "hasStarted">[]): Status {
+  if (trips.length === 0) return "not_visited";
+  if (trips.some((trip) => trip.hasStarted)) return "visited";
+  return "planned";
+}
+
+/**
+ * All-countries-at-once version of deriveCountryTravelStatus, grouped by
+ * canonical ISO A2 (never by display name — Hebrew/English labels for the
+ * same country must never create separate identities). "Currently
+ * traveling" is intentionally NOT a 4th map color (would require a DB enum
+ * migration touching unrelated country-CRUD UI); it's surfaced separately
+ * as a banner/link.
  */
 export function deriveCountryMapStatuses(trips: TripHubTrip[]): Record<string, Status> {
-  const statuses: Record<string, Status> = {};
+  const tripsByIso = new Map<string, TripHubTrip[]>();
   for (const trip of trips) {
     const iso = trip.isoA2.toUpperCase();
-    if (trip.status === "completed") {
-      statuses[iso] = "visited";
-    } else if ((trip.status === "upcoming" || trip.status === "planning" || trip.status === "active") && statuses[iso] !== "visited") {
-      statuses[iso] = "planned";
-    }
+    const existing = tripsByIso.get(iso);
+    if (existing) existing.push(trip);
+    else tripsByIso.set(iso, [trip]);
+  }
+
+  const statuses: Record<string, Status> = {};
+  for (const [iso, isoTrips] of tripsByIso) {
+    statuses[iso] = deriveCountryTravelStatus(isoTrips);
   }
   return statuses;
 }

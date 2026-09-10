@@ -117,6 +117,7 @@ export function useDuplicateTripHubItinerary() {
     },
     onSuccess: (_itinerary, variables) => {
       queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({
         queryKey: countryItineraryKeys.byIso(variables.isoA2),
       });
@@ -141,6 +142,7 @@ export function useRenameTripHubItinerary() {
     },
     onSuccess: (_itinerary, variables) => {
       queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
     },
   });
@@ -160,6 +162,7 @@ export function useArchiveTripHubItinerary() {
     },
     onSuccess: (_itinerary, variables) => {
       queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
     },
   });
@@ -179,6 +182,7 @@ export function useDeleteTripHubItinerary() {
     },
     onSuccess: (variables) => {
       queryClient.invalidateQueries({ queryKey: tripHubKeys.all });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(variables.isoA2) });
     },
   });

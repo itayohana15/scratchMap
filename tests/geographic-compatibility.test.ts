@@ -42,6 +42,7 @@ const CITY_A = { lat: 10.0, lon: 10.0 };
 const CITY_A_SUBURB = { lat: 10.05, lon: 10.05 };
 const CITY_B = { lat: 12.0, lon: 10.0 };
 const REGION_D = { lat: 10.9, lon: 10.0 };
+const COMPACT_MOBILITY_PROFILE = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
 
 const basePreferences: TripPreferences = {
   startDate: "2026-10-06",
@@ -184,10 +185,41 @@ test("isCandidateGeographicallyCompatibleWithDay accepts a nearby suburb of the 
   assert.equal(compatible, true);
 });
 
-// ===== 3. City A -> Region D -> City A valid ONLY as a deliberate day trip =====
-test("isCandidateGeographicallyCompatibleWithDay rejects a day-trip-distance region on a normal day but accepts it on a day-trip day", () => {
+// ===== 3. City A -> Region D -> City A valid ONLY as a PROVEN, feasible day trip =====
+// Root-cause regression test (real generated PDF: Seattle days containing
+// Grand Canyon/Yosemite) — a day-trip claim alone must never be an
+// unconditional pass; it must go through real round-trip feasibility math
+// (dayTripContext), and a genuinely infeasible excursion must still be
+// rejected even when the day IS a real day trip.
+test("isCandidateGeographicallyCompatibleWithDay rejects a day-trip-distance region on a normal day, and never grants an unconditional day-trip pass without real feasibility context", () => {
   assert.equal(isCandidateGeographicallyCompatibleWithDay(REGION_D, [CITY_A], {}), false);
-  assert.equal(isCandidateGeographicallyCompatibleWithDay(REGION_D, [CITY_A], { isDayTripDay: true }), true);
+  // Root-cause regression: claiming day-trip status with NO real feasibility
+  // context must fail closed, never fall back to the old unconditional pass.
+  assert.equal(
+    isCandidateGeographicallyCompatibleWithDay(REGION_D, [CITY_A], {
+      dayTripContext: { baseAnchor: null, mobilityProfile: COMPACT_MOBILITY_PROFILE, dailyCapacityMinutes: 600 },
+    }),
+    false
+  );
+});
+
+test("isCandidateGeographicallyCompatibleWithDay grants the day-trip exemption only when the round trip is actually feasible", () => {
+  const generousCapacity = { baseAnchor: CITY_A, mobilityProfile: COMPACT_MOBILITY_PROFILE, dailyCapacityMinutes: 1200 };
+  assert.equal(
+    isCandidateGeographicallyCompatibleWithDay(REGION_D, [CITY_A], { dayTripContext: generousCapacity }),
+    true,
+    "a genuinely feasible round trip (real capacity, real base anchor) must be accepted"
+  );
+
+  // The exact real-world shape of the reported bug: a real, resolved place
+  // thousands of km away — no realistic capacity makes this a genuine day
+  // trip, and it must be rejected even though day-trip status is claimed.
+  const farAwayPlace = { lat: 55.0, lon: 55.0 };
+  assert.equal(
+    isCandidateGeographicallyCompatibleWithDay(farAwayPlace, [CITY_A], { dayTripContext: generousCapacity }),
+    false,
+    "an impossibly distant place must never pass purely because the day is classified as a day trip"
+  );
 });
 
 test("isCandidateGeographicallyCompatibleWithDay never blocks on missing geographic data", () => {
@@ -245,10 +277,51 @@ test("pickReplacementRecommendation accepts a Region D candidate on a genuine da
     lon: REGION_D.lon,
   });
 
+  // Root-cause fix regression note: a day-trip claim is no longer an
+  // unconditional pass (spec §D) — real feasibility math now needs a real
+  // base anchor to measure the round trip from. A genuine day-trip day
+  // realistically has a base-anchored item (e.g. the morning departure
+  // point) alongside the excursion itself, which is what actually lets
+  // pickReplacementRecommendation establish `anchor` internally (via
+  // getPrimaryAnchor on the day's OTHER items, excluding the one being
+  // replaced) — a day with only the excursion item and nothing else has no
+  // establishable base, and correctly fails closed rather than guessing.
   const dayTripDay = buildDay({
     items: [
+      buildItem({ name: "City A Base", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon }),
       buildItem({ name: "Region D Morning Hike", category: "nature", lat: REGION_D.lat, lon: REGION_D.lon }),
     ],
+    cityRegion: "City A",
+    notes: "טיול יום לאזור הטבע",
+  });
+  const payload = buildPayload({ recommendations: [regionDCandidate] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day: dayTripDay,
+    item: dayTripDay.items[1],
+    profile,
+    usageState: createItineraryUsageState(),
+  });
+
+  // Not asserting it MUST pick this specific candidate (scoring may prefer
+  // others) — only that geography never rules it out outright the way it
+  // would on a normal day.
+  assert.notEqual(replacement, null);
+});
+
+test("pickReplacementRecommendation fails closed on a day-trip-labeled day with no establishable base anchor", () => {
+  const regionDCandidate = buildRecommendation({
+    id: "region-d-trail",
+    name: "Region D Nature Trail",
+    category: "nature",
+    location: "Region D",
+    lat: REGION_D.lat,
+    lon: REGION_D.lon,
+  });
+  const dayTripDay = buildDay({
+    items: [buildItem({ name: "Region D Morning Hike", category: "nature", lat: REGION_D.lat, lon: REGION_D.lon })],
     cityRegion: "City A",
     notes: "טיול יום לאזור הטבע",
   });
@@ -263,10 +336,7 @@ test("pickReplacementRecommendation accepts a Region D candidate on a genuine da
     usageState: createItineraryUsageState(),
   });
 
-  // Not asserting it MUST pick this specific candidate (scoring may prefer
-  // others) — only that geography never rules it out outright the way it
-  // would on a normal day.
-  assert.notEqual(replacement, null);
+  assert.equal(replacement, null, "with no other item to establish a real base anchor, the day-trip exemption must fail closed, never guess");
 });
 
 // ===== 7. Diversity repair cannot introduce a wrong-region item =====
@@ -598,8 +668,22 @@ test("buildLegalDayCandidatePool: an already-used real place (by id, by usage co
   assert.deepEqual(legalPool.map((c) => c.id), ["fresh-1"], "every already-used real place must be excluded, regardless of which tracking mechanism caught it");
 });
 
-test("buildLegalDayCandidatePool: a day_trip day is exempt from the geographic gate (matches isCandidateGeographicallyCompatibleWithDay's own contract)", () => {
-  const farCandidate = buildRecommendation({ id: "far-1", name: "City B Place", location: "City B", lat: CITY_B.lat, lon: CITY_B.lon });
+// Root-cause fix regression: isDayTripDay alone (with no real feasibility
+// context) must fail closed, never grant the old unconditional pass.
+test("buildLegalDayCandidatePool: isDayTripDay alone (no real feasibility context) fails closed", () => {
+  // Substantial duration (matches the "genuinely feasible" test's own
+  // candidate) — with no real feasibility context at all, this must still
+  // be rejected; it must never pass just because a big enough visit
+  // duration would otherwise clear the value-ratio bar under some
+  // hypothetical generous capacity.
+  const farCandidate = buildRecommendation({
+    id: "far-1",
+    name: "City B Place",
+    location: "City B",
+    lat: CITY_B.lat,
+    lon: CITY_B.lon,
+    estimatedDurationMinutes: 240,
+  });
 
   const legalPool = buildLegalDayCandidatePool({
     pool: [farCandidate],
@@ -610,5 +694,118 @@ test("buildLegalDayCandidatePool: a day_trip day is exempt from the geographic g
     usedRealPlaces: [],
   });
 
+  assert.deepEqual(legalPool.map((c) => c.id), []);
+});
+
+test("buildLegalDayCandidatePool: a day_trip day is exempt from the geographic gate ONLY with real, feasible day-trip context", () => {
+  // A substantial visit duration is required for the round trip to clear
+  // evaluateDayTripFeasibility's own value-ratio floor (real travel time
+  // to City B dominates a short visit otherwise) — not just a generous
+  // time budget alone.
+  const farCandidate = buildRecommendation({
+    id: "far-1",
+    name: "City B Place",
+    location: "City B",
+    lat: CITY_B.lat,
+    lon: CITY_B.lon,
+    estimatedDurationMinutes: 240,
+  });
+
+  const legalPool = buildLegalDayCandidatePool({
+    pool: [farCandidate],
+    ownerAnchors: [CITY_A],
+    isDayTripDay: true,
+    dayTripFeasibilityContext: { baseAnchor: CITY_A, mobilityProfile: COMPACT_MOBILITY_PROFILE, dailyCapacityMinutes: 1200 },
+    usedToday: new Set(),
+    usageCounts: new Map(),
+    usedRealPlaces: [],
+  });
+
   assert.deepEqual(legalPool.map((c) => c.id), ["far-1"]);
+});
+
+// ===== Semantic role safety (spec §J) — an airport/station/hotel must
+// never fill a normal activity slot merely because it's geographically
+// nearby. Enforced structurally: pickReplacementRecommendation's own
+// category filter requires an exact category match for replacementMode
+// "match" (an "attraction" slot can only ever be replaced by another
+// "attraction"), and replacementMode "non_food" additionally requires
+// isAnchorDayItem, which excludes NON_ACTIVITY_CATEGORIES
+// ("transportation"/"hotel"/"practical") outright — never by matching the
+// candidate's own name text. =====
+test("semantic role: a nearby airport/station (category transportation) cannot fill an attraction slot", () => {
+  const nearbyAirport = buildRecommendation({
+    id: "nearby-airport",
+    name: "City A International Airport",
+    category: "transportation",
+    location: "City A",
+    lat: CITY_A_SUBURB.lat,
+    lon: CITY_A_SUBURB.lon,
+  });
+  const day = buildDay({ items: [buildItem({ name: "City A Anchor", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon })] });
+  const payload = buildPayload({ recommendations: [nearbyAirport] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day,
+    item: buildItem({ name: "Outdated Attraction", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon }),
+    profile,
+    usageState: createItineraryUsageState(),
+    replacementMode: "non_food",
+  });
+
+  assert.equal(replacement, null, "a transportation-category candidate must never fill a non-food activity slot, however close it is");
+});
+
+test("semantic role: a nearby hotel (category hotel) cannot fill an attraction slot", () => {
+  const nearbyHotel = buildRecommendation({
+    id: "nearby-hotel",
+    name: "City A Grand Hotel",
+    category: "hotel",
+    location: "City A",
+    lat: CITY_A_SUBURB.lat,
+    lon: CITY_A_SUBURB.lon,
+  });
+  const day = buildDay({ items: [buildItem({ name: "City A Anchor", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon })] });
+  const payload = buildPayload({ recommendations: [nearbyHotel] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day,
+    item: buildItem({ name: "Outdated Attraction", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon }),
+    profile,
+    usageState: createItineraryUsageState(),
+    replacementMode: "non_food",
+  });
+
+  assert.equal(replacement, null, "a hotel-category candidate must never fill a non-food activity slot, however close it is");
+});
+
+test("semantic role: a nearby train station (category transportation) cannot fill an attraction slot without transit-leg context", () => {
+  const nearbyStation = buildRecommendation({
+    id: "nearby-station",
+    name: "City A Central Station",
+    category: "transportation",
+    location: "City A",
+    lat: CITY_A_SUBURB.lat,
+    lon: CITY_A_SUBURB.lon,
+  });
+  const day = buildDay({ items: [buildItem({ name: "City A Anchor", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon })] });
+  const payload = buildPayload({ recommendations: [nearbyStation] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+
+  // replacementMode "match" (the default, used for a plain attraction-slot
+  // repair) requires the candidate's OWN category to equal the item being
+  // replaced's category — "transportation" can never match "attraction".
+  const replacement = pickReplacementRecommendation({
+    payload,
+    day,
+    item: buildItem({ name: "Outdated Attraction", category: "attraction", lat: CITY_A.lat, lon: CITY_A.lon }),
+    profile,
+    usageState: createItineraryUsageState(),
+  });
+
+  assert.equal(replacement, null, "a station cannot fill an attraction slot without a real TransitLeg/transportation-role context");
 });

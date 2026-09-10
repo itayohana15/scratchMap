@@ -167,6 +167,7 @@ export function useGenerateCountryItinerary(iso: string) {
         (current) => upsertItineraryList(current, itinerary)
       );
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.setQueryData(countryItineraryKeys.detail(iso, itinerary.id), itinerary);
       // Trips/Dashboard/Passport all read from `useTripHubTrips()` — invalidate
       // it too so a freshly generated itinerary shows up without a manual
@@ -207,6 +208,7 @@ export function useUpdateCountryItinerary(iso: string) {
     },
     onSuccess: (itinerary) => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({
         queryKey: countryItineraryKeys.versions(iso, itinerary.id),
       });
@@ -229,6 +231,7 @@ export function useDuplicateCountryItinerary(iso: string) {
     },
     onSuccess: (itinerary) => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.setQueryData(countryItineraryKeys.detail(iso, itinerary.id), itinerary);
     },
   });
@@ -248,6 +251,7 @@ export function useArchiveCountryItinerary(iso: string) {
     },
     onSuccess: (itinerary) => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({
         queryKey: countryItineraryKeys.versions(iso, itinerary.id),
       });
@@ -269,6 +273,7 @@ export function useDeleteCountryItinerary(iso: string) {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
     },
   });
 }
@@ -303,6 +308,7 @@ export function useRegenerateCountryItinerary(iso: string) {
     },
     onSuccess: (itinerary) => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({
         queryKey: countryItineraryKeys.versions(iso, itinerary.id),
       });
@@ -333,6 +339,7 @@ export function useRestoreCountryItineraryVersion(iso: string) {
     },
     onSuccess: (itinerary) => {
       queryClient.invalidateQueries({ queryKey: countryItineraryKeys.byIso(iso) });
+      queryClient.invalidateQueries({ queryKey: ["countries", "map-statuses"] });
       queryClient.invalidateQueries({
         queryKey: countryItineraryKeys.versions(iso, itinerary.id),
       });

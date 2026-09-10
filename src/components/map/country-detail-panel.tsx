@@ -16,7 +16,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTripDateRange } from "@/lib/format";
 import { useCitiesByCountry } from "@/lib/queries/cities";
-import { useCountryByIso, useUpsertCountry } from "@/lib/queries/countries";
+import { useCountryByIso, useMapCountryStatuses, useUpsertCountry } from "@/lib/queries/countries";
 import { useTripHubTrips } from "@/lib/queries/trip-hub";
 import type { Status } from "@/lib/supabase/types";
 
@@ -38,6 +38,7 @@ export function CountryDetailPanel({
   const { data: country, isLoading } = useCountryByIso(iso ?? undefined);
   const { data: cities } = useCitiesByCountry(country?.id);
   const { data: allTrips = [] } = useTripHubTrips();
+  const { data: mapCountryStatuses } = useMapCountryStatuses();
   const upsertCountry = useUpsertCountry();
   const [pendingStatus, setPendingStatus] = useState<Status>("planned");
 
@@ -48,6 +49,17 @@ export function CountryDetailPanel({
   const completedCountryTrips = countryTrips.filter((trip) => trip.status === "completed");
   const upcomingCountryTrip = countryTrips.find((trip) => trip.status === "upcoming");
   const visitYears = [...new Set(completedCountryTrips.map((trip) => trip.year))].sort();
+  // Spec "PART B — MAP STATUS MUST BE SERVER AUTHORITATIVE" — the badge
+  // reads the SERVER-computed effectiveStatus (same source the map fill
+  // and sidebar use). The manual dropdown is only offered for a country
+  // the server reports has no trips at all (`hasTrips === false`), where
+  // the stored `countries.status` column is the legitimate fallback.
+  const serverCountryStatus = useMemo(
+    () => mapCountryStatuses?.find((entry) => entry.iso_a2.toUpperCase() === (iso ?? "").toUpperCase()),
+    [mapCountryStatuses, iso]
+  );
+  const effectiveStatus: Status | undefined = serverCountryStatus?.effectiveStatus ?? country?.status;
+  const hasCountryTrips = serverCountryStatus?.hasTrips ?? countryTrips.length > 0;
 
   async function handleAddCountry(status: Status) {
     if (!iso) return;
@@ -79,9 +91,9 @@ export function CountryDetailPanel({
 
             <SheetHeader className="pt-0">
               <SheetTitle className="sr-only">{country?.name ?? displayName}</SheetTitle>
-              {country && (
+              {country && effectiveStatus && (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Badge variant="secondary">{STATUS_LABELS[country.status]}</Badge>
+                  <Badge variant="secondary">{STATUS_LABELS[effectiveStatus]}</Badge>
                   {country.rating != null && (
                     <span className="flex items-center gap-1">
                       <Star className="size-3.5 fill-current text-amber-500" />
@@ -146,16 +158,20 @@ export function CountryDetailPanel({
                 </>
               ) : (
                 <>
-                  <section>
-                    <h3 className="mb-2 text-sm font-medium">סטטוס</h3>
-                    <StatusSelect
-                      value={country.status}
-                      onChange={handleStatusChange}
-                      disabled={upsertCountry.isPending}
-                    />
-                  </section>
+                  {!hasCountryTrips && (
+                    <>
+                      <section>
+                        <h3 className="mb-2 text-sm font-medium">סטטוס</h3>
+                        <StatusSelect
+                          value={country.status}
+                          onChange={handleStatusChange}
+                          disabled={upsertCountry.isPending}
+                        />
+                      </section>
 
-                  <Separator />
+                      <Separator />
+                    </>
+                  )}
 
                   <section>
                     <h3 className="mb-2 text-sm font-medium">סקירה כללית</h3>

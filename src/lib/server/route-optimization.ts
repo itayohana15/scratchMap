@@ -11,7 +11,13 @@
 //   2. Itinerary-wide metrics (computeItineraryTravelMetrics/
 //      detectBacktracking) — computed AFTER a plan exists, for QA
 //      reporting and as an input the repair loop can react to.
-import { haversineKm, type TripRecommendation } from "../trip-workspace";
+import {
+  haversineKm,
+  evaluateDayTripFeasibility,
+  evaluateTransferDetourFeasibility,
+  type DayTripFeasibility,
+  type TripRecommendation,
+} from "../trip-workspace";
 import { estimateMinutesForMode, selectTransportMode } from "../transport-mode";
 import type { TripPreferenceProfile } from "./itinerary-generation-constraints";
 import {
@@ -24,6 +30,14 @@ import {
 // Re-exported so every existing caller/test of THIS module is unaffected
 // by the move described at each definition's own original location below.
 export { allocateNightsForClusters, detectBacktracking, evaluateShortStayViability };
+export { evaluateDayTripFeasibility, evaluateTransferDetourFeasibility };
+export type {
+  DayTripFeasibilityInput,
+  DayTripFeasibility,
+  TransferDetourInput,
+  TransferDetourFeasibility,
+} from "../trip-workspace";
+export { DAY_TRIP_MIN_VALUE_RATIO } from "../trip-workspace";
 
 export interface ActivityCluster {
   id: string;
@@ -248,68 +262,6 @@ export function decideClusterRole(
   return "day_trip";
 }
 
-// Day-trip round-trip feasibility (base -> excursion cluster -> base) —
-// previously missing entirely: a cluster earning "day_trip" role
-// (decideClusterRole above) never had its actual round-trip travel cost
-// checked against the day's real usable time, so a genuinely too-far or
-// too-thin cluster could still surface as a "day trip" hint with nothing to
-// say whether a traveler could plausibly do it and enjoy it. Two
-// deliberately separate functions: evaluateDayTripFeasibility is the pure
-// arithmetic/decision (fully unit-testable with plain numbers, including
-// deliberately asymmetric legs), computeDayTripClusterFeasibility is the one
-// real caller that derives those numbers from an actual cluster + base
-// anchor using the same haversineKm/selectTransportMode/estimateMinutesForMode
-// primitives already used for intercity feasibility elsewhere (see
-// attemptStayStructureRepair's isTransitionFeasible in
-// country-itinerary-generation.ts) — no new travel-time estimator invented.
-export interface DayTripFeasibilityInput {
-  outboundTravelMinutes: number;
-  returnTravelMinutes: number;
-  internalTravelMinutes: number;
-  visitMinutes: number;
-  usableMinutes: number;
-}
-
-export interface DayTripFeasibility extends DayTripFeasibilityInput {
-  totalMinutes: number;
-  valueRatio: number;
-  feasible: boolean;
-  reason: "ok" | "exceeds_time_budget" | "low_value_ratio";
-}
-
-// No comparable ratio/threshold concept exists elsewhere in this codebase
-// (decideClusterRole's own thresholds are duration- and distance-based, not
-// a travel-share ratio) — a genuinely NEW tunable, not a magic number buried
-// in logic: at least 40% of the day trip's total time budget must be real
-// visit time, not travel, or the excursion isn't worth the trip.
-export const DAY_TRIP_MIN_VALUE_RATIO = 0.4;
-
-/**
- * Pure feasibility decision from already-known quantities — never computes
- * travel time itself, so outbound/return are always independently supplied
- * and never assumed equal (a real route can be asymmetric: a loop road, a
- * different return mode). Callers with only straight-line coordinates
- * (computeDayTripClusterFeasibility below) currently derive both the same
- * way, but this function's contract doesn't require that, so a future real
- * routing source can supply genuinely different legs without any change
- * here.
- */
-export function evaluateDayTripFeasibility(input: DayTripFeasibilityInput): DayTripFeasibility {
-  const totalMinutes =
-    input.outboundTravelMinutes + input.returnTravelMinutes + input.internalTravelMinutes + input.visitMinutes;
-  const valueRatio = totalMinutes > 0 ? input.visitMinutes / totalMinutes : 0;
-  const withinBudget = totalMinutes <= input.usableMinutes;
-  const meetsValueRatio = valueRatio >= DAY_TRIP_MIN_VALUE_RATIO;
-
-  return {
-    ...input,
-    totalMinutes,
-    valueRatio,
-    feasible: withinBudget && meetsValueRatio,
-    reason: !withinBudget ? "exceeds_time_budget" : !meetsValueRatio ? "low_value_ratio" : "ok",
-  };
-}
-
 /**
  * Nearest-neighbor chain through the cluster's own members — the one
  * genuinely new estimator here (nothing existing computes intra-cluster
@@ -382,69 +334,6 @@ export function computeDayTripClusterFeasibility(
     visitMinutes,
     usableMinutes,
   });
-}
-
-// Transfer-day detour/corridor feasibility (origin stay -> destination
-// stay) — the existing transfer-day check (enforceNormalDayLocality,
-// country-itinerary-generation.ts) only ever rejected an item that
-// POSITIVELY matched some OTHER modeled stay's area; an item that was
-// simply far from everything (not near origin, not near destination, not a
-// real match to any known stay, and not actually on the way) sailed
-// through with zero validation — the exact gap this closes. Same
-// deliberately separate two-function shape as the day-trip feasibility
-// work just above: evaluateTransferDetourFeasibility is pure arithmetic
-// (fully unit-testable with plain numbers, including the combined-slack
-// case for multiple detour activities on the same day), the real caller
-// derives its inputs from the trip's own already-computed StayTransition
-// (buildStayTransitions, itinerary-planning-principles.ts) — the same
-// origin/destination anchors and t(origin,destination) already used for
-// intercity feasibility elsewhere, not a second source of truth.
-export interface TransferDetourInput {
-  /** t(origin, candidate) */
-  outboundToCandidateMinutes: number;
-  /** t(candidate, destination) */
-  candidateToDestinationMinutes: number;
-  /** t(origin, destination) — the direct transfer leg itself */
-  directTransferMinutes: number;
-  visitMinutes: number;
-  /** The transfer day's total leftover time budget for detour activities (dailyCapacityMinutes - directTransferMinutes), before this candidate. */
-  availableSlackMinutes: number;
-  /** Detour+visit minutes already committed to earlier detour activities the same day — a second, individually-fine detour can still be correctly rejected once combined with the first. */
-  usedSlackMinutes: number;
-}
-
-export interface TransferDetourFeasibility {
-  detourMinutes: number;
-  totalMinutes: number;
-  remainingSlackMinutes: number;
-  feasible: boolean;
-  reason: "ok" | "exceeds_available_slack";
-}
-
-/**
- * detour(P) = t(origin,P) + t(P,destination) - t(origin,destination) —
- * implemented exactly. Clamped at 0: real-world mode-selection quirks
- * (different transport modes chosen for legs of different lengths) can
- * technically violate strict triangle-inequality symmetry in edge cases;
- * a "negative detour" has no physical meaning, it just means genuinely on
- * the way.
- */
-export function evaluateTransferDetourFeasibility(input: TransferDetourInput): TransferDetourFeasibility {
-  const detourMinutes = Math.max(
-    0,
-    input.outboundToCandidateMinutes + input.candidateToDestinationMinutes - input.directTransferMinutes
-  );
-  const totalMinutes = detourMinutes + input.visitMinutes;
-  const remainingSlackBefore = input.availableSlackMinutes - input.usedSlackMinutes;
-  const feasible = totalMinutes <= remainingSlackBefore;
-
-  return {
-    detourMinutes,
-    totalMinutes,
-    remainingSlackMinutes: remainingSlackBefore - totalMinutes,
-    feasible,
-    reason: feasible ? "ok" : "exceeds_available_slack",
-  };
 }
 
 // allocateNightsForClusters now lives in itinerary-planning-principles.ts

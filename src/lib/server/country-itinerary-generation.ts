@@ -38,6 +38,7 @@ export class ItineraryGenerationInfeasibleError extends Error {
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import { estimateMinutesForMode, selectTransportMode, type TransportMode } from "@/lib/transport-mode";
 import countryFactsData from "@/lib/facts/country-facts-data.json";
+import { findAirportByIata } from "@/lib/facts/airports-data";
 import {
   computeArrivalDepartureWindow,
   describeArrivalDepartureWindow,
@@ -97,8 +98,10 @@ import {
   applyShortStayViabilityRepair,
   buildStayTransitions,
   repairImpossibleStayTransition,
-  reorderAreasForDepartureFeasibility,
-  reorderAreasToMinimizeBacktracking,
+  optimizeStayRouteSequence,
+  verifyStayRouteInvariants,
+  scoreStayRoute,
+  type StayRouteNode,
   type TripFrameDayTripHint,
   type TripFramePlanningTrace,
   resolveItemEffectiveEndTime,
@@ -154,8 +157,11 @@ import {
   getTripDayCount,
   haversineKm,
   isCandidateGeographicallyCompatibleWithDay,
+  evaluateScheduledPlaceLegality,
+  type ScheduledPlaceLegalityRule,
   FUZZY_DUPLICATE_MAX_KM,
   isFuzzyDuplicatePlace,
+  isMealOpportunityMarker,
   ITINERARY_GENERATION_MODE_LABELS,
   RECOMMENDATION_CATEGORY_LABELS,
   createItineraryUsageState,
@@ -909,29 +915,52 @@ export function buildDeterministicTripFrame(payload: AiItineraryRequest, dayCoun
   const areaAnchors = computeAreaAnchors(payload);
   let phases = buildTripFramePhases(rankedAreas, areaCounts, dayCount, bucket, pinnedArea || null);
 
+  // GLOBAL ROUTE OPTIMIZATION pass — the ONE authoritative stay-order
+  // decision (spec §A: replaces the old two-step reorder at this exact
+  // call site, never a second competing orderer). Arrival/departure are
+  // hard constraints (spec §D): the route is arrival anchor → stay 1 →
+  // ... → stay N → departure anchor, both resolved from the real flight
+  // legs, never just the last stop.
+  const arrivalAirport = payload.preferences.flights?.outbound?.arrivalAirport || null;
+  const arrivalAnchor = arrivalAirport ? findAirportByIata(arrivalAirport) : null;
+  const departureAirport = payload.preferences.flights?.return?.departureAirport || null;
+  const departureAnchor = departureAirport ? findAirportByIata(departureAirport) : null;
+
   let backtrackingReordered = false;
   if (!pinnedArea && phases.length >= 2) {
     const selectedAreaOrder = phases.map((phase) => phase.areaLabel);
+    const routeNodes: StayRouteNode[] = selectedAreaOrder.map((area) => {
+      const anchor = areaAnchors.get(area);
+      return {
+        id: area,
+        lat: anchor?.lat ?? 0,
+        lon: anchor?.lon ?? 0,
+        hasAnchor: anchor != null,
+        value: areaCounts.get(area) ?? 1,
+      };
+    });
 
-    // Section "WIRE BACKTRACKING" — a real, coordinate-based reorder,
-    // adopted only when it genuinely reduces the route's own backtracking
-    // score.
-    let finalAreaOrder = reorderAreasToMinimizeBacktracking(selectedAreaOrder, areaAnchors);
-    backtrackingReordered = finalAreaOrder !== selectedAreaOrder;
+    const optimized = optimizeStayRouteSequence(routeNodes, arrivalAnchor, departureAnchor);
+    const finalAreaOrder = optimized.map((node) => node.id);
+    backtrackingReordered = finalAreaOrder.some((area, index) => area !== selectedAreaOrder[index]);
 
-    // The hard departure-airport constraint always has the final say on
-    // which area ends the trip (spec "DO NOT REORDER FIXED CONSTRAINTS" —
-    // optimization is subordinate to hard constraints) — applied last, on
-    // whatever order backtracking optimization produced.
-    finalAreaOrder = reorderAreasForDepartureFeasibility(
-      finalAreaOrder,
-      areaAnchors,
-      payload.preferences.flights?.return?.departureAirport || null,
-      payload.preferences.flights?.return?.departureTime || null
-    );
-
-    if (finalAreaOrder !== selectedAreaOrder) {
+    if (backtrackingReordered) {
       phases = reorderPhasesByArea(phases, finalAreaOrder);
+    }
+
+    if (isPlannerQaTraceEnabled()) {
+      const scoreBefore = scoreStayRoute(routeNodes, arrivalAnchor, departureAnchor);
+      const scoreAfter = scoreStayRoute(optimized, arrivalAnchor, departureAnchor);
+      logGenerationStage("route optimization: stay sequence", {
+        before: selectedAreaOrder,
+        after: finalAreaOrder,
+        scoreBefore,
+        scoreAfter,
+      });
+      const violations = verifyStayRouteInvariants(optimized, arrivalAnchor, departureAnchor);
+      if (violations.length > 0) {
+        logGenerationStage("route optimization: invariant violations after optimize (pre short-stay-repair)", { violations });
+      }
     }
   }
 
@@ -940,6 +969,22 @@ export function buildDeterministicTripFrame(payload: AiItineraryRequest, dayCoun
   // QA-only computation.
   const shortStayResult = applyShortStayViabilityRepair({ bucketId: bucket.id, phases, source: "deterministic" }, areaAnchors, areaCounts);
   phases = shortStayResult.frame.phases;
+
+  // Spec §I "if short-stay repair changes order/merges clusters, re-run
+  // route validation" — diagnostic re-check only (QA-gated), never a
+  // second repair pass; short-stay merging can change which areas are
+  // adjacent, so a revisit that wasn't there before optimization could in
+  // principle reappear after merging.
+  if (isPlannerQaTraceEnabled() && phases.length >= 2) {
+    const postRepairNodes: StayRouteNode[] = phases.map((phase) => {
+      const anchor = areaAnchors.get(phase.areaLabel);
+      return { id: phase.areaLabel, lat: anchor?.lat ?? 0, lon: anchor?.lon ?? 0, hasAnchor: anchor != null, value: areaCounts.get(phase.areaLabel) ?? 1 };
+    });
+    const postRepairViolations = verifyStayRouteInvariants(postRepairNodes, arrivalAnchor, departureAnchor);
+    if (postRepairViolations.length > 0) {
+      logGenerationStage("route optimization: invariant violations after short-stay repair", { violations: postRepairViolations });
+    }
+  }
 
   // Section "DAY-TRIP CLUSTER" — attach each day-trip cluster to whichever
   // FINAL surviving phase is geographically nearest, never a phase that
@@ -1053,6 +1098,22 @@ async function refineTripFrameWithGemini(
     // pickClusterAreaLabel only ever returns a label that already exists
     // verbatim in the pool, so the original is always anchor-safe.
     const areaAnchors = computeAreaAnchors(payload);
+    // Root-cause fix (real 43-day US replay: "Virginia" ended up as the
+    // areaLabel for THREE non-contiguous phases — a transfer day and two
+    // separate later "normal" stays — because nothing stopped Gemini from
+    // proposing the SAME rename for multiple phase indices). deriveDayType
+    // identifies a stay change purely by phase OBJECT identity
+    // (phase.id !== previousPhase.id), never by label — so two
+    // non-adjacent phases sharing a label is invisible to it, but their
+    // SHARED label makes every downstream lookup (areaAnchors.get(phase.
+    // areaLabel), buildStayTransitions treating them as the "same" stay
+    // when adjacent) ambiguous. A proposed rename that collides with a
+    // DIFFERENT phase's already-accepted label is rejected the same way
+    // an anchor-less one is — worldwide/generic, no phase-count or
+    // area-name assumption.
+    const acceptedLabelsByPhaseId = new Map<string, string>();
+    for (const phase of frame.phases) acceptedLabelsByPhaseId.set(phase.id, phase.areaLabel);
+
     const nextPhases = frame.phases.map((phase, index) => {
       const match = parsed.phases!.find((entry) => entry.index === index);
       if (!match || !match.areaLabel?.trim()) return phase;
@@ -1060,15 +1121,32 @@ async function refineTripFrameWithGemini(
         ? (match.intent as TripFramePhase["intent"])
         : phase.intent;
       const proposedLabel = match.areaLabel.trim();
-      const proposedHasAnchor = areaAnchors.get(normalizeAreaLabel(proposedLabel)) != null;
-      if (!proposedHasAnchor) {
-        logGenerationStage("refineTripFrameWithGemini: rejected an anchor-less rename", {
+      // Root-cause fix (same 43-day US replay) — the anchor-existence
+      // check normalizes the proposed label before looking it up, but the
+      // RAW (un-normalized) label used to be what got stored. Every later
+      // `areaAnchors.get(phase.areaLabel)` call site looks up the RAW
+      // stored label without normalizing, so e.g. "Virginia, USA" passed
+      // this check (its normalized form "Virginia" has a real anchor) yet
+      // resolved to `undefined` everywhere else, silently orphaning the
+      // phase from its own anchor. Storing the SAME normalized form that
+      // was actually verified closes that mismatch for every consumer at
+      // once, instead of patching each lookup site separately.
+      const normalizedProposedLabel = normalizeAreaLabel(proposedLabel);
+      const proposedHasAnchor = areaAnchors.get(normalizedProposedLabel) != null;
+      const collidesWithAnotherPhase = [...acceptedLabelsByPhaseId.entries()].some(
+        ([phaseId, label]) => phaseId !== phase.id && normalizeAreaLabel(label) === normalizedProposedLabel
+      );
+      if (!proposedHasAnchor || collidesWithAnotherPhase) {
+        logGenerationStage("refineTripFrameWithGemini: rejected a rename", {
           phaseIndex: index,
           originalAreaLabel: phase.areaLabel,
           rejectedProposedLabel: proposedLabel,
+          reason: !proposedHasAnchor ? "no_real_anchor" : "collides_with_another_phase",
         });
+        return phase;
       }
-      return { ...phase, areaLabel: proposedHasAnchor ? proposedLabel : phase.areaLabel, intent };
+      acceptedLabelsByPhaseId.set(phase.id, normalizedProposedLabel);
+      return { ...phase, areaLabel: normalizedProposedLabel, intent };
     });
 
     return { ...frame, phases: nextPhases, source: "ai" };
@@ -1566,14 +1644,137 @@ function sortAnchorsByCluster(day: AiGeneratedDay, anchors: AiGeneratedItem[]) {
   });
 }
 
+/**
+ * Round 4 — for a PHRASE field (a day's `accommodation` / `title`, e.g.
+ * "לינה נוחה באזור Chicago", "יום 4 בChicago") vs a bare area label: does
+ * the phrase positively NAME that area? Every word of the area label must
+ * appear among the phrase's words (superset direction — the phrase has
+ * extra fixed template words). Deliberately NOT `sharesDayArea` (which
+ * requires equal word-sets and is right for two bare area strings), and
+ * deliberately one-directional so "West Virginia" as an area label is not
+ * "named" by a "Virginia" phrase.
+ */
+function phraseNamesArea(phrase: string, areaLabel: string): boolean {
+  const areaWords = normalizeAreaLabel(areaLabel).toLowerCase().trim().split(/[\s,]+/).filter(Boolean);
+  if (areaWords.length === 0) return false;
+  const phraseWords = new Set(phrase.toLowerCase().trim().split(/[\s,·|/]+/).filter(Boolean));
+  return areaWords.every((word) => phraseWords.has(word));
+}
+
 function sharesDayArea(left: string, right: string) {
-  const normalizedLeft = normalizeAreaLabel(left).toLowerCase();
-  const normalizedRight = normalizeAreaLabel(right).toLowerCase();
-  return (
-    !!normalizedLeft &&
-    !!normalizedRight &&
-    (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft))
-  );
+  const normalizedLeft = normalizeAreaLabel(left).toLowerCase().trim();
+  const normalizedRight = normalizeAreaLabel(right).toLowerCase().trim();
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+  // Root-cause fix (real replay: a "West Virginia" transition day kept its
+  // stale cityRegion). Whole-word-SET equality, not "one string contains
+  // the other" — "West Virginia" / "Virginia Beach" must NOT read as the
+  // same area as "Virginia", and "York" must not match "New York". A
+  // genuine alias with a different word count (e.g. "New York" vs "New
+  // York City") deliberately does not match here either; alignDaysToTripFrame
+  // then just rewrites cityRegion to the authoritative phase label, which
+  // is the intended outcome.
+  const leftWords = new Set(normalizedLeft.split(/[\s,]+/).filter(Boolean));
+  const rightWords = new Set(normalizedRight.split(/[\s,]+/).filter(Boolean));
+  if (leftWords.size === 0 || leftWords.size !== rightWords.size) return false;
+  return [...leftWords].every((word) => rightWords.has(word));
+}
+
+/**
+ * Round 5 — a GENERIC meal-opportunity placeholder ("🍽 recommended lunch
+ * time near <area>"), the ONLY food item that is synthetic. It is either
+ * explicitly role-tagged (`itemRole === "meal_opportunity"`) or has the
+ * structural marker shape isMealOpportunityMarker already recognizes
+ * (restaurant/cafe category, NO real coordinates, NO recommendationId) —
+ * which ALSO catches a Gemini-authored restaurant that never name-matched
+ * a real candidate (enrichAiDay nulls its geometry) and a placeholder
+ * whose `itemRole` was dropped on a save/regeneration round-trip. Such an
+ * item's area label is pure presentation: normalizeDayOwnershipToFrame
+ * regenerates it from the day's canonical owner. It is NEVER put through
+ * real-POI geographic legality (there is no coordinate to judge).
+ */
+function isGenericMealOpportunity(item: Pick<AiGeneratedItem, "itemRole" | "category" | "lat" | "lon" | "recommendationId">): boolean {
+  return item.itemRole === "meal_opportunity" || isMealOpportunityMarker(item);
+}
+
+/**
+ * Round 6 — THE ONE authoritative predicate for "this scheduled item is a
+ * real, geographically-concrete place that must pass the final geographic
+ * legality rules". Every geography-critical gate
+ * (enforceNormalDayLocality, enforceFinalPlaceLegalityGate,
+ * validateFinalItineraryInvariants, enforceItineraryInvariantsWithRepair)
+ * uses THIS — never its own category allow/deny list. A named venue in
+ * ANY real-POI category — attraction, museum, landmark, nature, shopping,
+ * restaurant, cafe, bar/nightlife, family, hidden_gem, seasonal_event,
+ * day_trip — counts. `category` is NEVER an exemption: a distant museum is
+ * exactly as illegal as a distant restaurant or a distant landmark.
+ *
+ * Excluded — and ONLY these — the true structural / synthetic types:
+ *   - a generic meal-opportunity placeholder (isGenericMealOpportunity)
+ *   - a free-time / transit-practical synthetic block (isSyntheticScheduleItem)
+ *   - the canonical stay-transition item (isStayTransitionItem)
+ *   - `practical` (a logistics filler)
+ *   - `transportation` / `hotel` — semantic-role slots, judged by
+ *     enforceTransportRoleGuard, not by place geography.
+ */
+function isScheduledRealPlace(
+  item: Pick<AiGeneratedItem, "itemRole" | "category" | "lat" | "lon" | "recommendationId" | "canonicalPlaceId">
+): boolean {
+  if (isSyntheticScheduleItem(item)) return false;
+  if (isStayTransitionItem(item)) return false;
+  if (isGenericMealOpportunity(item)) return false;
+  if (item.category === "practical" || item.category === "transportation" || item.category === "hotel") return false;
+  return true;
+}
+
+/**
+ * Round 6 — THE coordinate-having twin of enforceNormalDayLocality's
+ * coordinate-less `matchesOwnArea`/`matchedOtherPhase` text check. A single
+ * trip-wide `localityRadiusKm` (120 km on the sparse tier) can otherwise
+ * accept a POI in an entirely different metro/region simply because the
+ * raw kilometres land under that one number (the real replay: the
+ * Smithsonian, "Washington, DC", ~80 km from a West Virginia panhandle
+ * base — inside 120 km).
+ *
+ * The rule, coordinate-anchored and threshold-free: a real POI is
+ * "elsewhere" when its OWN `location` text positively names a known area
+ * (a pool-derived areaAnchors label OR a TripFrame phase) that does NOT
+ * share the day owner, AND its coordinates are genuinely CLOSER to that
+ * named area's anchor than to this day's own base anchor. i.e. the item
+ * is really sitting in the place its text says it is, and that place is
+ * not this day's base. A POI whose text names the owner (e.g. "Harpers
+ * Ferry, West Virginia" on a "West Virginia" day) returns early — never
+ * flagged. Worldwide/generic — the item's own text + coordinates vs. the
+ * trip's own known areas; no place names, no distance constant.
+ */
+function realPlaceNamesADifferentKnownArea(
+  placeLat: number | null,
+  placeLon: number | null,
+  locationText: string,
+  ownerAreaLabel: string,
+  ownAnchor: { lat: number; lon: number } | null | undefined,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  tripFrame: TripFrame
+): { matched: boolean; areaLabel?: string } {
+  const text = locationText.trim();
+  if (!text) return { matched: false };
+  if (resolveTextualAreaMatch(text, ownerAreaLabel)) return { matched: false }; // its own text names the owner — fine
+  if (placeLat == null || placeLon == null || !ownAnchor) return { matched: false }; // coord-less handled elsewhere
+  const ownDistanceKm = haversineKm(ownAnchor.lat, ownAnchor.lon, placeLat, placeLon);
+
+  const candidateLabels = new Set<string>();
+  for (const [label] of areaAnchors) candidateLabels.add(label);
+  for (const phase of tripFrame.phases) candidateLabels.add(phase.areaLabel);
+
+  for (const label of candidateLabels) {
+    if (sharesDayArea(label, ownerAreaLabel)) continue; // the owner's own area / an alias of it
+    if (!resolveTextualAreaMatch(text, label)) continue; // the item's text does not name THIS area
+    const anchor = areaAnchors.get(label);
+    if (!anchor) continue;
+    const otherDistanceKm = haversineKm(anchor.lat, anchor.lon, placeLat, placeLon);
+    if (otherDistanceKm < ownDistanceKm) return { matched: true, areaLabel: label };
+  }
+  return { matched: false };
 }
 
 /**
@@ -1913,10 +2114,13 @@ export function pickNearbyMealRecommendation(
   // graceful synthetic placeholder for exactly this case
   // (buildFallbackMealPlaceholder); this now returns null and lets it be
   // used instead of ever placing a genuinely wrong-city meal.
+  // A meal is never justified by day-trip exemption logic (spec §I "category
+  // must not grant geographic privilege" — the same principle applies to
+  // day TYPE here: nobody plans a genuine day trip purely to eat somewhere
+  // far away) — always judged by real distance to this day's own anchors,
+  // regardless of how the day itself is classified.
   const geographicallyCompatible = candidates.filter((recommendation) =>
-    isCandidateGeographicallyCompatibleWithDay(recommendation, day.items, {
-      isDayTripDay: isDayTripDay(day),
-    })
+    isCandidateGeographicallyCompatibleWithDay(recommendation, day.items, {})
   );
 
   const ranked = geographicallyCompatible
@@ -3063,6 +3267,12 @@ export function buildReplacementItem(
     lat: coords.lat,
     lon: coords.lon,
     recommendationId: recommendation.id,
+    // Round 5 — this is now a REAL resolved venue (name + coordinates +
+    // recommendationId from the pool). Clear any synthetic marker the
+    // slot it replaced was carrying (e.g. a meal_opportunity placeholder),
+    // so downstream classifiers do not keep treating a real restaurant as
+    // synthetic and blow it away on the next ownership-normalization pass.
+    itemRole: "real_place",
   };
 }
 
@@ -3254,6 +3464,21 @@ export function pickReplacementRecommendation(args: {
   nextStop?: AiGeneratedItem | null;
   /** Locality-first architecture: a destination-mobility-profile-derived radius, when the caller has one, instead of the fixed worldwide default. */
   maxDistanceKm?: number;
+  /**
+   * Root-cause fix (real 43-day US replay: Yellowstone/Yosemite/Grand
+   * Canyon/Mount Rushmore surviving on Austin/New Orleans/Seattle days) —
+   * isCandidateGeographicallyCompatibleWithDay falls back to "anything is
+   * compatible" whenever the day being repaired has ZERO other items with
+   * real coordinates (the exact shape of a day whose only real content IS
+   * the violating item itself, everything else a synthetic meal/free-time
+   * placeholder). That fallback let the day-trip-national-park items get
+   * RE-SELECTED as their own "repair" with no geographic constraint at
+   * all. Passing the day's own real stay anchor here (when the caller has
+   * one — enforceNormalDayLocality and enforceTransportRoleGuard both do)
+   * guarantees the hard geographic gate always has at least one real
+   * reference point, even when the day's own items don't.
+   */
+  stayAreaAnchor?: { lat: number; lon: number } | null;
   /** Observability only (spec "ONE AUTHORITATIVE TRACE HELPER") — the caller's own repair identity; every call site should pass its real one, "other_existing_path" is only the fallback for one that doesn't yet. */
   traceSource?: PlaceInsertionSource;
 }) {
@@ -3276,6 +3501,63 @@ export function pickReplacementRecommendation(args: {
   const anchor =
     args.anchor ?? getRelevantMealAnchors(dayExcludingTarget, args.item.slot).anchor ?? getPrimaryAnchor(dayExcludingTarget);
   const nextStop = args.nextStop ?? getRelevantMealAnchors(dayExcludingTarget, args.item.slot).nextAnchor ?? null;
+
+  // Root-cause fix (real 43-day US replay, Round 3: "Virginia"-labelled
+  // phases whose anchor could not be resolved — see refineTripFrameWithGemini
+  // relabel bug). isCandidateGeographicallyCompatibleWithDay's own "no
+  // anchors -> anything is compatible" fallback let the just-released
+  // illegal place (or an equally-distant one) win the ranking straight
+  // back into the day whenever the hard geographic filter had nothing to
+  // check against. The reference the filter uses, in priority order:
+  //   1. args.stayAreaAnchor (the day's real stay/phase anchor) — the
+  //      normal path; enforceNormalDayLocality / enforceTransportRoleGuard
+  //      / the final gates all pass it.
+  //   2. this day's OWN other coordinate-bearing items (dayExcludingTarget).
+  //   3. the coordinates of the item being replaced itself — ONLY as a
+  //      last resort for a single-item day with no stay anchor (e.g. Live
+  //      Trip Mode's "swap this one closed place for a nearby one"), where
+  //      "near where it was" is genuinely the only and correct signal.
+  //      Never used when a stay anchor exists (that would reintroduce the
+  //      "flagged far item anchors its own replacement" bug this exclusion
+  //      was built to prevent).
+  // If none of the three exists, there is nothing to verify a real
+  // replacement against — return no replacement so the caller falls
+  // through to a synthetic FreeTimeBlock ("if zero legal unused POIs
+  // remain: use FreeTimeBlock; do NOT reinsert an illegal real place").
+  const dayItemsHaveCoordinates = dayExcludingTarget.items.some((entry) => entry.lat != null && entry.lon != null);
+  // The self-anchor last resort is ONLY safe on a normal day, where the
+  // item being replaced sits at (or near) the day's base — "near where it
+  // was" then genuinely means "near base". On a day-trip day the excursion
+  // item is DELIBERATELY far from base, so a replacement near it is
+  // equally unverifiable; that case must fail closed (return null ->
+  // FreeTimeBlock) rather than guess.
+  const lastResortSelfAnchor =
+    !args.stayAreaAnchor &&
+    !dayItemsHaveCoordinates &&
+    !isDayTripDay(dayExcludingTarget) &&
+    args.item.lat != null &&
+    args.item.lon != null
+      ? { lat: args.item.lat, lon: args.item.lon }
+      : null;
+  // When there is NO coordinate reference of any kind, the last-resort
+  // fallback is a HARD text-area filter: the candidate's own location must
+  // textually resolve to the same area as the day (its frame-synced
+  // cityRegion, or the replaced item's own location). This keeps
+  // empty-day fill / diversity passes working for a genuinely local pool
+  // while still blocking a far place whose location text names a different
+  // region — "Yellowstone / Wyoming" never resolves to a "Virginia" day.
+  // Only when even the area text is unknown is there nothing at all to go
+  // on: return no replacement -> the caller uses a synthetic FreeTimeBlock.
+  const hasCoordinateReference = Boolean(args.stayAreaAnchor) || dayItemsHaveCoordinates || Boolean(lastResortSelfAnchor);
+  const textAreaOnlyFallback = !hasCoordinateReference;
+  if (textAreaOnlyFallback && !area) {
+    return null;
+  }
+  const geographicReferenceAnchors: Array<{ lat: number | null; lon: number | null }> = [
+    ...dayExcludingTarget.items,
+    ...(args.stayAreaAnchor ? [{ lat: args.stayAreaAnchor.lat, lon: args.stayAreaAnchor.lon }] : []),
+    ...(lastResortSelfAnchor ? [lastResortSelfAnchor] : []),
+  ];
   // Spec §D — "locality_repair must never reinsert a globally used real
   // POI... even if geographically compatible, same category, same
   // ownerStay, legal pool otherwise chooses it": a hard reject at the
@@ -3302,6 +3584,12 @@ export function pickReplacementRecommendation(args: {
     .filter((candidate) => !includesAnyKeyword(`${candidate.name} ${candidate.location}`, args.profile.avoidKeywords))
     .filter((candidate) => !isAccessibilityConflict(candidate, args.payload))
     .filter((candidate) => !isDietaryConflict(candidate, args.profile))
+    // Round 3 — no coordinate reference of any kind exists for this day
+    // (no stay anchor, no coordinate items, no usable self-anchor). The
+    // ONLY remaining signal is the candidate's own location TEXT vs the
+    // day's area: require a positive whole-word area match, never "no
+    // anchors -> anything goes".
+    .filter((candidate) => !textAreaOnlyFallback || resolveTextualAreaMatch(candidate.location, area))
     // Generic worldwide architecture (Phase 5/14): a HARD reject, not just
     // a scoring penalty — a candidate that scoreRouteProximity would rank
     // well on other dimensions could still be genuinely in a different
@@ -3309,11 +3597,40 @@ export function pickReplacementRecommendation(args: {
     // every existing item's real coordinates, not just the immediate
     // anchor, so it still catches a mismatch even when the "anchor" happens
     // to be the one out-of-place item itself.
+    //
+    // Root-cause fix (real 43-day US replay) — dayExcludingTarget.items
+    // alone is EMPTY of real coordinates on a day whose only real content
+    // was the very item being repaired (a lone national park amid
+    // synthetic meal/free-time placeholders). Without a real anchor here,
+    // isCandidateGeographicallyCompatibleWithDay's own "no anchors at all"
+    // fallback treats every candidate as compatible — including the
+    // violating place itself, or an equally far one — which is exactly how
+    // the repair silently re-selected its own violation. args.stayAreaAnchor
+    // (the day's real stay/phase anchor, when the caller has one) is added
+    // as a real reference point so that fallback is never reached merely
+    // because THIS day's own items happen to have no coordinates.
     .filter((candidate) =>
-      isCandidateGeographicallyCompatibleWithDay(candidate, dayExcludingTarget.items, {
-        isDayTripDay: isDayTripDay(dayExcludingTarget),
-        maxDistanceKm: args.maxDistanceKm,
-      })
+      isCandidateGeographicallyCompatibleWithDay(
+        candidate,
+        geographicReferenceAnchors,
+        {
+          maxDistanceKm: args.maxDistanceKm,
+          dayTripContext: isDayTripDay(dayExcludingTarget)
+            ? {
+                baseAnchor:
+                  anchor && anchor.lat != null && anchor.lon != null
+                    ? { lat: anchor.lat, lon: anchor.lon }
+                    : args.stayAreaAnchor ?? lastResortSelfAnchor ?? null,
+                mobilityProfile: {
+                  tier: "medium",
+                  localityRadiusKm: args.maxDistanceKm ?? CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM,
+                  normalDayTravelBudgetMinutes: args.profile.dailyCapacityMinutes,
+                },
+                dailyCapacityMinutes: args.profile.dailyCapacityMinutes,
+              }
+            : undefined,
+        }
+      )
     )
     .sort((left, right) => {
       const leftAreaScore =
@@ -3718,11 +4035,14 @@ export function diversifyActivities(
       // fix isn't automatic here: the item actually being swapped out
       // must be excluded from the comparison set itself, or a candidate
       // close only to IT could still pass.
+      // Spec §I — a diversity/quota rebalance is never a day-trip
+      // justification either; always judged by real distance to this
+      // day's own remaining anchors.
       .filter((recommendation) =>
         isCandidateGeographicallyCompatibleWithDay(
           recommendation,
           day.items.filter((entry) => entry !== replaceableEntry.item),
-          { isDayTripDay: isDayTripDay(day) }
+          {}
         )
       )
       .sort((left, right) => {
@@ -3887,7 +4207,21 @@ export function fixOverloadedDays(
       attempts += 1;
       const movableIndex = [...currentDay.items]
         .map((item, index) => ({ item, index }))
-        .filter(({ item }) => !isFoodItem(item.category) && !item.locked && !item.fixedTime)
+        // Root-cause fix (real 43-day US replay: a "New York" day's stay-
+        // transition item read "Miami Beach -> Orlando" — completely
+        // unrelated to New York) — the real, structurally-marked ground
+        // transfer (isStayTransitionItem) is a genuine, day-specific
+        // logistics event, not a flexible activity: it is NOT locked or
+        // fixedTime (buildStayTransitionItem sets both false), and its
+        // often-large travelMinutes made it consistently score HIGHEST in
+        // the eviction sort below, getting physically relocated up to two
+        // days forward by moveOverflowItem — landing on a day it has
+        // nothing to do with, invisible to every later gate because none
+        // of them re-scan for a transition marker on a day that isn't
+        // itself currently a transfer day. It must never be moved off the
+        // one day it's structurally tied to; if that day is still
+        // overloaded, something else has to give.
+        .filter(({ item }) => !isFoodItem(item.category) && !item.locked && !item.fixedTime && !isStayTransitionItem(item))
         .sort((left, right) => {
           const priorityDelta = priorityRemovalWeight(left.item.priority) - priorityRemovalWeight(right.item.priority);
           if (priorityDelta !== 0) return priorityDelta;
@@ -4073,7 +4407,7 @@ export function ensureWeatherBackup(
         // day's route — it must belong to the same area as everything
         // else in the day, not just be the first indoor place anywhere in
         // the whole country's candidate pool.
-        isCandidateGeographicallyCompatibleWithDay(candidate, day.items, { isDayTripDay: isDayTripDay(day) })
+        isCandidateGeographicallyCompatibleWithDay(candidate, day.items, {})
     );
     if (!indoorBackup) return day;
 
@@ -4440,7 +4774,7 @@ function buildTransitionMarker(fromBase: string, toBase: string): string {
   return `transition:${fromBase}->${toBase}`;
 }
 
-function buildStayTransitionItem(transition: StayTransition): AiGeneratedItem {
+export function buildStayTransitionItem(transition: StayTransition): AiGeneratedItem {
   const modeLabel = TRANSPORT_MODE_LABELS_HE[transition.transportMode];
   const duration = Math.max(transition.estimatedTravelMinutes ?? 60, 15);
 
@@ -4495,6 +4829,45 @@ export function enforceStayTransitions(
 ): { days: AiGeneratedDay[]; impossibleStayTransitionDetails: ImpossibleStayTransition[] } {
   const impossibleStayTransitionDetails: ImpossibleStayTransition[] = [];
   const mutableDays = [...days];
+  const transitionByDayNumber = new Map(transitions.map((transition) => [transition.dayNumber, transition]));
+
+  // Root-cause fix (real 43-day US replay: a "New York" day's item read
+  // "Miami Beach -> Orlando", a "New Orleans" day's item read
+  // "Pennsylvania -> West Virginia") — the OLD stale-marker cleanup below
+  // only ever ran for days CURRENTLY in `transitions` (i.e. days this
+  // function is about to (re)insert a transition into). A marked item
+  // stranded on some OTHER day — moved there by fixOverloadedDays'
+  // eviction sort (now separately fixed to never select a transition item
+  // at all, but this sweep is the real, general-purpose backstop), or left
+  // behind after attemptStayStructureRepair changed which days are
+  // transfer days at all, or never cleaned up because its own
+  // (now-fixed) duplicate-area-label transition computed 0 minutes and
+  // was skipped by the `requiredMinutes<=0` guard below — was invisible to
+  // every other gate (enforceTransportRoleGuard/enforceFinalPlaceLegalityGate
+  // both structurally exempt a real transition marker; enforceNormalDayLocality
+  // excludes category "transportation" from its real-place checks). A
+  // transition marker only ever means anything on the ONE day it names —
+  // this sweep runs over EVERY day, independent of the insertion loop
+  // below, and removes any marker that doesn't match THAT day's own
+  // current (possibly nonexistent) transition. Only this function ever
+  // sets the marker, so there's no ambiguity about whose content it is; a
+  // transportation item with no marker at all (Gemini's own real content)
+  // is never touched here.
+  for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
+    const day = mutableDays[dayIndex];
+    const ownTransition = transitionByDayNumber.get(day.dayNumber);
+    const ownMarker = ownTransition ? buildTransitionMarker(ownTransition.fromBase, ownTransition.toBase) : null;
+    const staleMarkedItems = day.items.filter(
+      (item) => item.canonicalPlaceId.startsWith("transition:") && item.canonicalPlaceId !== ownMarker
+    );
+    if (staleMarkedItems.length > 0) {
+      mutableDays[dayIndex] = fillDerivedDayFields(
+        resequenceDayItems(normalizeDayCollections({ ...day, items: day.items.filter((item) => !staleMarkedItems.includes(item)) })),
+        payload,
+        profile
+      );
+    }
+  }
 
   for (const transition of transitions) {
     const requiredMinutes = transition.estimatedTravelMinutes;
@@ -4502,26 +4875,8 @@ export function enforceStayTransitions(
 
     const dayIndex = mutableDays.findIndex((day) => day.dayNumber === transition.dayNumber);
     if (dayIndex === -1) continue;
-    let day = mutableDays[dayIndex];
-
-    // Section Q — a marked item from an EARLIER structural repair pass
-    // (spec §A) whose fromBase/toBase no longer matches the current
-    // TripFrame is demonstrably stale (only this function ever sets this
-    // marker, so there's no ambiguity about whose content it is) — the
-    // exact real bug: "day base = Mitzpe Ramon, transportation item =
-    // Tel Aviv → Jerusalem" surviving a stay-structure change. Removed and
-    // rebuilt from the FINAL frame below. A transportation item with no
-    // marker at all (Gemini's own real content) is never touched here —
-    // only ever a candidate for the OTHER geographic repair passes, never
-    // deleted outright by this one.
+    const day = mutableDays[dayIndex];
     const currentMarker = buildTransitionMarker(transition.fromBase, transition.toBase);
-    const staleMarkedItems = day.items.filter(
-      (item) => item.canonicalPlaceId.startsWith("transition:") && item.canonicalPlaceId !== currentMarker
-    );
-    if (staleMarkedItems.length > 0) {
-      day = { ...day, items: day.items.filter((item) => !staleMarkedItems.includes(item)) };
-      mutableDays[dayIndex] = day;
-    }
 
     // Only MY OWN marker for this exact pair counts as "already
     // represented" — a Gemini-authored transport item (unmarked) is real
@@ -4629,7 +4984,18 @@ export function attemptStayStructureRepair(
 
 function alignDaysToTripFrame(days: AiGeneratedDay[], tripFrame: TripFrame): AiGeneratedDay[] {
   return days.map((day) => {
-    if (isIntercityTransferDay(day)) return day;
+    // Root-cause fix (real replay: a "New York" day whose transition item
+    // read "Miami Beach -> Orlando" kept that wrong cityRegion). The old
+    // check was `isIntercityTransferDay(day)` — a TEXT heuristic over the
+    // day's own title/notes/transportSegments, and transportSegments is
+    // itself SYNTHESIZED from the day's items (fillDerivedDayFields), so a
+    // stray transition item or an airport item made the day "look like" a
+    // transfer day and exempt itself from the very correction that would
+    // fix it. deriveDayType is structural: a day is a transfer only when
+    // its TripFrame phase differs from the previous day's phase, never
+    // because of what text its items happen to contain.
+    const derivedDayType = deriveDayType(day, tripFrame, null);
+    if (derivedDayType === "transfer") return day;
     const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
     if (!phase) return day;
     if (sharesDayArea(day.cityRegion || day.accommodation, phase.areaLabel)) return day;
@@ -4647,6 +5013,99 @@ function alignDaysToTripFrame(days: AiGeneratedDay[], tripFrame: TripFrame): AiG
       accommodation:
         day.accommodation && day.accommodation.trim() ? day.accommodation : `לינה נוחה באזור ${phase.areaLabel}`,
     };
+  });
+}
+
+/**
+ * Spec "ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER" (Round 4) — the
+ * single place that binds every day to its canonical TripFrame owner and
+ * makes ALL presentation/content fields derive from it:
+ *   - day.phaseId        := findFramePhaseForDay(...).id
+ *   - day.cityRegion     := phase.areaLabel        (display owner)
+ *   - day.accommodation  := "לינה נוחה באזור <phase.areaLabel>"  (lodging owner)
+ *   - day.title          := "יום N ב<phase.areaLabel>"          (title owner)
+ *   - every SYNTHETIC item's area label (free-time / meal-opportunity /
+ *     transit-practical) := phase.areaLabel — regenerated from the canonical
+ *     builder, never string-patched.
+ *
+ * Runs on the FINAL frame, for EVERY day type. A transfer day's owner is
+ * its destination phase (where the traveller sleeps that night); the
+ * "from → to" information lives on the structural transition item, not on
+ * the day's display/lodging fields. A day-trip day's owner stays the base
+ * — the excursion is visible through its own real item, and lodging/display
+ * both remain the base, so "display owner == lodging owner == structural
+ * owner" holds for every day type.
+ *
+ * A field is left alone only when it already `sharesDayArea` with the
+ * owner (a real hotel name in the right city, an AI title already naming
+ * the right area) — otherwise it is rewritten. Real items are never
+ * touched here (their geography is the gates' job); only synthetic items,
+ * whose area label is pure presentation, are re-derived.
+ */
+export function normalizeDayOwnershipToFrame(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  const otherPhaseLabels = tripFrame.phases.map((phase) => phase.areaLabel);
+
+  return days.map((day) => {
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    if (!phase) return day; // no structural owner to bind to — never block on missing structure
+    const ownerLabel = phase.areaLabel;
+
+    const cityRegion = sharesDayArea(day.cityRegion, ownerLabel) ? day.cityRegion : ownerLabel;
+    const accommodation = phraseNamesArea(day.accommodation, ownerLabel)
+      ? day.accommodation
+      : `לינה נוחה באזור ${ownerLabel}`;
+    const title = phraseNamesArea(day.title, ownerLabel) ? day.title : `יום ${day.dayNumber} ב${ownerLabel}`;
+
+    // Round 5 — the day's narrative (day.notes, printed under the PDF
+    // header) is a template string of the shape "... היום בנוי סביב <area>
+    // ...". It is written once (Gemini or the fallback builder) and never
+    // re-derived. When it positively names a DIFFERENT TripFrame phase's
+    // area than this day's owner, regenerate it from the canonical
+    // owner-anchored template — not a free-text search/replace.
+    const notesNamesForeignArea = otherPhaseLabels.some(
+      (label) => !sharesDayArea(label, ownerLabel) && phraseNamesArea(day.notes, label)
+    );
+    const notes =
+      notesNamesForeignArea || (day.notes.includes("בנוי סביב") && !phraseNamesArea(day.notes, ownerLabel))
+        ? `היום בנוי סביב ${ownerLabel} כדי לשמור על קצב טבעי, אוכל קרוב ומעברים הגיוניים.`
+        : day.notes;
+
+    const boundDay: AiGeneratedDay = { ...day, phaseId: phase.id, cityRegion, accommodation, title, notes };
+
+    const ownerBaked = { ...boundDay, cityRegion: ownerLabel };
+    let itemsChanged = false;
+    const items = boundDay.items.map((item) => {
+      // Round 5 — a GENERIC meal-opportunity placeholder (role-tagged OR a
+      // coordinate-less unmatched Gemini restaurant OR a placeholder whose
+      // itemRole was dropped on a save round-trip) carries only a
+      // presentation area label. Regenerate it from the canonical owner —
+      // this wipes a stale "Blue Bottle Coffee / San Francisco" name on an
+      // LA-owned day and replaces it with an LA meal-opportunity block.
+      if (isGenericMealOpportunity(item) || item.itemRole === "free_time") {
+        const rebuilt = buildFreeExplorationReplacement(item, ownerBaked);
+        itemsChanged = true;
+        return { ...rebuilt, slot: item.slot, plannedStartTime: item.plannedStartTime };
+      }
+      if (!isSyntheticScheduleItem(item)) return item; // a real, verifiable venue — the gates' job, not this pass's
+      // transit_practical / other synthetic: name+description are generic
+      // (no embedded area) — only the location tag + mapLink carry an area.
+      if (!sharesDayArea(item.location, ownerLabel)) {
+        itemsChanged = true;
+        return { ...item, location: ownerLabel, mapLink: buildMapLink(ownerLabel, null, null) };
+      }
+      return item;
+    });
+
+    const next: AiGeneratedDay =
+      itemsChanged || cityRegion !== day.cityRegion || notes !== day.notes ? { ...boundDay, items } : boundDay;
+    return itemsChanged
+      ? fillDerivedDayFields(resequenceDayItems(normalizeDayCollections(next)), payload, profile)
+      : next;
   });
 }
 
@@ -5570,8 +6029,22 @@ export function enforceNormalDayLocality(
           }
         } else {
           const tooFarFromBase = distanceFromOwnKm > mobilityProfile.localityRadiusKm;
+          // Round 6 — a coordinate-having POI whose OWN location text
+          // positively names a different, genuinely-separate known area is
+          // "somewhere else" even when the single trip-wide radius (120 km
+          // on the sparse tier) happens to accept the raw kilometres. This
+          // is the coordinate-having twin of the text check in the
+          // isRealCandidateSlot branch below — the Smithsonian ("Washington,
+          // DC") on a "West Virginia" day, at ~100 km, is the exact shape.
+          const namesElsewhere =
+            isScheduledRealPlace(item) &&
+            realPlaceNamesADifferentKnownArea(effectiveLat, effectiveLon, item.location, phase.areaLabel, ownAnchor, areaAnchors, tripFrame).matched;
           if (belongsToAnotherStay) violationReason = "belongs_to_another_stay";
           else if (tooFarFromBase) violationReason = "too_far_from_base";
+          else if (namesElsewhere) {
+            violationReason = "belongs_to_another_stay";
+            note = `location text "${item.location}" names a different known area than this day's own stay (${phase.areaLabel})`;
+          }
         }
       } else if (isRealCandidateSlot) {
         // Section "GEMINI ITEMS ARE BYPASSING GEOGRAPHIC VALIDATION" §2/§4/
@@ -5584,24 +6057,32 @@ export function enforceNormalDayLocality(
         // area label already goes through.
         //
         // Spec "GEOGRAPHIC CORRECTNESS REDESIGN" §4/§10 — "geography
-        // should be proven, not presumed": on a NORMAL day, an unresolved
-        // item with NO location text at all is no longer given a free
-        // pass just because it can't be textually disproven — unproven
-        // geography on a normal day is itself the defect. Day-trip/
-        // transfer days keep the lighter rule (a positive match to a
-        // DIFFERENT modeled stay only) — those day types are explicitly
-        // *supposed* to have real content away from base, so "did not
-        // resolve, no text at all" is not by itself suspicious there the
-        // way it is on a normal day; a full real travel-time/value-ratio
-        // feasibility check (never applied only to this quick rule) is
-        // deferred (see final report).
+        // should be proven, not presumed": an unresolved item with NO real
+        // coordinates is no longer given a free pass just because it can't
+        // be textually DISPROVEN — unproven geography is itself the
+        // defect, on EVERY day type. This closes the previously-deferred
+        // gap (real 43-day US replay: Yellowstone/Yosemite/Grand Canyon/
+        // Mount Rushmore each landed on a day_trip/transfer-classified day
+        // with no real coordinates and a Hebrew location string that
+        // matched no known stay's area label — so the old
+        // "isExemptDayType ? positively matches ANOTHER stay : doesn't
+        // match its own" rule found neither condition true and silently
+        // passed). A day-trip/transfer label is real permission to be away
+        // from base — but ONLY when that can be verified against real
+        // coordinates (the branch above, which still does a full
+        // evaluateDayTripFeasibility/evaluateTransferDetourFeasibility
+        // check); it was never meant to be permission to skip verification
+        // entirely just because coordinates happen to be missing. A
+        // coordinate-less item is therefore judged the exact same way
+        // regardless of day type: legal only if its own location text
+        // positively matches THIS day's own stay.
         const itemLocation = item.location.trim();
         const matchesOwnArea = itemLocation ? resolveTextualAreaMatch(itemLocation, phase.areaLabel) : false;
         const matchedOtherPhase = itemLocation
           ? tripFrame.phases.find((otherPhase) => otherPhase !== phase && resolveTextualAreaMatch(itemLocation, otherPhase.areaLabel))
           : undefined;
 
-        const isViolation = isExemptDayType ? Boolean(matchedOtherPhase) : !matchesOwnArea;
+        const isViolation = !matchesOwnArea;
         if (isViolation) {
           violationReason = "unverified_region_mismatch";
           note = matchedOtherPhase
@@ -5639,6 +6120,7 @@ export function enforceNormalDayLocality(
         profile,
         usageState,
         maxDistanceKm: mobilityProfile.localityRadiusKm,
+        stayAreaAnchor: ownAnchor ?? null,
       });
       const nextItem = replacement
         ? buildReplacementItem(replacement, item, mutableDay, payload)
@@ -5727,11 +6209,27 @@ export interface GeographyDiagnosticsSummary {
   realItemsWithUnresolvedOwnerGeometry: number;
   /** Distinct days whose owning stay has no resolvable geographic anchor at all. */
   ownerGeometryMissingDays: number;
+  /**
+   * Spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" §H "run a pure invariant
+   * validator... there must be zero illegalScheduledRealPlaces" — real
+   * places that a geography violation was found for AND that survive into
+   * the final plan anyway (verdict "flagged_protected": a locked/fixed-time
+   * item enforceNormalDayLocality deliberately never repairs). "repaired"/
+   * "removed" verdicts mean the violation was already caught and fixed —
+   * they are NOT counted here, since nothing illegal actually survives
+   * from those. Zero is the acceptance bar; a positive count here means a
+   * real, resolved POI failed evaluateScheduledPlaceLegality's rules and
+   * is still in the plan (only ever possible for a protected item, by
+   * construction — enforceNormalDayLocality repairs/removes every other
+   * violation it finds).
+   */
+  illegalScheduledRealPlaces: number;
 }
 
 export function summarizeGeographyDiagnostics(diagnostics: DayGeographyDiagnostic[]): GeographyDiagnosticsSummary {
   let realItemsWithNullLegGeometry = 0;
   let realItemsWithUnresolvedOwnerGeometry = 0;
+  let illegalScheduledRealPlaces = 0;
   const ownerGeometryMissingDayNumbers = new Set<number>();
 
   for (const day of diagnostics) {
@@ -5744,6 +6242,9 @@ export function summarizeGeographyDiagnostics(diagnostics: DayGeographyDiagnosti
       if (item.verdictRule === "enforceNormalDayLocality: unresolved_owner_geometry") {
         realItemsWithUnresolvedOwnerGeometry += 1;
       }
+      if (item.verdict === "flagged_protected") {
+        illegalScheduledRealPlaces += 1;
+      }
     }
   }
 
@@ -5751,6 +6252,7 @@ export function summarizeGeographyDiagnostics(diagnostics: DayGeographyDiagnosti
     realItemsWithNullLegGeometry,
     realItemsWithUnresolvedOwnerGeometry,
     ownerGeometryMissingDays: ownerGeometryMissingDayNumbers.size,
+    illegalScheduledRealPlaces,
   };
 }
 
@@ -5982,8 +6484,18 @@ export function repairNormalDayTravelOutliers(
 // GUARD" — generic name patterns (English/Hebrew), never a hardcoded list
 // of specific airport/station names, matching the same convention already
 // used by TRANSFER_DAY_PATTERN/DAY_TRIP_PATTERN.
+//
+// Round 3 addition (real replay: "Chicago Union Station" surviving inside
+// a normal Chicago sightseeing day) — the earlier pattern only matched a
+// "station" preceded by an explicit mode word (train/railway/bus/metro/
+// subway). Major intercity rail terminals are very commonly named
+// "<City> Union Station" / "<City> Central Station" / "Grand Central
+// Terminal" / "<City> Penn Station" / a "transit center"/"port authority"
+// / a "<mode> terminal" — a worldwide naming convention, not a specific
+// place. The Hebrew forms also now allow the definite article ("שדה
+// התעופה", "תחנת הרכבת").
 const TRANSPORT_INFRASTRUCTURE_NAME_PATTERN =
-  /international airport|\bairport\b|train station|railway station|bus terminal|bus station|metro station|subway station|נמל תעופה|שדה תעופה|תחנת רכבת|תחנה מרכזית/i;
+  /international airport|\bairport\b|train station|railway station|\bunion station\b|\bcentral station\b|\bgrand central\b|\bpenn station\b|bus terminal|bus station|coach station|metro station|subway station|\btransit (?:center|centre|hub)\b|port authority|(?:train|rail|bus|ferry|coach|cruise|airport) terminal|נמל ?ה?תעופה|שדה ?ה?תעופה|תחנת ?ה?רכבת|תחנה מרכזית|מסוף (?:נוסעים|אוטובוסים)/i;
 
 export interface TransportRoleViolation {
   dayNumber: number;
@@ -5992,19 +6504,50 @@ export interface TransportRoleViolation {
 }
 
 /**
- * Spec "AIRPORTS ARE NOT ATTRACTIONS" — transport infrastructure (an
- * airport, station, terminal) may only occupy a normal-attraction slot
- * when it's genuinely serving a transfer role: either already categorized
- * as transportation, or on a day this codebase already classifies as an
- * intercity transfer. Anywhere else, a Gemini-authored item that's really
- * just a famous airport/station masquerading as a sightseeing stop is
- * repaired the same way any other invalid item is (real nearby candidate
- * first, free exploration second) — never removed silently, never kept.
+ * Root-cause fix (real 43-day US replay: "O'Hare International Airport"
+ * scheduled as a 09:00 Chicago activity, "Los Angeles International
+ * Airport" scheduled as an LA activity) — the ONE real, structural marker
+ * a genuinely synthesized ground-transfer item carries (buildStayTransitionItem
+ * always sets this exact prefix on canonicalPlaceId; nothing else in this
+ * codebase produces it). This is deliberately NOT `category ===
+ * "transportation"` and NOT `isIntercityTransferDay(day)` — both used to be
+ * the guard's exemption and both are defeated by circularity: Gemini (or
+ * normalizeCategory) can tag a hallucinated sightseeing-airport item
+ * "transportation" with zero real transfer context behind it, and a day's
+ * own transportSegments/notes are partly SYNTHESIZED from its own items
+ * (fillDerivedDayFields), so an airport item's own text can make
+ * isIntercityTransferDay(day) true for the very day that contains it. A
+ * real synthesized transition never even matches
+ * TRANSPORT_INFRASTRUCTURE_NAME_PATTERN in the first place (its name is
+ * "<mode>: <fromBase> → <toBase>", never an airport/station name), so
+ * requiring this marker for the exemption costs nothing on the legitimate
+ * path and closes both circular escape hatches on the illegitimate one.
+ */
+function isStayTransitionItem(item: Pick<AiGeneratedItem, "canonicalPlaceId">): boolean {
+  return item.canonicalPlaceId?.startsWith("transition:") ?? false;
+}
+
+/**
+ * Spec "AIRPORTS ARE NOT ATTRACTIONS" / "SEMANTIC ROLE GATE" — transport
+ * infrastructure (an airport, station, terminal) and accommodation (a
+ * hotel) may never occupy a generic activity slot; the ONLY legitimate
+ * transfer-role item is the one this codebase itself synthesizes
+ * (isStayTransitionItem, above) — never granted by category label or by a
+ * day's own (partly self-generated) transfer-sounding text. A hotel is
+ * judged purely by its structured category, never by name, since "hotel"
+ * is already a first-class RecommendationCategory value with no
+ * legitimate reason to appear as a day.items entry at all (accommodation
+ * lives on the stay's own accommodationLat/Lon fields, never as a
+ * scheduled activity). Anywhere a violation is found, it's repaired the
+ * same way any other invalid item is (real nearby candidate first, free
+ * exploration second) — never removed silently, never kept.
  */
 export function enforceTransportRoleGuard(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
-  profile: TripPreferenceProfile
+  profile: TripPreferenceProfile,
+  tripFrame?: TripFrame,
+  areaAnchors?: Map<string, { lat: number; lon: number } | null>
 ): { days: AiGeneratedDay[]; violations: TransportRoleViolation[] } {
   const violations: TransportRoleViolation[] = [];
   const mutableDays = [...days];
@@ -6015,11 +6558,14 @@ export function enforceTransportRoleGuard(
     const day = mutableDays[dayIndex];
     let mutableDay = day;
     let changed = false;
+    const phase = tripFrame ? findFramePhaseForDay(tripFrame, day.dayNumber) : null;
+    const stayAreaAnchor = phase && areaAnchors ? (areaAnchors.get(phase.areaLabel) ?? null) : null;
 
     for (const item of day.items) {
-      if (item.category === "transportation") continue; // already the legitimate role
-      if (!TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(item.name)) continue;
-      if (isIntercityTransferDay(day)) continue; // arrival/departure/connection context — a legitimate mention
+      const isTransportRoleMatch = TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(item.name);
+      const isHotelRoleMatch = item.category === "hotel";
+      if (!isTransportRoleMatch && !isHotelRoleMatch) continue;
+      if (isTransportRoleMatch && isStayTransitionItem(item)) continue; // the real, structurally-marked ground transfer — a legitimate mention
 
       if (isProtectedItem(item)) {
         violations.push({ dayNumber: day.dayNumber, itemName: item.name, repaired: false });
@@ -6027,14 +6573,29 @@ export function enforceTransportRoleGuard(
       }
 
       releaseItineraryUsage(usageState, item);
-      const replacement = pickReplacementRecommendation({
+      const rawReplacement = pickReplacementRecommendation({
         traceSource: "other_existing_path",
         payload,
         day: mutableDay,
         item,
         profile,
         usageState,
+        stayAreaAnchor,
       });
+      // Root-cause fix (real replay: LAX "replaced" by LAX) — pickReplacementRecommendation
+      // never applies TRANSPORT_INFRASTRUCTURE_NAME_PATTERN or a hotel-category
+      // check to its own candidate pool, and releaseItineraryUsage just
+      // freed the offending item, so the closest candidate to the stay
+      // anchor is very often the SAME airport/station/hotel. A replacement
+      // that is itself a semantic-role violation is discarded here — the
+      // day gets a synthetic free-exploration block instead, never another
+      // masquerading infrastructure item.
+      const replacement =
+        rawReplacement &&
+        !TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(rawReplacement.name) &&
+        rawReplacement.category !== "hotel"
+          ? rawReplacement
+          : null;
       const nextItem = replacement
         ? buildReplacementItem(replacement, item, mutableDay, payload)
         : buildFreeExplorationReplacement(item, mutableDay);
@@ -6052,6 +6613,575 @@ export function enforceTransportRoleGuard(
   return { days: mutableDays, violations };
 }
 
+export interface FinalPlaceLegalityViolation {
+  dayNumber: number;
+  itemName: string;
+  rule: ScheduledPlaceLegalityRule;
+  repaired: boolean;
+}
+
+/**
+ * Spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" §Step 3 "ONE AUTHORITATIVE
+ * FINAL GATE" — a genuinely independent last-mile check, run after every
+ * other repair (enforceNormalDayLocality, enforceTransportRoleGuard,
+ * ensureArrivalDepartureDayHasContent) on the EXACT days object about to
+ * be returned, using the same evaluateScheduledPlaceLegality primitive
+ * unit-tested in tests/scheduled-place-legality.test.ts — never a
+ * duplicate reimplementation, and never the day's own pre-repair state.
+ * This is deliberately NOT a replacement for enforceNormalDayLocality (its
+ * own inline day-trip/transfer detour math is the real, historically
+ * battle-tested source of truth for THOSE day types, and rewriting it
+ * risked regressing 700+ passing scenarios) — it is the belt-and-suspenders
+ * backstop the spec asks for: whatever upstream repair pass missed, has a
+ * bug in, or gets added later without threading a stay anchor through
+ * correctly, this still catches on the FINAL object before it is ever
+ * persisted or rendered.
+ *
+ * No category exemption: only synthetic items (isSyntheticScheduleItem),
+ * food (its own opening-hours/meal-spacing repairs own that class), and
+ * the two semantic-role categories enforceTransportRoleGuard just handled
+ * (transportation — including the real, structurally-marked stay
+ * transition, which legitimately connects two different anchors and is
+ * never subject to a single-stay-anchor distance rule; hotel) are skipped.
+ * Every other real item — attraction, museum, nature, restaurant does NOT
+ * apply here since it's food, hidden_gem, shopping, nightlife, family,
+ * seasonal_event, day_trip — is judged, regardless of what category label
+ * it carries, using the day's own FINAL derived day type/stay anchor/
+ * transfer context, never a stale pre-repair value.
+ */
+export function enforceFinalPlaceLegalityGate(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  arrivalDepartureWindow: ArrivalDepartureWindow | null = null
+): { days: AiGeneratedDay[]; violations: FinalPlaceLegalityViolation[] } {
+  const violations: FinalPlaceLegalityViolation[] = [];
+  const mutableDays = [...days];
+  const usageState = buildItineraryUsageState(mutableDays);
+  const dailyCapacityMinutes = deriveDailyCapacityMinutes(payload.preferences.tripPace);
+  const stayTransitions = buildStayTransitions(tripFrame, areaAnchors);
+
+  for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
+    const day = mutableDays[dayIndex];
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    if (!phase) continue; // no phase at all — same "never block on missing structure" convention as enforceNormalDayLocality
+    const stayAnchor = areaAnchors.get(phase.areaLabel) ?? null;
+    const dayType = deriveDayType(day, tripFrame, arrivalDepartureWindow);
+    const transition =
+      dayType === "transfer" ? stayTransitions.find((candidate) => candidate.dayNumber === day.dayNumber) : undefined;
+
+    let mutableDay = day;
+    let changed = false;
+
+    for (const item of day.items) {
+      // Round 6 — THE one authoritative real-place predicate. A museum, a
+      // landmark, a shopping venue, a restaurant: all judged identically.
+      if (!isScheduledRealPlace(item)) continue;
+
+      const result = evaluateScheduledPlaceLegality({
+        placeLat: item.lat,
+        placeLon: item.lon,
+        dayType,
+        stayAnchor,
+        mobilityProfile,
+        dailyCapacityMinutes,
+        visitMinutes: item.estimatedDurationMinutes,
+        transferOrigin: transition?.fromCoordinates ?? undefined,
+        transferDestination: transition?.toCoordinates ?? undefined,
+        directTransferMinutes: transition?.estimatedTravelMinutes ?? undefined,
+      });
+
+      // Round 6 — the raw-kilometre rule alone can accept a POI in an
+      // entirely different metro/region on the sparse tier (120 km). If
+      // the item's OWN location text positively names a different known
+      // area that is genuinely separate from the owner, it does not
+      // belong on this day regardless of what the single trip-wide radius
+      // says. Never applied to a transfer day (its corridor is judged by
+      // real detour math above).
+      const namesElsewhere =
+        dayType !== "transfer"
+          ? realPlaceNamesADifferentKnownArea(item.lat, item.lon, item.location, phase.areaLabel, stayAnchor, areaAnchors, tripFrame)
+          : { matched: false as const };
+      if (result.legal && !namesElsewhere.matched) continue;
+      const effectiveRule: ScheduledPlaceLegalityRule = result.legal ? "invalid_normal_day_distance" : result.rule;
+
+      if (isProtectedItem(item)) {
+        violations.push({ dayNumber: day.dayNumber, itemName: item.name, rule: effectiveRule, repaired: false });
+        continue;
+      }
+
+      releaseItineraryUsage(usageState, item);
+      const rawReplacement = pickReplacementRecommendation({
+        traceSource: "other_existing_path",
+        payload,
+        day: mutableDay,
+        item,
+        profile,
+        usageState,
+        maxDistanceKm: mobilityProfile.localityRadiusKm,
+        stayAreaAnchor: stayAnchor,
+      });
+      // Round 3 — re-validate the replacement against the SAME authoritative
+      // check before accepting it. pickReplacementRecommendation's own
+      // geographic filter can still pass a candidate (e.g. via a stale/
+      // coarse anchor) that this gate's stricter derived-day-type +
+      // evaluateScheduledPlaceLegality would reject; without this, the gate
+      // could "repair" an illegal place with another illegal place and
+      // still report repaired:true.
+      const replacement =
+        rawReplacement &&
+        evaluateScheduledPlaceLegality({
+          placeLat: rawReplacement.lat,
+          placeLon: rawReplacement.lon,
+          dayType,
+          stayAnchor,
+          mobilityProfile,
+          dailyCapacityMinutes,
+          visitMinutes: rawReplacement.estimatedDurationMinutes ?? undefined,
+          transferOrigin: transition?.fromCoordinates ?? undefined,
+          transferDestination: transition?.toCoordinates ?? undefined,
+          directTransferMinutes: transition?.estimatedTravelMinutes ?? undefined,
+        }).legal &&
+        !(dayType !== "transfer" &&
+          realPlaceNamesADifferentKnownArea(rawReplacement.lat, rawReplacement.lon, rawReplacement.location, phase.areaLabel, stayAnchor, areaAnchors, tripFrame).matched)
+          ? rawReplacement
+          : null;
+      const nextItem = replacement
+        ? buildReplacementItem(replacement, item, mutableDay, payload)
+        : buildFreeExplorationReplacement(item, mutableDay);
+      registerItineraryUsage(usageState, nextItem);
+      mutableDay = { ...mutableDay, items: mutableDay.items.map((entry) => (entry === item ? nextItem : entry)) };
+      changed = true;
+      violations.push({ dayNumber: day.dayNumber, itemName: item.name, rule: effectiveRule, repaired: true });
+    }
+
+    if (changed) {
+      mutableDays[dayIndex] = fillDerivedDayFields(resequenceDayItems(normalizeDayCollections(mutableDay)), payload, profile);
+    }
+  }
+
+  return { days: mutableDays, violations };
+}
+
+export interface FinalItineraryInvariantReport {
+  /** Real scheduled POIs that fail evaluateScheduledPlaceLegality against the FINAL day/frame. */
+  illegalScheduledRealPlaces: number;
+  /** transition:-marked items whose from/to no longer match the day's own current TripFrame phase boundary (or that sit on a non-transfer day). */
+  invalidTransitionOwnership: number;
+  /** Airports/stations/hotels occupying a generic activity slot with no structural transport/accommodation context. */
+  invalidSemanticRolePlacements: number;
+  /** Distinct days that have a real scheduled place but whose owning phase has no resolvable geographic anchor. */
+  ownerGeometryMissingDays: number;
+  /** Real scheduled POIs with no coordinates at all — geography can never be verified for them. */
+  realItemsWithNullLegGeometry: number;
+  /** Round 4 — days that map to NO TripFrame phase at all yet carry real scheduled content (no structural owner exists). */
+  dayOwnerMismatch: number;
+  /** Round 4 — days whose displayed area (cityRegion) does not share the owning phase's area label. */
+  invalidDayDisplayOwnership: number;
+  /** Round 4 — days whose lodging base (accommodation) does not share the owning phase's area label. */
+  lodgingOwnerMismatch: number;
+  /** Round 4 — synthetic items (free-time / meal-opportunity / transit-practical) whose area label does not share the owning phase's area label. */
+  syntheticOwnerMismatch: number;
+  /** Round 5 — REAL named food venues (restaurant / cafe / bar) that fail evaluateScheduledPlaceLegality against the FINAL day owner (subset of illegalScheduledRealPlaces, surfaced separately). */
+  realFoodVenueOwnerMismatch: number;
+  /**
+   * Round 6 — a purely diagnostic 3-way split of the SAME
+   * `illegalScheduledRealPlaces` total (attractions/museums/landmarks/nature/
+   * shopping/other non-food POIs vs. food venues vs. anything else real).
+   * `illegalRealAttractions + illegalRealFoodVenues + illegalRealOtherVenues
+   * === illegalScheduledRealPlaces` always. NEVER gate on these — the
+   * authoritative acceptance counter is `illegalScheduledRealPlaces`.
+   */
+  illegalRealAttractions: number;
+  illegalRealFoodVenues: number;
+  illegalRealOtherVenues: number;
+  /** Round 5 — days whose narrative text (day.notes) positively names a DIFFERENT TripFrame phase's area than the day's owner. */
+  narrativeOwnerMismatch: number;
+  /** Per-violation detail, for logging/tests — never used to gate anything. */
+  details: Array<{ dayNumber: number; itemName: string; kind: string; note?: string }>;
+}
+
+function parseTransitionMarker(canonicalPlaceId: string): { fromBase: string; toBase: string } | null {
+  if (!canonicalPlaceId.startsWith("transition:")) return null;
+  const body = canonicalPlaceId.slice("transition:".length);
+  const sep = body.indexOf("->");
+  if (sep === -1) return null;
+  return { fromBase: body.slice(0, sep), toBase: body.slice(sep + 2) };
+}
+
+/**
+ * Spec "TRIP-FRAME / DAY OWNERSHIP / FINAL GEOGRAPHY INVARIANT" §Step 5 —
+ * a PURE validator over the EXACT final itinerary. It NEVER mutates and it
+ * NEVER re-runs a repair function (the previous "diagnostic" re-ran
+ * enforceNormalDayLocality, which is a tautology). Every real scheduled
+ * place is judged by evaluateScheduledPlaceLegality against the FINAL
+ * day/frame; every transition:-marked item is judged by whether its
+ * from/to still matches the day's own current TripFrame phase boundary;
+ * every airport/station/hotel by whether it has real structural context.
+ * Acceptance requires every count to be zero. Worldwide/generic — no
+ * country, city or place name is referenced.
+ */
+export function validateFinalItineraryInvariants(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  payload: AiItineraryRequest,
+  arrivalDepartureWindow: ArrivalDepartureWindow | null = null
+): FinalItineraryInvariantReport {
+  const dailyCapacityMinutes = deriveDailyCapacityMinutes(payload.preferences.tripPace);
+  const stayTransitions = buildStayTransitions(tripFrame, areaAnchors);
+  const details: FinalItineraryInvariantReport["details"] = [];
+  let illegalScheduledRealPlaces = 0;
+  let invalidTransitionOwnership = 0;
+  let invalidSemanticRolePlacements = 0;
+  let realItemsWithNullLegGeometry = 0;
+  let dayOwnerMismatch = 0;
+  let invalidDayDisplayOwnership = 0;
+  let lodgingOwnerMismatch = 0;
+  let syntheticOwnerMismatch = 0;
+  let realFoodVenueOwnerMismatch = 0;
+  let narrativeOwnerMismatch = 0;
+  let illegalRealAttractions = 0;
+  let illegalRealFoodVenues = 0;
+  let illegalRealOtherVenues = 0;
+  // Purely diagnostic: split ONE `illegalScheduledRealPlaces` hit into exactly
+  // one of three buckets so they always sum back to the authoritative total.
+  const SIGHTSEEING_CATEGORIES = new Set<RecommendationCategory>([
+    "museum",
+    "nature",
+    "shopping",
+    "hidden_gem",
+    "seasonal_event",
+    "day_trip",
+  ]);
+  const bucketIllegalRealPlace = (item: Pick<AiGeneratedItem, "category">): void => {
+    if (isFoodItem(item.category)) illegalRealFoodVenues += 1;
+    else if (SIGHTSEEING_CATEGORIES.has(item.category)) illegalRealAttractions += 1;
+    else illegalRealOtherVenues += 1;
+  };
+  const ownerGeometryMissingDayNumbers = new Set<number>();
+  const allPhaseLabels = tripFrame.phases.map((phase) => phase.areaLabel);
+
+  for (const day of days) {
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    const previousPhase = day.dayNumber > 1 ? findFramePhaseForDay(tripFrame, day.dayNumber - 1) : null;
+    const stayAnchor = phase ? (areaAnchors.get(phase.areaLabel) ?? null) : null;
+    const dayType = deriveDayType(day, tripFrame, arrivalDepartureWindow);
+
+    // Round 4 — structural ownership consistency (spec "ONE DAY HAS ONE
+    // AUTHORITATIVE STRUCTURAL OWNER"). Display / lodging / synthetic-item
+    // area labels must all agree with the owning phase; a day with no
+    // phase at all yet carrying real content has no owner.
+    const hasRealContent = day.items.some(
+      (candidate) => !isSyntheticScheduleItem(candidate) && !isStayTransitionItem(candidate)
+    );
+    if (!phase) {
+      if (hasRealContent) {
+        dayOwnerMismatch += 1;
+        details.push({ dayNumber: day.dayNumber, itemName: "(day)", kind: "day_owner_mismatch", note: "no TripFrame phase owns this day" });
+      }
+    } else {
+      if (!sharesDayArea(day.cityRegion, phase.areaLabel)) {
+        invalidDayDisplayOwnership += 1;
+        details.push({ dayNumber: day.dayNumber, itemName: "(day)", kind: "invalid_day_display_ownership", note: `cityRegion "${day.cityRegion}" != owner "${phase.areaLabel}"` });
+      }
+      if (!phraseNamesArea(day.accommodation, phase.areaLabel)) {
+        lodgingOwnerMismatch += 1;
+        details.push({ dayNumber: day.dayNumber, itemName: "(day)", kind: "lodging_owner_mismatch", note: `accommodation "${day.accommodation}" != owner "${phase.areaLabel}"` });
+      }
+      // Round 5 — the day's narrative names a DIFFERENT phase's area.
+      if (
+        allPhaseLabels.some((label) => !sharesDayArea(label, phase.areaLabel) && phraseNamesArea(day.notes, label))
+      ) {
+        narrativeOwnerMismatch += 1;
+        details.push({ dayNumber: day.dayNumber, itemName: "(day)", kind: "narrative_owner_mismatch", note: `day.notes names an area other than owner "${phase.areaLabel}"` });
+      }
+      for (const synthetic of day.items) {
+        // Round 5 — a generic meal-opportunity placeholder whose itemRole
+        // was dropped (e.g. on a save round-trip) still reads as a synthetic
+        // area label that must match the owner.
+        if (!isSyntheticScheduleItem(synthetic) && !isGenericMealOpportunity(synthetic)) continue;
+        if (synthetic.location && !sharesDayArea(synthetic.location, phase.areaLabel)) {
+          syntheticOwnerMismatch += 1;
+          details.push({ dayNumber: day.dayNumber, itemName: synthetic.name, kind: "synthetic_owner_mismatch", note: `synthetic location "${synthetic.location}" != owner "${phase.areaLabel}"` });
+        }
+      }
+    }
+    const transition =
+      dayType === "transfer" ? stayTransitions.find((candidate) => candidate.dayNumber === day.dayNumber) : undefined;
+    // The one marker that is legitimate ON THIS DAY: the current frame's
+    // own phase boundary here, and only when this really is a transfer day.
+    const expectedMarker =
+      dayType === "transfer" && previousPhase && phase
+        ? buildTransitionMarker(previousPhase.areaLabel, phase.areaLabel)
+        : null;
+
+    for (const item of day.items) {
+      // Structural transition item — validate OWNERSHIP, not distance.
+      if (isStayTransitionItem(item)) {
+        const parsed = parseTransitionMarker(item.canonicalPlaceId);
+        if (item.canonicalPlaceId !== expectedMarker) {
+          invalidTransitionOwnership += 1;
+          details.push({
+            dayNumber: day.dayNumber,
+            itemName: item.name,
+            kind: "invalid_transition_ownership",
+            note: parsed
+              ? `marker ${parsed.fromBase} -> ${parsed.toBase} does not match this day's own frame boundary${
+                  expectedMarker ? ` (expected ${expectedMarker.slice("transition:".length)})` : " (this day is not a transfer day)"
+                }`
+              : "unparseable transition marker",
+          });
+        }
+        continue;
+      }
+
+      // Round 5/6 — a GENERIC meal-opportunity placeholder has no
+      // coordinate to judge (its owner-label consistency is checked in the
+      // day block above); every OTHER real scheduled place — museum,
+      // landmark, shopping, restaurant alike — is judged here.
+      if (isGenericMealOpportunity(item)) continue;
+      if (!isScheduledRealPlace(item) && !TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(item.name) && item.category !== "hotel" && item.category !== "transportation") continue;
+
+      // Semantic role — an airport/station/hotel in a generic activity
+      // slot. The ONLY legitimate transport-role item is the structural
+      // transition handled above; a hotel is never a day.items entry.
+      const isTransportInfraName = TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(item.name);
+      if (isTransportInfraName || item.category === "hotel" || item.category === "transportation") {
+        invalidSemanticRolePlacements += 1;
+        details.push({
+          dayNumber: day.dayNumber,
+          itemName: item.name,
+          kind: "invalid_semantic_role_placement",
+          note: item.category === "hotel"
+            ? "hotel category in a scheduled activity slot"
+            : item.category === "transportation"
+              ? "transportation-category item with no structural transition marker"
+              : "transport-infrastructure name in a scheduled activity slot with no transition context",
+        });
+        continue;
+      }
+
+      // Real named venue — restaurant / cafe / bar / attraction / museum /
+      // park alike (Round 5: `category === "food"` is NOT an exemption).
+      const isFoodVenue = isFoodItem(item.category);
+      if (item.lat == null || item.lon == null) {
+        realItemsWithNullLegGeometry += 1;
+        illegalScheduledRealPlaces += 1;
+        bucketIllegalRealPlace(item);
+        if (isFoodVenue) realFoodVenueOwnerMismatch += 1;
+        details.push({ dayNumber: day.dayNumber, itemName: item.name, kind: isFoodVenue ? "real_food_venue_null_geometry" : "real_item_null_geometry" });
+        continue;
+      }
+      if (phase && !stayAnchor) {
+        ownerGeometryMissingDayNumbers.add(day.dayNumber);
+      }
+      const result = evaluateScheduledPlaceLegality({
+        placeLat: item.lat,
+        placeLon: item.lon,
+        dayType,
+        stayAnchor,
+        mobilityProfile,
+        dailyCapacityMinutes,
+        visitMinutes: item.estimatedDurationMinutes,
+        transferOrigin: transition?.fromCoordinates ?? undefined,
+        transferDestination: transition?.toCoordinates ?? undefined,
+        directTransferMinutes: transition?.estimatedTravelMinutes ?? undefined,
+      });
+      // Round 6 — a POI whose own location text positively names a
+      // different, genuinely-separate known area is illegal even when the
+      // single trip-wide radius happens to accept the raw kilometres.
+      const namesElsewhere =
+        dayType !== "transfer" &&
+        !!phase &&
+        realPlaceNamesADifferentKnownArea(item.lat, item.lon, item.location, phase.areaLabel, stayAnchor, areaAnchors, tripFrame).matched;
+      if (!result.legal || namesElsewhere) {
+        illegalScheduledRealPlaces += 1;
+        bucketIllegalRealPlace(item);
+        if (isFoodVenue) realFoodVenueOwnerMismatch += 1;
+        const kindBase = isFoodVenue ? "illegal_real_food_venue" : "illegal_real_place";
+        details.push({ dayNumber: day.dayNumber, itemName: item.name, kind: namesElsewhere && result.legal ? `${kindBase}:names_a_different_known_area` : `${kindBase}:${result.rule}` });
+      }
+    }
+  }
+
+  return {
+    illegalScheduledRealPlaces,
+    invalidTransitionOwnership,
+    invalidSemanticRolePlacements,
+    ownerGeometryMissingDays: ownerGeometryMissingDayNumbers.size,
+    realItemsWithNullLegGeometry,
+    dayOwnerMismatch,
+    invalidDayDisplayOwnership,
+    lodgingOwnerMismatch,
+    syntheticOwnerMismatch,
+    realFoodVenueOwnerMismatch,
+    narrativeOwnerMismatch,
+    illegalRealAttractions,
+    illegalRealFoodVenues,
+    illegalRealOtherVenues,
+    details,
+  };
+}
+
+/**
+ * Spec §Step 6 "REPAIR, THEN VALIDATE" — runs the PURE validator over the
+ * final object; if anything is non-zero, applies ONE bounded, deterministic
+ * repair (remove a stale/ownerless transition marker; remove or
+ * legal-replace an illegal real place or a masquerading airport/station/
+ * hotel — a replacement is re-checked with the SAME pure per-item rules
+ * before being accepted, else a synthetic FreeTimeBlock is used); then
+ * re-runs the PURE validator. No real place is inserted after the second
+ * validation.
+ */
+export function enforceItineraryInvariantsWithRepair(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  window: ArrivalDepartureWindow
+): { days: AiGeneratedDay[]; before: FinalItineraryInvariantReport; after: FinalItineraryInvariantReport } {
+  const before = validateFinalItineraryInvariants(days, tripFrame, areaAnchors, mobilityProfile, payload, window);
+  const total =
+    before.illegalScheduledRealPlaces +
+    before.invalidTransitionOwnership +
+    before.invalidSemanticRolePlacements +
+    before.realItemsWithNullLegGeometry +
+    before.dayOwnerMismatch +
+    before.invalidDayDisplayOwnership +
+    before.lodgingOwnerMismatch +
+    before.syntheticOwnerMismatch +
+    before.realFoodVenueOwnerMismatch +
+    before.narrativeOwnerMismatch;
+  if (total === 0) {
+    return { days, before, after: before };
+  }
+
+  const dailyCapacityMinutes = deriveDailyCapacityMinutes(payload.preferences.tripPace);
+  const stayTransitions = buildStayTransitions(tripFrame, areaAnchors);
+  // Round 4 — deterministically re-bind every day to its canonical owner
+  // and re-derive display / lodging / synthetic labels BEFORE the per-item
+  // repair below, so those repairs see a structurally consistent day.
+  const mutableDays = [...normalizeDayOwnershipToFrame(days, tripFrame, payload, profile)];
+  const usageState = buildItineraryUsageState(mutableDays);
+
+  for (let dayIndex = 0; dayIndex < mutableDays.length; dayIndex += 1) {
+    const day = mutableDays[dayIndex];
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    const previousPhase = day.dayNumber > 1 ? findFramePhaseForDay(tripFrame, day.dayNumber - 1) : null;
+    const stayAnchor = phase ? (areaAnchors.get(phase.areaLabel) ?? null) : null;
+    const dayType = deriveDayType(day, tripFrame, window);
+    const transition =
+      dayType === "transfer" ? stayTransitions.find((candidate) => candidate.dayNumber === day.dayNumber) : undefined;
+    const expectedMarker =
+      dayType === "transfer" && previousPhase && phase
+        ? buildTransitionMarker(previousPhase.areaLabel, phase.areaLabel)
+        : null;
+
+    let mutableDay = day;
+    let changed = false;
+
+    for (const item of day.items) {
+      // Stale/ownerless transition marker — remove outright (the correct
+      // transition, if any, was already inserted by enforceStayTransitions).
+      if (isStayTransitionItem(item)) {
+        if (item.canonicalPlaceId !== expectedMarker) {
+          mutableDay = { ...mutableDay, items: mutableDay.items.filter((entry) => entry !== item) };
+          changed = true;
+        }
+        continue;
+      }
+      // Round 5/6 — a GENERIC meal-opportunity placeholder was already
+      // owner-normalized by normalizeDayOwnershipToFrame above; every OTHER
+      // real scheduled place (museum, landmark, shopping, restaurant) is
+      // repaired here identically via the ONE authoritative predicate.
+      if (isGenericMealOpportunity(item) || isSyntheticScheduleItem(item) || item.category === "practical") continue;
+      if (isProtectedItem(item)) continue; // reported, never force-removed
+
+      const isSemanticRoleViolation =
+        TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(item.name) ||
+        item.category === "hotel" ||
+        item.category === "transportation";
+      const namesElsewhere =
+        dayType !== "transfer" &&
+        realPlaceNamesADifferentKnownArea(item.lat, item.lon, item.location, phase ? phase.areaLabel : "", stayAnchor, areaAnchors, tripFrame).matched;
+      const isIllegalRealPlace =
+        isScheduledRealPlace(item) &&
+        (item.lat == null ||
+          item.lon == null ||
+          namesElsewhere ||
+          !evaluateScheduledPlaceLegality({
+            placeLat: item.lat,
+            placeLon: item.lon,
+            dayType,
+            stayAnchor,
+            mobilityProfile,
+            dailyCapacityMinutes,
+            visitMinutes: item.estimatedDurationMinutes,
+            transferOrigin: transition?.fromCoordinates ?? undefined,
+            transferDestination: transition?.toCoordinates ?? undefined,
+            directTransferMinutes: transition?.estimatedTravelMinutes ?? undefined,
+          }).legal);
+
+      if (!isSemanticRoleViolation && !isIllegalRealPlace) continue;
+
+      releaseItineraryUsage(usageState, item);
+      const rawReplacement = pickReplacementRecommendation({
+        traceSource: "other_existing_path",
+        payload,
+        day: mutableDay,
+        item,
+        profile,
+        usageState,
+        maxDistanceKm: mobilityProfile.localityRadiusKm,
+        stayAreaAnchor: stayAnchor,
+      });
+      const replacement =
+        rawReplacement &&
+        !TRANSPORT_INFRASTRUCTURE_NAME_PATTERN.test(rawReplacement.name) &&
+        rawReplacement.category !== "hotel" &&
+        rawReplacement.category !== "transportation" &&
+        rawReplacement.lat != null &&
+        rawReplacement.lon != null &&
+        !(dayType !== "transfer" &&
+          realPlaceNamesADifferentKnownArea(rawReplacement.lat, rawReplacement.lon, rawReplacement.location, phase ? phase.areaLabel : "", stayAnchor, areaAnchors, tripFrame).matched) &&
+        evaluateScheduledPlaceLegality({
+          placeLat: rawReplacement.lat,
+          placeLon: rawReplacement.lon,
+          dayType,
+          stayAnchor,
+          mobilityProfile,
+          dailyCapacityMinutes,
+          visitMinutes: rawReplacement.estimatedDurationMinutes ?? undefined,
+          transferOrigin: transition?.fromCoordinates ?? undefined,
+          transferDestination: transition?.toCoordinates ?? undefined,
+          directTransferMinutes: transition?.estimatedTravelMinutes ?? undefined,
+        }).legal
+          ? rawReplacement
+          : null;
+      const nextItem = replacement
+        ? buildReplacementItem(replacement, item, mutableDay, payload)
+        : buildFreeExplorationReplacement(item, mutableDay);
+      registerItineraryUsage(usageState, nextItem);
+      mutableDay = { ...mutableDay, items: mutableDay.items.map((entry) => (entry === item ? nextItem : entry)) };
+      changed = true;
+    }
+
+    if (changed) {
+      mutableDays[dayIndex] = fillDerivedDayFields(resequenceDayItems(normalizeDayCollections(mutableDay)), payload, profile);
+    }
+  }
+
+  const after = validateFinalItineraryInvariants(mutableDays, tripFrame, areaAnchors, mobilityProfile, payload, window);
+  return { days: mutableDays, before, after };
+}
+
 function finalizeArrivalDepartureContent(
   plan: AiItineraryResponse,
   payload: AiItineraryRequest,
@@ -6062,8 +7192,18 @@ function finalizeArrivalDepartureContent(
   areaAnchors: Map<string, { lat: number; lon: number } | null>,
   mobilityProfile: DestinationMobilityProfile
 ): AiItineraryResponse {
+  // Spec "ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER" (Round 4) — the
+  // FINAL pipeline order starts by binding every day to its canonical
+  // TripFrame owner and re-deriving display / lodging / synthetic-item
+  // labels from it, THEN rebuilding the required stay transitions from the
+  // FINAL frame (removing any that no longer match a real phase boundary),
+  // and only THEN running the real-POI / semantic-role / invariant gates.
+  const ownerBoundDays = normalizeDayOwnershipToFrame(plan.days, tripFrame, payload, profile);
+  const finalTransitions = buildStayTransitions(tripFrame, areaAnchors);
+  const { days: transitionRebuiltDays } = enforceStayTransitions(ownerBoundDays, finalTransitions, payload, profile);
+
   const { days: localityRepairedDays } = enforceNormalDayLocality(
-    removeFuzzyDuplicatePlaces(plan.days, payload, profile),
+    removeFuzzyDuplicatePlaces(transitionRebuiltDays, payload, profile),
     tripFrame,
     areaAnchors,
     mobilityProfile,
@@ -6074,8 +7214,69 @@ function finalizeArrivalDepartureContent(
   // Section "AIRPORTS ARE NOT ATTRACTIONS" — same final-gate position as
   // the locality check just above (spec "GEOGRAPHIC VALIDATION MUST RUN
   // AFTER ALL REPAIRS").
-  const { days: roleRepairedDays } = enforceTransportRoleGuard(localityRepairedDays, payload, profile);
-  const finalizedDays = ensureArrivalDepartureDayHasContent(roleRepairedDays, payload, profile, dayCount, window);
+  const { days: roleRepairedDays } = enforceTransportRoleGuard(localityRepairedDays, payload, profile, tripFrame, areaAnchors);
+  const arrivalRepairedDays = ensureArrivalDepartureDayHasContent(roleRepairedDays, payload, profile, dayCount, window);
+  // Spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" §Step 3 "ONE AUTHORITATIVE
+  // FINAL GATE" — the last mutation capable of adding/moving a real place
+  // in this pipeline is ensureArrivalDepartureDayHasContent just above (it
+  // only ever inserts a synthetic practical block into an EMPTY day, never
+  // a real POI, but this gate still runs after it so nothing added later
+  // could ever bypass it either). Runs on the exact object about to be
+  // costed and returned below — never a throwaway copy.
+  const { days: legalityGatedDays, violations: finalLegalityViolations } = enforceFinalPlaceLegalityGate(
+    arrivalRepairedDays,
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload,
+    profile,
+    window
+  );
+
+  // Spec "TRIP-FRAME / DAY OWNERSHIP / FINAL GEOGRAPHY INVARIANT" §Step 6 —
+  // PURE validator over the exact object, then ONE bounded deterministic
+  // repair, then the PURE validator again. This is the acceptance gate:
+  // illegalScheduledRealPlaces / invalidTransitionOwnership /
+  // invalidSemanticRolePlacements / realItemsWithNullLegGeometry must all
+  // be zero on `finalizedDays`. No real place is inserted after this.
+  const { days: finalizedDays, before: invariantBefore, after: invariantAfter } = enforceItineraryInvariantsWithRepair(
+    legalityGatedDays,
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload,
+    profile,
+    window
+  );
+  const invariantBeforeTotal =
+    invariantBefore.illegalScheduledRealPlaces +
+    invariantBefore.invalidTransitionOwnership +
+    invariantBefore.invalidSemanticRolePlacements +
+    invariantBefore.realItemsWithNullLegGeometry +
+    invariantBefore.dayOwnerMismatch +
+    invariantBefore.invalidDayDisplayOwnership +
+    invariantBefore.lodgingOwnerMismatch +
+    invariantBefore.syntheticOwnerMismatch +
+    invariantBefore.realFoodVenueOwnerMismatch +
+    invariantBefore.narrativeOwnerMismatch;
+  if (invariantBeforeTotal > 0) {
+    logGenerationStage("final itinerary invariant repair", { before: invariantBefore, after: invariantAfter });
+  }
+
+  // Spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" §Step 2/3 — the true,
+  // independent count of real places this final gate itself found illegal
+  // ON THE OBJECT ACTUALLY BEING RETURNED, never a re-run of the same
+  // repair being audited. Any entry with repaired:false is a locked/
+  // fixed-time item that survives by design (never silently dropped) —
+  // this must be visible in dev diagnostics even when it's 0, so a future
+  // regression here is never silently invisible again.
+  if (finalLegalityViolations.length > 0) {
+    logGenerationStage("final legality gate violations", {
+      total: finalLegalityViolations.length,
+      unrepairedProtected: finalLegalityViolations.filter((v) => !v.repaired).length,
+      violations: finalLegalityViolations,
+    });
+  }
 
   // Spec "מכני, לא קריאה ידנית" — a dev-only mechanical geography report,
   // never gates acceptance, never runs in production. QA_DEBUG_GEOGRAPHY=1
@@ -6949,6 +8150,7 @@ export async function generateCountryItineraryPlan(
             duplicateSources,
             ownerAnchorMissingDays: geoSummary.ownerGeometryMissingDays,
             realItemsWithNullLegGeometry: geoSummary.realItemsWithNullLegGeometry,
+            illegalScheduledRealPlaces: geoSummary.illegalScheduledRealPlaces,
             dayTypeMismatchDays,
             legalPoolExhaustionCount,
             legalPoolExhaustionReasons,

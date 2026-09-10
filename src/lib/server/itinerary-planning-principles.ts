@@ -585,6 +585,403 @@ export function reorderAreasToMinimizeBacktracking(
   return reorderedScore < originalScore ? ordered : rankedAreas;
 }
 
+// =====================================================================
+// GLOBAL ROUTE OPTIMIZATION — spec "trip-frame / stay-ordering problem,
+// not a day-level repair problem". Real 43-day US replay evidence:
+// Seattle→Washington→Seattle, Boston→Atlanta→Boston, Austin→New York→
+// Austin, Nashville→Philadelphia→Nashville — a heavy-weight area ranked
+// #1, a distant heavy-weight area ranked #2, and a THIRD area
+// geographically near #1 (but weight-ranked #3) produced exactly this
+// zig-zag, because the production order was pure weight-rank with only a
+// single greedy nearest-neighbor pass (reorderAreasToMinimizeBacktracking,
+// adopted only if it beat the ORIGINAL order — no multi-start, no local
+// search) and a narrow last-stop-only departure swap
+// (reorderAreasForDepartureFeasibility) — arrival was never considered at
+// all, and neither function detects a non-contiguous REGION revisit (only
+// a sharp 3-point local angle reversal).
+//
+// This is the ONE authoritative replacement for that reorder step at its
+// single production call site (buildDeterministicTripFrame) — the two
+// older functions above are left defined and independently tested (they
+// have real standalone test coverage and no other code should compete
+// with THIS optimizer in production), but production no longer calls them.
+// This never drops or merges a stay — it is a pure permutation optimizer
+// over whichever stays buildTripFramePhases' own significance filter
+// already selected (spec §E: never solve backtracking by deleting value).
+//
+// Architecture (spec §I): buildDeterministicTripFrame already (1) decides
+// viable overnight areas via decideClusterRole/buildTripFramePhases'
+// significance filter before this ever runs, and (since
+// allocateNightsForClusters computes each area's own night count purely
+// from its own required-content-minutes, never from its position) night
+// allocation is already order-independent — so (2) optimizing order here
+// and (3) keeping each area's already-allocated night count, just at its
+// new position, is achieved by the existing reorderPhasesByArea call
+// immediately after this, with no restructuring of the well-tested
+// buildTripFramePhases needed. (4) applyShortStayViabilityRepair and (5)
+// a post-repair invariant re-check both still run after, unchanged in
+// position.
+// =====================================================================
+
+/** A same-region reappearance within this many km of an already-left area counts as a revisit — large enough to catch a metro-area-adjacent second area (e.g. a satellite city), small enough to never conflate two genuinely different regions. Generic worldwide; never a named place. */
+export const STAY_REGION_REVISIT_RADIUS_KM = 150;
+
+/** How much extra distance (beyond the best achievable) an arrival/departure endpoint may sit at before it's flagged as a real, worth-fixing mismatch rather than an unavoidable rounding-scale difference. */
+export const ARRIVAL_DEPARTURE_MISMATCH_TOLERANCE_KM = 150;
+
+export interface StayRouteNode {
+  /** Stable id — this codebase's normalized area label, the same key areaAnchors/areaWeights are keyed by. */
+  id: string;
+  lat: number;
+  lon: number;
+  /** True only when a real, resolved anchor exists — an anchor-less node is never geometrically reordered (nothing real to compare), matching the pre-existing philosophy in reorderAreasToMinimizeBacktracking. */
+  hasAnchor: boolean;
+  /** Cluster/area significance (e.g. required-content-minutes or candidate weight) — informational for logging/reporting; a pure permutation of a FIXED node set has the same total value regardless of order, so this never discriminates between orderings by itself (see spec §H note on value preservation living in the SELECTION step, not here). */
+  value: number;
+}
+
+export interface RouteScoreWeights {
+  /** Per km of total inter-stay travel. */
+  travel: number;
+  /** Extra weight on top of `travel` for the single largest leg — discourages one huge outlier jump even when total distance is otherwise fine. */
+  maxJump: number;
+  /** Flat penalty per non-contiguous region reappearance — deliberately large: spec §F says a revisit must normally be strongly dominated by any revisit-free alternative. */
+  revisit: number;
+  /** Per km of avoidable extra distance between the arrival anchor and the first stay (0 when the closest available stay was chosen). */
+  arrivalMismatch: number;
+  /** Per km of avoidable extra distance between the departure anchor and the last stay. */
+  departureMismatch: number;
+}
+
+/** Spec §H "keep weights generic and centralized" — the one production set; a caller may pass its own for testing but never a second competing default. */
+export const DEFAULT_ROUTE_SCORE_WEIGHTS: RouteScoreWeights = {
+  travel: 1,
+  maxJump: 0.3,
+  revisit: 800,
+  arrivalMismatch: 4,
+  departureMismatch: 4,
+};
+
+export interface RouteScoreBreakdown {
+  travelCostKm: number;
+  maxJumpKm: number;
+  revisitCount: number;
+  arrivalMismatchKm: number;
+  departureMismatchKm: number;
+  total: number;
+}
+
+/** Union-find grouping by mutual proximity — the SAME generic radius-based idea used elsewhere in this codebase for geographic compatibility, never a named-place lookup. */
+function groupStayNodesByRegion(nodes: StayRouteNode[], radiusKm: number): number[] {
+  const parent = nodes.map((_, index) => index);
+  function find(x: number): number {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+  function union(a: number, b: number) {
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA !== rootB) parent[rootA] = rootB;
+  }
+  for (let i = 0; i < nodes.length; i += 1) {
+    for (let j = i + 1; j < nodes.length; j += 1) {
+      if (haversineKm(nodes[i].lat, nodes[i].lon, nodes[j].lat, nodes[j].lon) <= radiusKm) {
+        union(i, j);
+      }
+    }
+  }
+  return nodes.map((_, index) => find(index));
+}
+
+/**
+ * Spec §F "generic revisit/backtracking penalty" — counts every time the
+ * route returns to a region it had already left (any earlier CONTIGUOUS
+ * block of the same region-group, followed by at least one stay from a
+ * DIFFERENT region-group, followed by this region-group again). Zero for
+ * a genuinely coherent A→B→C progression, or for a region visited in one
+ * single contiguous block regardless of how many stays it contains.
+ * Deliberately distinct from detectBacktracking above (a local 3-point
+ * angle check) — this catches a revisit even across several intervening
+ * stays, which a purely local angle check structurally cannot.
+ */
+export function countRegionRevisits(
+  sequence: StayRouteNode[],
+  radiusKm: number = STAY_REGION_REVISIT_RADIUS_KM
+): number {
+  if (sequence.length < 3) return 0;
+  const regionIds = groupStayNodesByRegion(sequence, radiusKm);
+  const closedRegions = new Set<number>();
+  let revisits = 0;
+  let i = 0;
+  while (i < sequence.length) {
+    const region = regionIds[i];
+    if (closedRegions.has(region)) revisits += 1;
+    let j = i;
+    while (j + 1 < sequence.length && regionIds[j + 1] === region) j += 1;
+    closedRegions.add(region);
+    i = j + 1;
+  }
+  return revisits;
+}
+
+/**
+ * Spec §H "make the route score explicit and testable" — the ONE
+ * objective function both the optimizer below and its own tests use.
+ * Lower is better. arrivalMismatch/departureMismatch are "regret" terms
+ * (extra distance versus the best achievable choice within this SAME
+ * node set), not raw distance — a trip that is simply far from the
+ * airport everywhere never gets punished for geography it can't change,
+ * only for choosing a WORSE stay than one already available to it.
+ */
+export function scoreStayRoute(
+  sequence: StayRouteNode[],
+  arrivalAnchor: { lat: number; lon: number } | null,
+  departureAnchor: { lat: number; lon: number } | null,
+  weights: RouteScoreWeights = DEFAULT_ROUTE_SCORE_WEIGHTS
+): RouteScoreBreakdown {
+  let travelCostKm = 0;
+  let maxJumpKm = 0;
+  for (let i = 0; i < sequence.length - 1; i += 1) {
+    const legKm = haversineKm(sequence[i].lat, sequence[i].lon, sequence[i + 1].lat, sequence[i + 1].lon);
+    travelCostKm += legKm;
+    if (legKm > maxJumpKm) maxJumpKm = legKm;
+  }
+
+  const revisitCount = countRegionRevisits(sequence);
+
+  let arrivalMismatchKm = 0;
+  if (arrivalAnchor && sequence.length > 0) {
+    const firstDistanceKm = haversineKm(arrivalAnchor.lat, arrivalAnchor.lon, sequence[0].lat, sequence[0].lon);
+    const bestPossibleKm = Math.min(
+      ...sequence.map((node) => haversineKm(arrivalAnchor.lat, arrivalAnchor.lon, node.lat, node.lon))
+    );
+    arrivalMismatchKm = Math.max(0, firstDistanceKm - bestPossibleKm);
+  }
+
+  let departureMismatchKm = 0;
+  if (departureAnchor && sequence.length > 0) {
+    const lastNode = sequence[sequence.length - 1];
+    const lastDistanceKm = haversineKm(departureAnchor.lat, departureAnchor.lon, lastNode.lat, lastNode.lon);
+    const bestPossibleKm = Math.min(
+      ...sequence.map((node) => haversineKm(departureAnchor.lat, departureAnchor.lon, node.lat, node.lon))
+    );
+    departureMismatchKm = Math.max(0, lastDistanceKm - bestPossibleKm);
+  }
+
+  const total =
+    weights.travel * travelCostKm +
+    weights.maxJump * maxJumpKm +
+    weights.revisit * revisitCount +
+    weights.arrivalMismatch * arrivalMismatchKm +
+    weights.departureMismatch * departureMismatchKm;
+
+  return { travelCostKm, maxJumpKm, revisitCount, arrivalMismatchKm, departureMismatchKm, total };
+}
+
+function nearestNeighborConstruct(nodes: StayRouteNode[], seedIndex: number): StayRouteNode[] {
+  const remaining = nodes.map((_, index) => index).filter((index) => index !== seedIndex);
+  const order = [seedIndex];
+  while (remaining.length > 0) {
+    const lastNode = nodes[order[order.length - 1]];
+    let bestIndex = remaining[0];
+    let bestDistance = Infinity;
+    for (const candidateIndex of remaining) {
+      const distance = haversineKm(lastNode.lat, lastNode.lon, nodes[candidateIndex].lat, nodes[candidateIndex].lon);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = candidateIndex;
+      }
+    }
+    order.push(bestIndex);
+    remaining.splice(remaining.indexOf(bestIndex), 1);
+  }
+  return order.map((index) => nodes[index]);
+}
+
+function twoOptSwap(sequence: StayRouteNode[], i: number, j: number): StayRouteNode[] {
+  return [...sequence.slice(0, i), ...sequence.slice(i, j + 1).reverse(), ...sequence.slice(j + 1)];
+}
+
+/**
+ * Spec §G "nearest-neighbor + 2-opt... bounded, deterministic, no
+ * expensive unbounded TSP solver". Bounded by construction: at most
+ * MAX_TWO_OPT_PASSES full O(n^2) sweeps, each trial scored in O(n) — for
+ * the realistic n (a trip's own overnight base count, capped at the
+ * bucket table's own maxBases of 10), this is at most a few thousand
+ * scoring calls, not an unbounded search.
+ */
+const MAX_TWO_OPT_PASSES = 25;
+
+function twoOptImprove(
+  sequence: StayRouteNode[],
+  arrivalAnchor: { lat: number; lon: number } | null,
+  departureAnchor: { lat: number; lon: number } | null,
+  weights: RouteScoreWeights
+): StayRouteNode[] {
+  let current = sequence;
+  let currentScore = scoreStayRoute(current, arrivalAnchor, departureAnchor, weights).total;
+
+  for (let pass = 0; pass < MAX_TWO_OPT_PASSES; pass += 1) {
+    let improvedThisPass = false;
+    for (let i = 0; i < current.length - 1; i += 1) {
+      for (let j = i + 1; j < current.length; j += 1) {
+        const candidate = twoOptSwap(current, i, j);
+        const candidateScore = scoreStayRoute(candidate, arrivalAnchor, departureAnchor, weights).total;
+        if (candidateScore < currentScore - 1e-9) {
+          current = candidate;
+          currentScore = candidateScore;
+          improvedThisPass = true;
+        }
+      }
+    }
+    if (!improvedThisPass) break;
+  }
+  return current;
+}
+
+/**
+ * Spec §G "multi-start optimization... for ~10-20 stays a single greedy
+ * nearest-neighbor is not enough". Seeds: nearest-to-arrival (the missing
+ * piece the OLD reorder never considered at all), highest-value node, and
+ * the original first node (a stable, always-available baseline) — deduped,
+ * each run through nearest-neighbor construction + bounded 2-opt, and the
+ * globally best-SCORING result wins. Deterministic: no randomness
+ * anywhere, ties broken by insertion order (strict `<` comparison, first
+ * candidate wins). Never drops or merges a node — a pure permutation of
+ * whatever it's given (spec §E).
+ */
+export function optimizeStayRouteSequence(
+  nodes: StayRouteNode[],
+  arrivalAnchor: { lat: number; lon: number } | null,
+  departureAnchor: { lat: number; lon: number } | null,
+  weights: RouteScoreWeights = DEFAULT_ROUTE_SCORE_WEIGHTS
+): StayRouteNode[] {
+  if (nodes.length <= 1) return nodes;
+
+  const withAnchor = nodes.filter((node) => node.hasAnchor);
+  const withoutAnchor = nodes.filter((node) => !node.hasAnchor);
+  if (withAnchor.length < 2) return nodes; // not enough real geography to reason about — leave everything in its original order
+
+  const seedIndices = new Set<number>();
+  seedIndices.add(0); // stable baseline seed, always available
+
+  let highestValueIndex = 0;
+  withAnchor.forEach((node, index) => {
+    if (node.value > withAnchor[highestValueIndex].value) highestValueIndex = index;
+  });
+  seedIndices.add(highestValueIndex);
+
+  if (arrivalAnchor) {
+    let nearestArrivalIndex = 0;
+    let nearestArrivalDistance = Infinity;
+    withAnchor.forEach((node, index) => {
+      const distance = haversineKm(arrivalAnchor.lat, arrivalAnchor.lon, node.lat, node.lon);
+      if (distance < nearestArrivalDistance) {
+        nearestArrivalDistance = distance;
+        nearestArrivalIndex = index;
+      }
+    });
+    seedIndices.add(nearestArrivalIndex);
+  }
+
+  let best: StayRouteNode[] = withAnchor;
+  let bestScore = scoreStayRoute(withAnchor, arrivalAnchor, departureAnchor, weights).total;
+
+  for (const seedIndex of seedIndices) {
+    const constructed = nearestNeighborConstruct(withAnchor, seedIndex);
+    const improved = twoOptImprove(constructed, arrivalAnchor, departureAnchor, weights);
+    const score = scoreStayRoute(improved, arrivalAnchor, departureAnchor, weights).total;
+    if (score < bestScore - 1e-9) {
+      bestScore = score;
+      best = improved;
+    }
+  }
+
+  // Anchor-less nodes can't be reasoned about geographically — appended in
+  // their original relative order, same philosophy as the pre-existing
+  // reorderAreasToMinimizeBacktracking.
+  return [...best, ...withoutAnchor];
+}
+
+export type RouteInvariantViolationType =
+  | "duplicate_stay"
+  | "non_contiguous_revisit"
+  | "missing_anchor"
+  | "arrival_mismatch"
+  | "departure_mismatch";
+
+export interface RouteInvariantViolation {
+  type: RouteInvariantViolationType;
+  detail: string;
+}
+
+/**
+ * Spec §J "hard route invariants... before day generation, assert...". A
+ * diagnostic assertion, not a second repair mechanism — the optimizer
+ * above already scores every one of these; this is the QA-visible proof
+ * that it actually achieved them (or an honest record of why it couldn't,
+ * e.g. genuinely infeasible geography with no closer alternative).
+ */
+export function verifyStayRouteInvariants(
+  sequence: StayRouteNode[],
+  arrivalAnchor: { lat: number; lon: number } | null,
+  departureAnchor: { lat: number; lon: number } | null,
+  regionRadiusKm: number = STAY_REGION_REVISIT_RADIUS_KM
+): RouteInvariantViolation[] {
+  const violations: RouteInvariantViolation[] = [];
+  const seen = new Set<string>();
+
+  for (const node of sequence) {
+    if (seen.has(node.id)) {
+      violations.push({ type: "duplicate_stay", detail: `"${node.id}" appears more than once in the route` });
+    }
+    seen.add(node.id);
+    if (!node.hasAnchor) {
+      violations.push({ type: "missing_anchor", detail: `"${node.id}" has no usable anchor coordinates` });
+    }
+  }
+
+  const revisitCount = countRegionRevisits(sequence, regionRadiusKm);
+  if (revisitCount > 0) {
+    violations.push({
+      type: "non_contiguous_revisit",
+      detail: `${revisitCount} region(s) revisited non-contiguously after being left`,
+    });
+  }
+
+  if (arrivalAnchor && sequence.length > 1) {
+    const firstDistanceKm = haversineKm(arrivalAnchor.lat, arrivalAnchor.lon, sequence[0].lat, sequence[0].lon);
+    const bestPossibleKm = Math.min(
+      ...sequence.map((node) => haversineKm(arrivalAnchor.lat, arrivalAnchor.lon, node.lat, node.lon))
+    );
+    if (firstDistanceKm - bestPossibleKm > ARRIVAL_DEPARTURE_MISMATCH_TOLERANCE_KM) {
+      violations.push({
+        type: "arrival_mismatch",
+        detail: `first stay is ${Math.round(firstDistanceKm)}km from arrival; ${Math.round(bestPossibleKm)}km was achievable within this same stay set`,
+      });
+    }
+  }
+
+  if (departureAnchor && sequence.length > 1) {
+    const lastNode = sequence[sequence.length - 1];
+    const lastDistanceKm = haversineKm(departureAnchor.lat, departureAnchor.lon, lastNode.lat, lastNode.lon);
+    const bestPossibleKm = Math.min(
+      ...sequence.map((node) => haversineKm(departureAnchor.lat, departureAnchor.lon, node.lat, node.lon))
+    );
+    if (lastDistanceKm - bestPossibleKm > ARRIVAL_DEPARTURE_MISMATCH_TOLERANCE_KM) {
+      violations.push({
+        type: "departure_mismatch",
+        detail: `last stay is ${Math.round(lastDistanceKm)}km from departure; ${Math.round(bestPossibleKm)}km was achievable within this same stay set`,
+      });
+    }
+  }
+
+  return violations;
+}
+
 /**
  * Pure geography-first phase distribution: given ranked area weights (e.g.
  * how many real candidate places fall in each area) and a bucket's base

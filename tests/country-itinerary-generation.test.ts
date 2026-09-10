@@ -30,7 +30,12 @@ import {
   deriveDayType,
   enforceNormalDayLocality,
   enforceTransportRoleGuard,
+  enforceFinalPlaceLegalityGate,
   enforceStayTransitions,
+  buildStayTransitionItem,
+  normalizeDayOwnershipToFrame,
+  validateFinalItineraryInvariants,
+  enforceItineraryInvariantsWithRepair,
   removeFuzzyDuplicatePlaces,
   ensureWeatherBackup,
   resolveCandidateProviderStatus,
@@ -63,6 +68,7 @@ import {
   isMealOpportunityMarker,
   selectFallbackCandidate,
 } from "../src/lib/trip-workspace";
+import { countRegionRevisits, type StayRouteNode } from "../src/lib/server/itinerary-planning-principles";
 import type { StayTransition, TripFrame } from "../src/lib/server/itinerary-planning-principles";
 import type {
   AiGeneratedDay,
@@ -2420,6 +2426,42 @@ test("live wiring: a weight-only route order that would backtrack is reordered i
   assert.deepEqual(frame.phases.map((phase) => phase.areaLabel), ["City C", "City M", "City A"]);
 });
 
+// Spec §K.10 "short-stay repair cannot reintroduce major backtracking" —
+// a weak cluster genuinely likely to get merged/absorbed by
+// applyShortStayViabilityRepair sits between two strong ones; the FINAL
+// phase order (after the full deterministic pipeline, short-stay repair
+// included) must still be a coherent, revisit-free route along the real
+// coordinates, whatever survived the repair.
+test("live wiring: short-stay viability repair does not reintroduce backtracking into the final route", () => {
+  const AREA_ANCHORS: Record<string, { lat: number; lon: number }> = {
+    "City A": { lat: 0, lon: 0 },
+    "City B": { lat: 0, lon: 10 },
+    "City C": { lat: 0, lon: 20 },
+    "City D": { lat: 0, lon: 30 },
+  };
+  const cityA = Array.from({ length: 9 }, () => buildRecommendation({ location: "City A", lat: 0, lon: 0, estimatedDurationMinutes: 120 }));
+  // A genuinely weak cluster — little content, a real short-stay-repair candidate.
+  const cityB = Array.from({ length: 2 }, () => buildRecommendation({ location: "City B", lat: 0, lon: 10, estimatedDurationMinutes: 45 }));
+  const cityC = Array.from({ length: 9 }, () => buildRecommendation({ location: "City C", lat: 0, lon: 20, estimatedDurationMinutes: 120 }));
+  const cityD = Array.from({ length: 9 }, () => buildRecommendation({ location: "City D", lat: 0, lon: 30, estimatedDurationMinutes: 120 }));
+  const payload = buildPayload({
+    recommendations: [...cityA, ...cityB, ...cityC, ...cityD],
+    preferences: { ...basePreferences, accommodationArea: "", preferredRegions: "" },
+  });
+
+  const frame = buildDeterministicTripFrame(payload, 20);
+  const finalNodes: StayRouteNode[] = frame.phases.map((phase) => {
+    const anchor = AREA_ANCHORS[phase.areaLabel];
+    return { id: phase.areaLabel, lat: anchor?.lat ?? 0, lon: anchor?.lon ?? 0, hasAnchor: anchor != null, value: 1 };
+  });
+
+  assert.equal(
+    countRegionRevisits(finalNodes),
+    0,
+    `expected a revisit-free final route after short-stay repair, got: ${frame.phases.map((p) => p.areaLabel).join(" -> ")}`
+  );
+});
+
 test("live wiring: generation completes and stays bounded for a genuinely weak, scattered candidate pool", () => {
   const scattered = Array.from({ length: 6 }, (_, index) =>
     buildRecommendation({ location: `Spot ${index}`, lat: index * 5, lon: index * 5, estimatedDurationMinutes: 30 })
@@ -3186,6 +3228,34 @@ test("enforceNormalDayLocality (transfer day): an activity requiring a large det
   assert.ok(!days[0].items.some((item) => item.name === "Way Off Route Stop"));
 });
 
+// Root-cause regression (real 43-day US replay: Yellowstone/Yosemite/Grand
+// Canyon/Mount Rushmore each landed on a day_trip/transfer-classified day
+// with NO real coordinates and a location string matching no known stay's
+// area label — the OLD asymmetric rule `isExemptDayType ? positively
+// matches ANOTHER known stay : doesn't match its own` found neither
+// condition true for text this foreign, and silently passed). A
+// coordinate-less item is now judged by the SAME rule on every day type:
+// legal only if its own text positively matches THIS day's own stay.
+test("enforceNormalDayLocality (transfer day): a coordinate-less item whose location text matches NO known stay — including this one — is a violation, not a silent pass", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 2);
+  const day = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    items: [
+      buildCoordinatelessItem({ name: "Unrelated National Park", location: "A Region Nobody Modeled" }),
+    ],
+  });
+
+  const { days, violations } = enforceNormalDayLocality([day], TRANSFER_TRIP_FRAME, TRANSFER_AREA_ANCHORS, TRANSFER_MOBILITY_PROFILE, payload, profile);
+
+  assert.ok(
+    violations.some((violation) => violation.itemName === "Unrelated National Park" && violation.reason === "unverified_region_mismatch" && violation.repaired),
+    "a day_trip/transfer label must never be an unconditional pass for unverifiable (coordinate-less) geography, even when the mismatch can't be positively pinned to a specific OTHER known stay"
+  );
+  assert.ok(!days[0].items.some((item) => item.name === "Unrelated National Park"));
+});
+
 // Spec "תיקון גנרי, לא תיקון תשיעי" — enforceNormalDayLocality is the
 // terminal geographic gate every recent round has built around; its own
 // repair step used to hand pickReplacementRecommendation a day view that
@@ -3854,6 +3924,147 @@ test("golden replay: a resolved real POI thousands of minutes from its assigned 
   assert.ok(!days[0].items.some((item) => item.name === "Annapolis"));
 });
 
+// Root-cause regression (spec §K.16 "Gemini-resolved item cannot bypass
+// legality") — the SAME scenario as above, but with a real candidate pool
+// containing BOTH a genuinely local replacement AND a candidate at the
+// exact same impossibly-distant location. Under the old bypass
+// (isCandidateGeographicallyCompatibleWithDay: `if (isDayTripDay) return
+// true`), the distant candidate would have been just as "eligible" as the
+// local one during the REPAIR's own replacement search — this proves the
+// fix reaches all the way into that replacement search, not just the
+// initial detection.
+test("golden replay: repairing a Gemini day-trip-category item never selects an equally-distant replacement candidate", () => {
+  const LOS_ANGELES = { lat: 34.0522, lon: -118.2437 };
+  const ANNAPOLIS = { lat: 38.9784, lon: -76.4922 };
+
+  const localReplacement = buildRecommendation({
+    id: "rec-local",
+    name: "Local LA Attraction",
+    category: "day_trip",
+    location: "Los Angeles",
+    lat: LOS_ANGELES.lat + 0.05,
+    lon: LOS_ANGELES.lon + 0.05,
+    estimatedDurationMinutes: 90,
+  });
+  const equallyDistantReplacement = buildRecommendation({
+    id: "rec-distant",
+    name: "Another Annapolis-Area Spot",
+    category: "day_trip",
+    location: "Annapolis",
+    lat: ANNAPOLIS.lat + 0.01,
+    lon: ANNAPOLIS.lon + 0.01,
+    estimatedDurationMinutes: 90,
+  });
+
+  const payload = buildPayload({ recommendations: [localReplacement, equallyDistantReplacement] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "Los Angeles", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["Los Angeles", LOS_ANGELES]]);
+  const mobilityProfile = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "Los Angeles",
+    items: [
+      buildItem({ name: "Morning Departure", slot: "morning", plannedStartTime: "08:00", lat: LOS_ANGELES.lat, lon: LOS_ANGELES.lon }),
+      buildItem({
+        name: "Annapolis",
+        category: "day_trip",
+        recommendationId: "rec-annapolis-original",
+        slot: "afternoon",
+        plannedStartTime: "12:00",
+        lat: ANNAPOLIS.lat,
+        lon: ANNAPOLIS.lon,
+        estimatedDurationMinutes: 90,
+      }),
+      buildItem({ name: "Evening Return", slot: "evening", plannedStartTime: "18:00", lat: LOS_ANGELES.lat, lon: LOS_ANGELES.lon }),
+    ],
+  });
+
+  const { days } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(!days[0].items.some((item) => item.name === "Annapolis"));
+  assert.ok(
+    !days[0].items.some((item) => item.recommendationId === "rec-distant"),
+    "the repair's own replacement search must never select an equally-distant candidate just because the day is a day trip"
+  );
+});
+
+// Root-cause regression (real 43-day US replay: "Austin day contains
+// Yellowstone National Park", "Austin day contains Yosemite National
+// Park", "New Orleans day contains Grand Canyon National Park", "Seattle
+// day contains Mount Rushmore") — the EXACT real production shape: a
+// day whose only real, coordinate-bearing content IS the far violation
+// itself; every other item is a synthetic meal/free-time placeholder with
+// no coordinates at all. `dayExcludingTarget.items` (the day minus the
+// item being repaired) therefore has ZERO coordinate-bearing anchors —
+// isCandidateGeographicallyCompatibleWithDay's own "no anchors at all ->
+// anything is compatible" fallback used to make the repair's OWN
+// candidate filter toothless, letting it re-select the exact violation
+// (or an equally distant candidate) as its "repair." Passing the day's
+// real stay/phase anchor through (enforceNormalDayLocality's ownAnchor ->
+// pickReplacementRecommendation's stayAreaAnchor) is the fix under test.
+test("golden replay: repairing the day's ONLY real item — with every other item synthetic and coordinate-less — never re-selects an equally-distant candidate (Austin/Yellowstone shape)", () => {
+  const AUSTIN = { lat: 30.2672, lon: -97.7431 };
+  const YELLOWSTONE = { lat: 44.428, lon: -110.5885 }; // genuinely thousands of km from Austin
+
+  // Deliberately labeled with the day's OWN area text ("Austin") despite
+  // its real coordinates being in Wyoming — this isolates the fix under
+  // test: only the REAL COORDINATE geographic gate can reject this
+  // candidate; the ranking's own textual area-match bonus would otherwise
+  // favor it regardless (a real risk of an under-specified regression
+  // test that happens to pass for the wrong reason).
+  const distantReplacementWithMatchingText = buildRecommendation({
+    id: "rec-distant-yellowstone-area",
+    name: "Another Yellowstone-Area Spot",
+    category: "nature",
+    location: "Austin",
+    lat: YELLOWSTONE.lat + 0.01,
+    lon: YELLOWSTONE.lon + 0.01,
+    estimatedDurationMinutes: 90,
+  });
+
+  const payload = buildPayload({ recommendations: [distantReplacementWithMatchingText] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "Austin", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+  const areaAnchors = new Map([["Austin", AUSTIN]]);
+  const mobilityProfile = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+
+  // dayNumber: 2 — the 2nd day of the SAME Austin stay (not the first, so
+  // deriveDayType classifies it "normal", exactly like the real replay's
+  // Day 22/23), with only ONE real item (Yellowstone, resolved with real
+  // coordinates — e.g. via ensureMustVisitCoverage matching a mustVisit
+  // keyword) and the rest pure synthetic placeholders, matching the real
+  // shape exactly.
+  const day = buildDay({
+    dayNumber: 2,
+    cityRegion: "Austin",
+    items: [
+      buildItem({
+        name: "Yellowstone National Park",
+        category: "nature",
+        recommendationId: "rec-yellowstone-original",
+        slot: "morning",
+        plannedStartTime: "09:10",
+        lat: YELLOWSTONE.lat,
+        lon: YELLOWSTONE.lon,
+        estimatedDurationMinutes: 90,
+      }),
+      buildCoordinatelessItem({ name: "Recommended lunch window", category: "practical", itemRole: "meal_opportunity", location: "" }),
+      buildCoordinatelessItem({ name: "Free time to explore at your own pace", category: "attraction", itemRole: "free_time", location: "" }),
+      buildCoordinatelessItem({ name: "Recommended dinner window", category: "practical", itemRole: "meal_opportunity", location: "" }),
+    ],
+  });
+
+  const { days } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(!days[0].items.some((item) => item.name === "Yellowstone National Park"));
+  assert.ok(
+    !days[0].items.some((item) => item.recommendationId === "rec-distant-yellowstone-area"),
+    "with zero other coordinate anchors on this day, the repair must still use the real stay anchor — never fall back to 'anything is compatible'"
+  );
+});
+
 // ==================================================
 // PART: "FAIL CLOSED ON MISSING COMPARISON GEOMETRY" — a second, separate
 // real QA replay found the SAME symptom (ownerStay incompatible,
@@ -3907,6 +4118,36 @@ test("golden replay: a broad/relabeled stay with NO resolvable anchor cannot let
   // The real repair pipeline actually flags/removes both — not a silent skip.
   const { violations } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
   assert.equal(violations.filter((v) => v.reason === "unresolved_owner_geometry").length, 2);
+});
+
+// Spec §H "run a pure invariant validator over every real POI — there must
+// be zero illegalScheduledRealPlaces": the ONE case where a real geography
+// violation genuinely survives into the final plan is a protected
+// (locked/fixed-time) item — enforceNormalDayLocality deliberately never
+// repairs those. summarizeGeographyDiagnostics must count exactly this,
+// and nothing else (an ordinary, repaired violation must NOT count, since
+// nothing illegal actually remains once it's fixed).
+test("summarizeGeographyDiagnostics.illegalScheduledRealPlaces counts only a real violation that survives (protected item), never a repaired one", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A_ANCHOR]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+  const FAR_AWAY = { lat: CITY_A_ANCHOR.lat + 40, lon: CITY_A_ANCHOR.lon + 40 };
+
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "City A Anchor", lat: CITY_A_ANCHOR.lat, lon: CITY_A_ANCHOR.lon }),
+      buildItem({ name: "Locked Distant Item", recommendationId: "rec-locked", lat: FAR_AWAY.lat, lon: FAR_AWAY.lon, locked: true }),
+    ],
+  });
+
+  const diagnostics = computeGeographyDiagnostics([day], tripFrame, areaAnchors, mobilityProfile, payload, profile, null);
+  const summary = summarizeGeographyDiagnostics(diagnostics);
+
+  assert.equal(summary.illegalScheduledRealPlaces, 1, "the locked/protected violation must count as an illegal real place still in the plan");
 });
 
 test("4. a future-stay item with no coordinates cannot leak into the current stay's normal day", () => {
@@ -4009,7 +4250,19 @@ test("enforceTransportRoleGuard repairs an airport used as a normal sightseeing 
   assert.ok(!days[0].items.some((item) => item.name === "City International Airport"));
 });
 
-test("enforceTransportRoleGuard leaves an airport alone when it's already the legitimate transportation category", () => {
+// Root-cause regression (real 43-day US replay: "O'Hare International
+// Airport" scheduled as a 09:00 Chicago activity, "Los Angeles
+// International Airport" scheduled as an LA activity) — category ===
+// "transportation" used to be an UNCONDITIONAL exemption, with zero
+// verification the item was genuinely serving a transfer role. Gemini (or
+// normalizeCategory) can tag a hallucinated sightseeing-airport item
+// "transportation" with no real transfer context behind it at all — this
+// is deliberately no longer a free pass. The ONE legitimate transportation-
+// category item (the real, structurally-marked stay transition built by
+// buildStayTransitionItem) never matches TRANSPORT_INFRASTRUCTURE_NAME_
+// PATTERN in the first place (its name is "<mode>: <fromBase> → <toBase>"),
+// so this change costs the legitimate path nothing.
+test("enforceTransportRoleGuard repairs an airport EVEN when Gemini tagged it category=transportation, with no real transfer context", () => {
   const payload = buildPayload();
   const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
   const day = buildDay({
@@ -4017,11 +4270,21 @@ test("enforceTransportRoleGuard leaves an airport alone when it's already the le
     items: [buildItem({ name: "City International Airport", category: "transportation" })],
   });
 
-  const { violations } = enforceTransportRoleGuard([day], payload, profile);
-  assert.equal(violations.length, 0);
+  const { days, violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "City International Airport" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "City International Airport"));
 });
 
-test("enforceTransportRoleGuard leaves a real airport mention alone on a genuine transfer day", () => {
+// Root-cause regression — the day-level `isIntercityTransferDay(day)` text
+// exemption was circular: fillDerivedDayFields synthesizes a day's own
+// transportSegments/notes text partly FROM its own items, so an airport
+// item's own name/transportation text could make the day itself match the
+// transfer pattern, exempting the very item that caused the match. The
+// ONLY legitimate exemption now is the item being the real, structurally-
+// marked stay-transition (canonicalPlaceId starting with "transition:") —
+// a plain "יום מעבר בין בסיסים" note on the day is no longer sufficient by
+// itself.
+test("enforceTransportRoleGuard repairs a real airport mention even on a day whose own notes/text read as a transfer day", () => {
   const payload = buildPayload();
   const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
   const day = buildDay({
@@ -4030,8 +4293,187 @@ test("enforceTransportRoleGuard leaves a real airport mention alone on a genuine
     items: [buildItem({ name: "City International Airport", category: "attraction" })],
   });
 
+  const { days, violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "City International Airport" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "City International Airport"));
+});
+
+// Semantic-role gate — a hotel/accommodation category item can never
+// occupy a generic activity slot, judged purely by structured category
+// (real bug: "The Plaza" hotel appearing as a scheduled 16:23 New York
+// activity with its own price, in a real generated PDF).
+test("enforceTransportRoleGuard repairs a hotel-category item scheduled as a generic activity", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "The Grand Hotel", category: "hotel" })],
+  });
+
+  const { days, violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "The Grand Hotel" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "The Grand Hotel"));
+});
+
+// Semantic-role gate — a train/bus station occupying a generic activity
+// slot, with no real TransitLeg/transfer context, must be repaired the
+// same as an airport. The one legitimate exemption (the structurally-
+// marked stay-transition item) never matches this pattern by name at all.
+test("enforceTransportRoleGuard repairs a train station scheduled as a generic activity, with no real transit-leg context", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "Grand Central Railway Station", category: "attraction" })],
+  });
+
+  const { days, violations } = enforceTransportRoleGuard([day], payload, profile);
+  assert.ok(violations.some((violation) => violation.itemName === "Grand Central Railway Station" && violation.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "Grand Central Railway Station"));
+});
+
+// The one real, legitimate exemption: a genuine stay-transition item this
+// codebase itself synthesizes (buildStayTransitionItem always sets
+// canonicalPlaceId to "transition:<from>-><to>") legitimately connects two
+// different bases and must never be "repaired" away.
+test("enforceTransportRoleGuard leaves the real, structurally-marked stay-transition item alone", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const day = buildDay({
+    dayNumber: 1,
+    items: [
+      buildItem({
+        name: "רכבת: City A → City B",
+        category: "transportation",
+        canonicalPlaceId: "transition:City A->City B",
+      }),
+    ],
+  });
+
   const { violations } = enforceTransportRoleGuard([day], payload, profile);
-  assert.equal(violations.length, 0);
+  assert.equal(violations.length, 0, "a real stay-transition item, even though category=transportation, is never a semantic-role violation");
+});
+
+// Spec §Step 3 "ONE AUTHORITATIVE FINAL GATE" — enforceFinalPlaceLegalityGate
+// is the belt-and-suspenders backstop: it must catch a real, distant place
+// even if it reaches the final days array through some path OTHER than
+// enforceNormalDayLocality/enforceTransportRoleGuard (e.g. a hypothetical
+// future insertion added after those two run). Direct unit coverage of
+// the new function itself, independent of the two repair passes.
+test("enforceFinalPlaceLegalityGate repairs a distant real item on a normal day, independent of enforceNormalDayLocality ever running", () => {
+  const CITY_A = { lat: 10.0, lon: 10.0 };
+  const FAR_AWAY = { lat: 55.0, lon: 55.0 };
+
+  const localReplacement = buildRecommendation({
+    id: "rec-local",
+    name: "Genuine Local Spot",
+    category: "attraction",
+    location: "City A",
+    lat: CITY_A.lat + 0.01,
+    lon: CITY_A.lon + 0.01,
+  });
+  const payload = buildPayload({ recommendations: [localReplacement] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [buildItem({ name: "Impossibly Distant Place", category: "attraction", lat: FAR_AWAY.lat, lon: FAR_AWAY.lon })],
+  });
+
+  const { days, violations } = enforceFinalPlaceLegalityGate([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+
+  assert.ok(violations.some((v) => v.itemName === "Impossibly Distant Place" && v.repaired));
+  assert.ok(!days[0].items.some((item) => item.name === "Impossibly Distant Place"));
+});
+
+test("enforceFinalPlaceLegalityGate never touches synthetic, transportation, or hotel-category items", () => {
+  const CITY_A = { lat: 10.0, lon: 10.0 };
+  const FAR_AWAY = { lat: 55.0, lon: 55.0 };
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const areaAnchors = new Map([["City A", CITY_A]]);
+  const mobilityProfile = { tier: "compact" as const, localityRadiusKm: 25, normalDayTravelBudgetMinutes: 60 };
+
+  const day = buildDay({
+    dayNumber: 1,
+    cityRegion: "City A",
+    items: [
+      buildCoordinatelessItem({ name: "Free time far away conceptually", category: "attraction", itemRole: "free_time", location: "" }),
+      buildItem({ name: "Distant Hotel", category: "hotel", lat: FAR_AWAY.lat, lon: FAR_AWAY.lon }),
+      buildItem({ name: "Distant Transport Leg", category: "transportation", lat: FAR_AWAY.lat, lon: FAR_AWAY.lon }),
+    ],
+  });
+
+  const { violations } = enforceFinalPlaceLegalityGate([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  assert.equal(violations.length, 0, "synthetic/hotel/transportation items are out of this gate's scope — enforceTransportRoleGuard owns semantic-role categories");
+});
+
+// Spec "DAY-LEVEL POI GEOGRAPHY / LEGALITY" §Step 3 — the true final-gate
+// acceptance bar: after the FULL finalizeArrivalDepartureContent sequence
+// (enforceNormalDayLocality -> enforceTransportRoleGuard ->
+// ensureArrivalDepartureDayHasContent -> enforceFinalPlaceLegalityGate),
+// zero illegal real places may survive on the object actually returned.
+test("full finalization sequence: enforceNormalDayLocality + enforceTransportRoleGuard + enforceFinalPlaceLegalityGate together leave zero illegal real places (Austin/Yellowstone shape, end to end)", () => {
+  const AUSTIN = { lat: 30.2672, lon: -97.7431 };
+  const YELLOWSTONE = { lat: 44.428, lon: -110.5885 };
+
+  const localReplacement = buildRecommendation({
+    id: "rec-local-austin-2",
+    name: "Genuine Austin Attraction 2",
+    category: "nature",
+    location: "Austin",
+    lat: AUSTIN.lat + 0.02,
+    lon: AUSTIN.lon + 0.02,
+    estimatedDurationMinutes: 90,
+  });
+
+  const payload = buildPayload({ recommendations: [localReplacement] });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 1);
+  const tripFrame = buildTestFrame([{ areaLabel: "Austin", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+  const areaAnchors = new Map([["Austin", AUSTIN]]);
+  const mobilityProfile = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+
+  const day = buildDay({
+    dayNumber: 2,
+    cityRegion: "Austin",
+    items: [
+      buildItem({
+        name: "Yellowstone National Park",
+        category: "nature",
+        recommendationId: "rec-yellowstone-original-2",
+        slot: "morning",
+        plannedStartTime: "09:10",
+        lat: YELLOWSTONE.lat,
+        lon: YELLOWSTONE.lon,
+        estimatedDurationMinutes: 90,
+      }),
+      buildItem({ name: "Genuine Austin Local Activity", category: "attraction", lat: AUSTIN.lat, lon: AUSTIN.lon }),
+      buildCoordinatelessItem({ name: "Free time to explore at your own pace", category: "attraction", itemRole: "free_time", location: "" }),
+    ],
+  });
+
+  const { days: localityDays } = enforceNormalDayLocality([day], tripFrame, areaAnchors, mobilityProfile, payload, profile);
+  const { days: roleDays } = enforceTransportRoleGuard(localityDays, payload, profile, tripFrame, areaAnchors);
+  const { days: finalDays, violations: finalViolations } = enforceFinalPlaceLegalityGate(
+    roleDays,
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload,
+    profile
+  );
+
+  assert.ok(!finalDays[0].items.some((item) => item.name === "Yellowstone National Park"));
+  assert.equal(
+    finalViolations.filter((v) => !v.repaired).length,
+    0,
+    "illegalScheduledRealPlaces on the true final object must be 0 — no unrepaired real violation may survive"
+  );
 });
 
 // Spec "תיקון גנרי, לא תיקון תשיעי" — enforceTransportRoleGuard's own
@@ -4580,4 +5022,758 @@ test("repairPlan rejects a Gemini-authored duplicate at ingestion (same recommen
 
   const duplicateCount = result.days.flatMap((day) => day.items).filter((item) => item.recommendationId === "dup-place").length;
   assert.equal(duplicateCount, 1, "the same Gemini-authored real place must survive on only ONE day, the second occurrence rejected at ingestion");
+});
+
+// ==================================================
+// ROUND 3 — TRIP-FRAME / DAY OWNERSHIP / FINAL GEOGRAPHY INVARIANT
+// ==================================================
+
+const R3_MOBILITY = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+const R3_CITY_A = { lat: 40.0, lon: -74.0 };
+const R3_CITY_B = { lat: 41.0, lon: -74.2 }; // ~111km from A — its own separate stay
+const R3_FAR = { lat: 44.4, lon: -110.6 }; // thousands of km from both — a Yellowstone-scale outlier
+
+function r3TransitionItem(fromBase: string, toBase: string, toCoords: { lat: number; lon: number }): AiGeneratedItem {
+  return buildStayTransitionItem({
+    fromBase,
+    toBase,
+    fromCoordinates: R3_CITY_A,
+    toCoordinates: toCoords,
+    transportMode: "car",
+    estimatedTravelMinutes: 120,
+    dayNumber: 2,
+  });
+}
+
+// D + critical regression — a transition marker that no longer matches the
+// day's own frame boundary (stay reordered A->B into C->D, or the item
+// was physically relocated to an unrelated day) is stale and must be
+// removed by enforceStayTransitions' global sweep, even though that day
+// is not itself in the current `transitions` list.
+test("enforceStayTransitions removes a stale transition marker from a day that is not a current transfer day", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+
+  const normalDayWithStaleTransition = buildDay({
+    dayNumber: 2,
+    cityRegion: "City A",
+    items: [
+      buildItem({ name: "City A Museum", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+      r3TransitionItem("Miami Beach", "Orlando", { lat: 28.5, lon: -81.4 }),
+    ],
+  });
+
+  // No transition targets day 2 anymore.
+  const { days } = enforceStayTransitions([normalDayWithStaleTransition], [], payload, profile);
+
+  assert.ok(
+    !days[0].items.some((item) => item.canonicalPlaceId.startsWith("transition:")),
+    "a transition marker on a day with no current transition of its own is stale and must be swept"
+  );
+  assert.ok(days[0].items.some((item) => item.name === "City A Museum"), "real content on the day is untouched");
+});
+
+// A transition whose from/to matches the day's OWN current boundary is kept.
+test("enforceStayTransitions keeps a transition marker that matches the day's own current boundary", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+
+  const goodTransition: StayTransition = {
+    fromBase: "City A",
+    toBase: "City B",
+    fromCoordinates: R3_CITY_A,
+    toCoordinates: R3_CITY_B,
+    transportMode: "car",
+    estimatedTravelMinutes: 120,
+    dayNumber: 2,
+  };
+  const transferDay = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    items: [buildStayTransitionItem(goodTransition), buildItem({ name: "City B Arrival Stroll", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon })],
+  });
+
+  const { days } = enforceStayTransitions([transferDay], [goodTransition], payload, profile);
+  assert.ok(
+    days[0].items.some((item) => item.canonicalPlaceId === "transition:City A->City B"),
+    "the day's own valid transition marker is preserved"
+  );
+});
+
+// B (fixOverloadedDays) — the structural transition item must never be the
+// item that gets evicted to another day.
+test("fixOverloadedDays never relocates the stay-transition item off its own day", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+
+  const transitionItem = buildStayTransitionItem({
+    fromBase: "City A",
+    toBase: "City B",
+    fromCoordinates: R3_CITY_A,
+    toCoordinates: R3_CITY_B,
+    transportMode: "car",
+    estimatedTravelMinutes: 300, // large — would sort FIRST as the most attractive eviction candidate
+    dayNumber: 2,
+  });
+  const overloadedDay = buildDay({
+    dayNumber: 2,
+    cityRegion: "City B",
+    items: [
+      transitionItem,
+      buildItem({ name: "Heavy Activity 1", estimatedDurationMinutes: 300, lat: R3_CITY_B.lat, lon: R3_CITY_B.lon }),
+      buildItem({ name: "Heavy Activity 2", estimatedDurationMinutes: 300, lat: R3_CITY_B.lat, lon: R3_CITY_B.lon }),
+      buildItem({ name: "Heavy Activity 3", estimatedDurationMinutes: 300, lat: R3_CITY_B.lat, lon: R3_CITY_B.lon }),
+    ],
+  });
+  const nextDay = buildDay({ dayNumber: 3, cityRegion: "City B", items: [] });
+
+  const [repairedDay2] = fixOverloadedDays([overloadedDay, nextDay], payload, profile);
+  assert.ok(
+    repairedDay2.items.some((item) => item.canonicalPlaceId === "transition:City A->City B"),
+    "the transition item stays on its own day; some OTHER item is the one moved"
+  );
+});
+
+// ===== validateFinalItineraryInvariants — the PURE Step 5 validator =====
+
+const R3_FRAME_TWO_STAYS = buildTestFrame([
+  { areaLabel: "City A", nights: 2, startDayNumber: 1, endDayNumber: 2 },
+  { areaLabel: "City B", nights: 2, startDayNumber: 3, endDayNumber: 4 },
+]);
+const R3_ANCHORS_TWO_STAYS = new Map<string, { lat: number; lon: number } | null>([
+  ["City A", R3_CITY_A],
+  ["City B", R3_CITY_B],
+]);
+
+test("validateFinalItineraryInvariants: a clean itinerary reports every count as zero", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "City A Sight", lat: R3_CITY_A.lat + 0.01, lon: R3_CITY_A.lon + 0.01 })] }),
+    buildDay({ dayNumber: 2, cityRegion: "City A", items: [buildItem({ name: "City A Park", lat: R3_CITY_A.lat - 0.02, lon: R3_CITY_A.lon })] }),
+    buildDay({
+      dayNumber: 3,
+      cityRegion: "City B",
+      items: [
+        buildStayTransitionItem({ fromBase: "City A", toBase: "City B", fromCoordinates: R3_CITY_A, toCoordinates: R3_CITY_B, transportMode: "car", estimatedTravelMinutes: 120, dayNumber: 3 }),
+        buildItem({ name: "City B Sight", lat: R3_CITY_B.lat + 0.01, lon: R3_CITY_B.lon }),
+      ],
+    }),
+    buildDay({ dayNumber: 4, cityRegion: "City B", items: [buildItem({ name: "City B Museum", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon - 0.01 })] }),
+  ];
+
+  const report = validateFinalItineraryInvariants(days, R3_FRAME_TWO_STAYS, R3_ANCHORS_TWO_STAYS, R3_MOBILITY, payload);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+  assert.equal(report.invalidTransitionOwnership, 0);
+  assert.equal(report.invalidSemanticRolePlacements, 0);
+  assert.equal(report.ownerGeometryMissingDays, 0);
+  assert.equal(report.realItemsWithNullLegGeometry, 0);
+});
+
+test("validateFinalItineraryInvariants: a distant real POI on a normal day counts as illegalScheduledRealPlaces", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "Yellowstone-scale Outlier", category: "nature", lat: R3_FAR.lat, lon: R3_FAR.lon })] }),
+  ];
+  const frame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const anchors = new Map<string, { lat: number; lon: number } | null>([["City A", R3_CITY_A]]);
+
+  const report = validateFinalItineraryInvariants(days, frame, anchors, R3_MOBILITY, payload);
+  assert.equal(report.illegalScheduledRealPlaces, 1);
+});
+
+test("validateFinalItineraryInvariants: an airport-name item and a hotel-category item both count as invalidSemanticRolePlacements", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({
+      dayNumber: 1,
+      cityRegion: "City A",
+      items: [
+        buildItem({ name: "City A International Airport", category: "attraction", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+        buildItem({ name: "The Grand Hotel", category: "hotel", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+        buildItem({ name: "Chicago Union Station", category: "attraction", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+      ],
+    }),
+  ];
+  const frame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const anchors = new Map<string, { lat: number; lon: number } | null>([["City A", R3_CITY_A]]);
+
+  const report = validateFinalItineraryInvariants(days, frame, anchors, R3_MOBILITY, payload);
+  assert.equal(report.invalidSemanticRolePlacements, 3, "airport name, hotel category, and 'Union Station' name all count");
+});
+
+test("validateFinalItineraryInvariants: a transition marker not matching the day's frame boundary counts as invalidTransitionOwnership", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", items: [] }),
+    buildDay({
+      dayNumber: 2,
+      cityRegion: "City A",
+      items: [
+        buildItem({ name: "City A Sight", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+        // day 2 is interior to the City A stay (not a transfer day at all) — any transition marker here is invalid ownership
+        r3TransitionItem("Pennsylvania", "West Virginia", { lat: 39.0, lon: -80.0 }),
+      ],
+    }),
+  ];
+
+  const report = validateFinalItineraryInvariants(days, R3_FRAME_TWO_STAYS, R3_ANCHORS_TWO_STAYS, R3_MOBILITY, payload);
+  assert.equal(report.invalidTransitionOwnership, 1);
+});
+
+test("validateFinalItineraryInvariants: a real POI with null coordinates counts as realItemsWithNullLegGeometry AND illegalScheduledRealPlaces", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildCoordinatelessItem({ name: "Unresolved Real Place", category: "attraction", location: "Somewhere" })] }),
+  ];
+  const frame = buildTestFrame([{ areaLabel: "City A", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const anchors = new Map<string, { lat: number; lon: number } | null>([["City A", R3_CITY_A]]);
+
+  const report = validateFinalItineraryInvariants(days, frame, anchors, R3_MOBILITY, payload);
+  assert.equal(report.realItemsWithNullLegGeometry, 1);
+  assert.equal(report.illegalScheduledRealPlaces, 1);
+});
+
+test("validateFinalItineraryInvariants: a phase with no resolvable anchor and a real place counts as ownerGeometryMissingDays", () => {
+  const payload = buildPayload();
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "Ghost Region", items: [buildItem({ name: "Some Real Place", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon })] }),
+  ];
+  const frame = buildTestFrame([{ areaLabel: "Ghost Region", nights: 1, startDayNumber: 1, endDayNumber: 1 }]);
+  const anchors = new Map<string, { lat: number; lon: number } | null>(); // no anchor for "Ghost Region"
+
+  const report = validateFinalItineraryInvariants(days, frame, anchors, R3_MOBILITY, payload);
+  assert.equal(report.ownerGeometryMissingDays, 1);
+});
+
+// ===== enforceItineraryInvariantsWithRepair — Step 6 repair->validate->repair =====
+
+test("enforceItineraryInvariantsWithRepair: distant POI + stale transition + airport are all cleared, after-report all zero", () => {
+  const payload = buildPayload({
+    recommendations: [
+      buildRecommendation({ id: "local-a", name: "Genuine City A Attraction", category: "nature", location: "City A", lat: R3_CITY_A.lat + 0.02, lon: R3_CITY_A.lon + 0.02 }),
+    ],
+  });
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 4);
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", items: [buildItem({ name: "City A Anchor", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon })] }),
+    buildDay({
+      dayNumber: 2,
+      cityRegion: "City A",
+      items: [
+        buildItem({ name: "City A Base", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+        buildItem({ name: "Yellowstone-scale Outlier", category: "nature", lat: R3_FAR.lat, lon: R3_FAR.lon }),
+        r3TransitionItem("Miami Beach", "Orlando", { lat: 28.5, lon: -81.4 }),
+        buildItem({ name: "City A International Airport", category: "attraction", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon }),
+      ],
+    }),
+    buildDay({ dayNumber: 3, cityRegion: "City B", items: [buildItem({ name: "City B Sight", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon })] }),
+    buildDay({ dayNumber: 4, cityRegion: "City B", items: [buildItem({ name: "City B Museum", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon })] }),
+  ];
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+
+  const { days: repaired, before, after } = enforceItineraryInvariantsWithRepair(
+    days,
+    R3_FRAME_TWO_STAYS,
+    R3_ANCHORS_TWO_STAYS,
+    R3_MOBILITY,
+    payload,
+    profile,
+    window
+  );
+
+  assert.ok(before.illegalScheduledRealPlaces + before.invalidTransitionOwnership + before.invalidSemanticRolePlacements > 0, "sanity: violations existed before repair");
+  assert.equal(after.illegalScheduledRealPlaces, 0);
+  assert.equal(after.invalidTransitionOwnership, 0);
+  assert.equal(after.invalidSemanticRolePlacements, 0);
+  assert.equal(after.realItemsWithNullLegGeometry, 0);
+
+  const day2 = repaired[1];
+  assert.ok(!day2.items.some((item) => item.name === "Yellowstone-scale Outlier"), "the distant POI is gone");
+  assert.ok(!day2.items.some((item) => item.canonicalPlaceId.startsWith("transition:")), "the stale transition marker is gone");
+  assert.ok(!day2.items.some((item) => item.name === "City A International Airport"), "the airport is gone");
+});
+
+// H / I — legal content is never disturbed by the repair.
+test("enforceItineraryInvariantsWithRepair: a clean itinerary is returned byte-for-byte unchanged", () => {
+  const payload = buildPayload();
+  const profile = buildTripPreferenceProfile(basePreferences, "Country X", 4);
+  const days = [
+    buildDay({ dayNumber: 1, cityRegion: "City A", title: "יום 1 בCity A", accommodation: "לינה נוחה באזור City A", items: [buildItem({ name: "City A Sight", lat: R3_CITY_A.lat + 0.01, lon: R3_CITY_A.lon })] }),
+    buildDay({ dayNumber: 2, cityRegion: "City A", title: "יום 2 בCity A", accommodation: "לינה נוחה באזור City A", items: [buildItem({ name: "City A Park", lat: R3_CITY_A.lat, lon: R3_CITY_A.lon - 0.01 })] }),
+    buildDay({
+      dayNumber: 3,
+      cityRegion: "City B",
+      title: "יום 3 בCity B",
+      accommodation: "לינה נוחה באזור City B",
+      items: [
+        buildStayTransitionItem({ fromBase: "City A", toBase: "City B", fromCoordinates: R3_CITY_A, toCoordinates: R3_CITY_B, transportMode: "car", estimatedTravelMinutes: 120, dayNumber: 3 }),
+        buildItem({ name: "City B Sight", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon }),
+      ],
+    }),
+    buildDay({ dayNumber: 4, cityRegion: "City B", title: "יום 4 בCity B", accommodation: "לינה נוחה באזור City B", items: [buildItem({ name: "City B Museum", lat: R3_CITY_B.lat, lon: R3_CITY_B.lon })] }),
+  ];
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+
+  const { days: repaired, before } = enforceItineraryInvariantsWithRepair(days, R3_FRAME_TWO_STAYS, R3_ANCHORS_TWO_STAYS, R3_MOBILITY, payload, profile, window);
+  assert.equal(
+    before.illegalScheduledRealPlaces + before.invalidTransitionOwnership + before.invalidSemanticRolePlacements + before.realItemsWithNullLegGeometry +
+      before.dayOwnerMismatch + before.invalidDayDisplayOwnership + before.lodgingOwnerMismatch + before.syntheticOwnerMismatch,
+    0
+  );
+  assert.deepEqual(repaired, days, "no violations -> the exact same object is returned");
+});
+
+// ==================================================
+// ROUND 4 — ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER
+// ==================================================
+
+const R4_A = { lat: 40.71, lon: -74.0 };  // "Area A"
+const R4_B = { lat: 41.88, lon: -87.63 }; // "Area B"
+const R4_FRAME = buildTestFrame([
+  { areaLabel: "Area A", nights: 2, startDayNumber: 1, endDayNumber: 2 },
+  { areaLabel: "Area B", nights: 2, startDayNumber: 3, endDayNumber: 4 },
+]);
+const R4_ANCHORS = new Map<string, { lat: number; lon: number } | null>([["Area A", R4_A], ["Area B", R4_B]]);
+
+function r4Day(overrides: Partial<AiGeneratedDay>): AiGeneratedDay {
+  return buildDay({ title: "יום ? בArea A", cityRegion: "Area A", accommodation: "לינה נוחה באזור Area A", ...overrides });
+}
+function r4SyntheticFreeTime(area: string): AiGeneratedItem {
+  return buildCoordinatelessItem({
+    name: `זמן פנוי לגלות את ${area} בקצב שלכם`,
+    category: "attraction",
+    itemRole: "free_time",
+    location: area,
+    shortDescription: `חלופה גמישה וזולה באזור ${area} כדי לשמור על הקצב והתקציב בלי לנסוע רחוק.`,
+  });
+}
+function r4SyntheticMeal(area: string): AiGeneratedItem {
+  return buildCoordinatelessItem({
+    name: `הפסקת צהריים מומלצת באזור ${area}`,
+    category: "cafe",
+    itemRole: "meal_opportunity",
+    location: area,
+    slot: "lunch",
+    shortDescription: `זהו חלון זמן מומלץ לארוחת צהריים באזור ${area} — לא מסעדה קונקרטית.`,
+  });
+}
+
+const R4_PAYLOAD = buildPayload();
+const R4_PROFILE = buildTripPreferenceProfile(basePreferences, "Country X", 4);
+
+// STEP 3/4/6 — normalizeDayOwnershipToFrame rebinds a day whose display,
+// lodging and synthetic content all name the WRONG area to its canonical
+// owner, deterministically, for every field.
+test("normalizeDayOwnershipToFrame: a day displayed/lodged/synthetic-labelled as Area A but owned by Area B is fully rebound to Area B", () => {
+  const stale = r4Day({
+    dayNumber: 3, // owned by "Area B" per R4_FRAME
+    title: "יום 3 בArea A",
+    cityRegion: "Area A",
+    accommodation: "לינה נוחה באזור Area A",
+    items: [
+      r4SyntheticFreeTime("Area A"),
+      r4SyntheticMeal("Area A"),
+      buildItem({ name: "Real B Sight", lat: R4_B.lat, lon: R4_B.lon }),
+    ],
+  });
+
+  const [bound] = normalizeDayOwnershipToFrame([stale], R4_FRAME, R4_PAYLOAD, R4_PROFILE);
+
+  assert.equal(bound.phaseId, "phase-2", "day is bound to the Area B phase id");
+  assert.ok(bound.cityRegion.includes("Area B"), `display owner: ${bound.cityRegion}`);
+  assert.ok(bound.accommodation.includes("Area B"), `lodging owner: ${bound.accommodation}`);
+  assert.ok(bound.title.includes("Area B"), `title owner: ${bound.title}`);
+  const freeTime = bound.items.find((i) => i.itemRole === "free_time")!;
+  const meal = bound.items.find((i) => i.itemRole === "meal_opportunity")!;
+  assert.ok(!freeTime.name.includes("Area A") && freeTime.location.includes("Area B"), `free-time relabelled: ${freeTime.name} / ${freeTime.location}`);
+  assert.ok(!meal.name.includes("Area A") && meal.location.includes("Area B"), `meal-opportunity relabelled: ${meal.name} / ${meal.location}`);
+  assert.ok(bound.items.some((i) => i.name === "Real B Sight"), "the real item is untouched by ownership binding");
+});
+
+// A day already consistent with its owner is passed through unchanged.
+test("normalizeDayOwnershipToFrame: a day already consistent with its owner keeps its exact fields", () => {
+  const clean = r4Day({
+    dayNumber: 1,
+    title: "יום 1 בArea A",
+    cityRegion: "Area A",
+    accommodation: "לינה נוחה באזור Area A",
+    items: [r4SyntheticFreeTime("Area A"), buildItem({ name: "Real A Sight", lat: R4_A.lat, lon: R4_A.lon })],
+  });
+  const [bound] = normalizeDayOwnershipToFrame([clean], R4_FRAME, R4_PAYLOAD, R4_PROFILE);
+  assert.equal(bound.cityRegion, "Area A");
+  assert.equal(bound.accommodation, "לינה נוחה באזור Area A");
+  assert.equal(bound.title, "יום 1 בArea A");
+});
+
+// STEP 7 — the expanded pure validator flags each structural mismatch.
+test("validateFinalItineraryInvariants: display / lodging / synthetic owner mismatches are each counted", () => {
+  const days = [
+    r4Day({ dayNumber: 3, title: "יום 3 בArea A", cityRegion: "Area A", accommodation: "לינה נוחה באזור Area A", items: [r4SyntheticFreeTime("Area A"), buildItem({ name: "Real B Sight", lat: R4_B.lat, lon: R4_B.lon })] }),
+  ];
+  const report = validateFinalItineraryInvariants(days, R4_FRAME, R4_ANCHORS, R3_MOBILITY, R4_PAYLOAD);
+  assert.equal(report.invalidDayDisplayOwnership, 1, "cityRegion Area A vs owner Area B");
+  assert.equal(report.lodgingOwnerMismatch, 1, "accommodation Area A vs owner Area B");
+  assert.equal(report.syntheticOwnerMismatch, 1, "synthetic free-time location Area A vs owner Area B");
+});
+
+test("validateFinalItineraryInvariants: a day with no owning phase but real content counts as dayOwnerMismatch", () => {
+  const days = [buildDay({ dayNumber: 99, cityRegion: "Nowhere", items: [buildItem({ name: "Orphan Sight", lat: R4_A.lat, lon: R4_A.lon })] })];
+  const report = validateFinalItineraryInvariants(days, R4_FRAME, R4_ANCHORS, R3_MOBILITY, R4_PAYLOAD);
+  assert.equal(report.dayOwnerMismatch, 1);
+});
+
+test("validateFinalItineraryInvariants: a fully owner-consistent itinerary reports every Round-4 count as zero", () => {
+  const days = [
+    r4Day({ dayNumber: 1, title: "יום 1 בArea A", cityRegion: "Area A", accommodation: "לינה נוחה באזור Area A", items: [r4SyntheticFreeTime("Area A"), buildItem({ name: "Real A Sight", lat: R4_A.lat + 0.01, lon: R4_A.lon })] }),
+    r4Day({ dayNumber: 2, title: "יום 2 בArea A", cityRegion: "Area A", accommodation: "לינה נוחה באזור Area A", items: [buildItem({ name: "Real A Park", lat: R4_A.lat, lon: R4_A.lon - 0.01 })] }),
+    r4Day({
+      dayNumber: 3, title: "יום 3 בArea B", cityRegion: "Area B", accommodation: "לינה נוחה באזור Area B",
+      items: [buildStayTransitionItem({ fromBase: "Area A", toBase: "Area B", fromCoordinates: R4_A, toCoordinates: R4_B, transportMode: "car", estimatedTravelMinutes: 120, dayNumber: 3 }), buildItem({ name: "Real B Sight", lat: R4_B.lat, lon: R4_B.lon })],
+    }),
+    r4Day({ dayNumber: 4, title: "יום 4 בArea B", cityRegion: "Area B", accommodation: "לינה נוחה באזור Area B", items: [buildItem({ name: "Real B Museum", lat: R4_B.lat, lon: R4_B.lon })] }),
+  ];
+  const report = validateFinalItineraryInvariants(days, R4_FRAME, R4_ANCHORS, R3_MOBILITY, R4_PAYLOAD);
+  assert.equal(report.dayOwnerMismatch, 0);
+  assert.equal(report.invalidDayDisplayOwnership, 0);
+  assert.equal(report.lodgingOwnerMismatch, 0);
+  assert.equal(report.syntheticOwnerMismatch, 0);
+  assert.equal(report.invalidTransitionOwnership, 0);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+});
+
+// STEP 9 critical regression — a day built owned by A, then run through
+// the FULL bounded repair against a frame that owns it by B: display,
+// lodging, synthetic all derive from B; after-report all zero.
+test("enforceItineraryInvariantsWithRepair: a day authored for Area A but structurally owned by Area B ends fully consistent with Area B", () => {
+  const staleDay = r4Day({
+    dayNumber: 3,
+    title: "יום 3 בArea A",
+    cityRegion: "Area A",
+    accommodation: "לינה נוחה באזור Area A",
+    items: [
+      r4SyntheticFreeTime("Area A"),
+      r4SyntheticMeal("Area A"),
+      buildItem({ name: "Real B Sight", lat: R4_B.lat, lon: R4_B.lon }),
+    ],
+  });
+  const days = [
+    r4Day({ dayNumber: 1, title: "יום 1 בArea A", accommodation: "לינה נוחה באזור Area A", items: [buildItem({ name: "Real A Sight", lat: R4_A.lat, lon: R4_A.lon })] }),
+    r4Day({ dayNumber: 2, title: "יום 2 בArea A", accommodation: "לינה נוחה באזור Area A", items: [buildItem({ name: "Real A Park", lat: R4_A.lat, lon: R4_A.lon })] }),
+    staleDay,
+    r4Day({ dayNumber: 4, title: "יום 4 בArea B", cityRegion: "Area B", accommodation: "לינה נוחה באזור Area B", items: [buildItem({ name: "Real B Museum", lat: R4_B.lat, lon: R4_B.lon })] }),
+  ];
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+
+  const { days: repaired, before, after } = enforceItineraryInvariantsWithRepair(days, R4_FRAME, R4_ANCHORS, R3_MOBILITY, R4_PAYLOAD, R4_PROFILE, window);
+
+  assert.ok(before.invalidDayDisplayOwnership + before.lodgingOwnerMismatch + before.syntheticOwnerMismatch > 0, "sanity: mismatches existed");
+  assert.equal(after.dayOwnerMismatch, 0);
+  assert.equal(after.invalidDayDisplayOwnership, 0);
+  assert.equal(after.lodgingOwnerMismatch, 0);
+  assert.equal(after.syntheticOwnerMismatch, 0);
+  assert.equal(after.invalidTransitionOwnership, 0);
+  assert.equal(after.illegalScheduledRealPlaces, 0);
+
+  const day3 = repaired[2];
+  assert.ok(day3.cityRegion.includes("Area B"), `display: ${day3.cityRegion}`);
+  assert.ok(day3.accommodation.includes("Area B"), `lodging: ${day3.accommodation}`);
+  assert.ok(day3.items.filter((i) => i.itemRole === "free_time" || i.itemRole === "meal_opportunity").every((i) => !i.name.includes("Area A") && i.location.includes("Area B")), "synthetic items derive from Area B");
+});
+
+// ==================================================
+// ROUND 5 — FULL DAY GEOGRAPHIC OWNERSHIP, FOOD + NARRATIVE
+// ==================================================
+
+const R5_OWNER = { lat: 44.5, lon: -110.0 };  // "Owner Area" (a remote, national-park-scale base)
+const R5_FAR = { lat: 40.71, lon: -74.0 };    // "Far Metro" — a distant metro
+const R5_FRAME = buildTestFrame([
+  { areaLabel: "Owner Area", nights: 2, startDayNumber: 1, endDayNumber: 2 },
+  { areaLabel: "Far Metro", nights: 2, startDayNumber: 3, endDayNumber: 4 },
+]);
+const R5_ANCHORS = new Map<string, { lat: number; lon: number } | null>([["Owner Area", R5_OWNER], ["Far Metro", R5_FAR]]);
+const R5_PAYLOAD = buildPayload();
+const R5_PROFILE = buildTripPreferenceProfile(basePreferences, "Country X", 4);
+
+function r5Day(overrides: Partial<AiGeneratedDay>): AiGeneratedDay {
+  return buildDay({
+    dayNumber: 1,
+    cityRegion: "Owner Area",
+    accommodation: "לינה נוחה באזור Owner Area",
+    title: "יום 1 בOwner Area",
+    notes: "יום רגוע. היום בנוי סביב Owner Area כדי לשמור על קצב טבעי, אוכל קרוב ומעברים הגיוניים.",
+    ...overrides,
+  });
+}
+
+// 1 — owner "Owner Area" + a real (coordinate-having) restaurant in "Far Metro" -> illegal, repaired away.
+test("Round 5: a real restaurant with real coordinates far from the day owner is flagged AND repaired", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ id: "local-rest", name: "Genuine Local Diner", category: "restaurant", location: "Owner Area", lat: R5_OWNER.lat + 0.01, lon: R5_OWNER.lon })],
+  });
+  const day = r5Day({ dayNumber: 1, items: [buildItem({ name: "Le Bernardin", category: "restaurant", recommendationId: "rec-le-bernardin", lat: R5_FAR.lat, lon: R5_FAR.lon })] });
+
+  const before = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, payload);
+  assert.ok(before.realFoodVenueOwnerMismatch >= 1, "a real food venue far from the owner must be counted");
+  assert.ok(before.illegalScheduledRealPlaces >= 1);
+
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+  const { days, after } = enforceItineraryInvariantsWithRepair([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, payload, R5_PROFILE, window);
+  assert.equal(after.realFoodVenueOwnerMismatch, 0);
+  assert.ok(!days[0].items.some((i) => i.name === "Le Bernardin"), "the distant restaurant is gone");
+});
+
+// 2 — owner + a distant cafe -> same.
+test("Round 5: a real cafe far from the day owner is flagged AND repaired", () => {
+  const day = r5Day({ dayNumber: 1, items: [buildItem({ name: "Blue Bottle Coffee", category: "cafe", recommendationId: "rec-bb", lat: R5_FAR.lat, lon: R5_FAR.lon })] });
+  const before = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.ok(before.realFoodVenueOwnerMismatch >= 1);
+
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+  const { days } = enforceItineraryInvariantsWithRepair([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD, R5_PROFILE, window);
+  assert.ok(!days[0].items.some((i) => i.name === "Blue Bottle Coffee"));
+});
+
+// 3 — a generic MealOpportunity placeholder labelled with a foreign area is regenerated to the owner.
+test("Round 5: a meal-opportunity placeholder labelled with a foreign area is regenerated to the day owner", () => {
+  const staleMeal = buildCoordinatelessItem({
+    name: "הפסקת צהריים מומלצת באזור Far Metro",
+    category: "cafe",
+    itemRole: "meal_opportunity",
+    location: "Far Metro",
+    slot: "lunch",
+    shortDescription: "זהו חלון זמן מומלץ לארוחת צהריים באזור Far Metro",
+  });
+  const day = r5Day({ dayNumber: 1, items: [staleMeal, buildItem({ name: "Owner Sight", lat: R5_OWNER.lat, lon: R5_OWNER.lon })] });
+
+  const [bound] = normalizeDayOwnershipToFrame([day], R5_FRAME, R5_PAYLOAD, R5_PROFILE);
+  const meal = bound.items.find((i) => i.itemRole === "meal_opportunity")!;
+  assert.ok(!meal.name.includes("Far Metro") && meal.location.includes("Owner Area"), `regenerated: ${meal.name} / ${meal.location}`);
+});
+
+// 3b — a coordinate-less Gemini "restaurant" (itemRole dropped) is treated as a meal-opportunity marker and regenerated.
+test("Round 5: a coordinate-less unmatched restaurant name is treated as a meal-opportunity marker and regenerated to the owner", () => {
+  const fakeRest = buildCoordinatelessItem({ name: "Lilia", category: "restaurant", location: "Brooklyn", slot: "dinner", recommendationId: null });
+  const day = r5Day({ dayNumber: 1, items: [fakeRest, buildItem({ name: "Owner Sight", lat: R5_OWNER.lat, lon: R5_OWNER.lon })] });
+
+  const [bound] = normalizeDayOwnershipToFrame([day], R5_FRAME, R5_PAYLOAD, R5_PROFILE);
+  assert.ok(!bound.items.some((i) => i.name === "Lilia"), "the unverifiable restaurant name is replaced");
+  assert.ok(bound.items.some((i) => (i.itemRole === "meal_opportunity") && i.location.includes("Owner Area")), "replaced by an owner-area meal opportunity");
+});
+
+// 4 — day narrative naming a foreign area is regenerated.
+test("Round 5: a day whose notes say 'built around <foreign area>' has its narrative regenerated to the owner", () => {
+  const day = r5Day({ dayNumber: 3, cityRegion: "Far Metro", accommodation: "לינה נוחה באזור Far Metro", title: "יום 3 בFar Metro",
+    notes: "יום רגוע. היום בנוי סביב Owner Area כדי לשמור על קצב טבעי.", items: [buildItem({ name: "Far Sight", lat: R5_FAR.lat, lon: R5_FAR.lon })] });
+
+  const before = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.equal(before.narrativeOwnerMismatch, 1, "notes name 'Owner Area' on a 'Far Metro'-owned day");
+
+  const [bound] = normalizeDayOwnershipToFrame([day], R5_FRAME, R5_PAYLOAD, R5_PROFILE);
+  assert.ok(bound.notes.includes("Far Metro") && !bound.notes.includes("Owner Area"), `regenerated notes: ${bound.notes}`);
+  const after = validateFinalItineraryInvariants([bound], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.equal(after.narrativeOwnerMismatch, 0);
+});
+
+// 5 — a real cafe/restaurant is treated as a real place (goes through legality), not skipped as synthetic.
+test("Round 5: the validator does NOT continue past a real restaurant/cafe — it is judged like an attraction", () => {
+  const localRest = buildItem({ name: "Local Bistro", category: "restaurant", recommendationId: "rec-local", lat: R5_OWNER.lat + 0.01, lon: R5_OWNER.lon });
+  const farRest = buildItem({ name: "Far Bistro", category: "restaurant", recommendationId: "rec-far", lat: R5_FAR.lat, lon: R5_FAR.lon });
+  const day = r5Day({ dayNumber: 1, items: [localRest, farRest] });
+  const report = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.equal(report.realFoodVenueOwnerMismatch, 1, "only the far one is flagged; a real restaurant is definitely SEEN");
+});
+
+// 6 — a generic MealOpportunity in the correct owner area is NOT flagged as an illegal real place.
+test("Round 5: a generic meal-opportunity in the correct owner area is synthetic — never counted as an illegal real place", () => {
+  const okMeal = buildCoordinatelessItem({ name: "🍽 זמן מומלץ לארוחת צהריים באזור Owner Area", category: "cafe", itemRole: "meal_opportunity", location: "Owner Area", slot: "lunch" });
+  const day = r5Day({ dayNumber: 1, items: [okMeal, buildItem({ name: "Owner Sight", lat: R5_OWNER.lat, lon: R5_OWNER.lon })] });
+  const report = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+  assert.equal(report.realFoodVenueOwnerMismatch, 0);
+  assert.equal(report.syntheticOwnerMismatch, 0);
+});
+
+// 7/8/9 — legal local content survives untouched.
+test("Round 5: a clean day (local restaurant + local attraction + owner-correct narrative) is unchanged and all counts zero", () => {
+  const day = r5Day({
+    dayNumber: 1,
+    items: [
+      buildItem({ name: "Local Grill", category: "restaurant", recommendationId: "rec-g", lat: R5_OWNER.lat + 0.01, lon: R5_OWNER.lon }),
+      buildItem({ name: "Owner Museum", category: "museum", lat: R5_OWNER.lat, lon: R5_OWNER.lon - 0.01 }),
+      buildCoordinatelessItem({ name: "🍽 זמן מומלץ לארוחת ערב באזור Owner Area", category: "restaurant", itemRole: "meal_opportunity", location: "Owner Area", slot: "dinner" }),
+    ],
+  });
+  const report = validateFinalItineraryInvariants([day], R5_FRAME, R5_ANCHORS, R3_MOBILITY, R5_PAYLOAD);
+  assert.equal(
+    report.illegalScheduledRealPlaces + report.realFoodVenueOwnerMismatch + report.narrativeOwnerMismatch +
+      report.syntheticOwnerMismatch + report.invalidDayDisplayOwnership + report.lodgingOwnerMismatch + report.dayOwnerMismatch,
+    0
+  );
+  const [bound] = normalizeDayOwnershipToFrame([day], R5_FRAME, R5_PAYLOAD, R5_PROFILE);
+  assert.equal(bound.notes, day.notes, "owner-correct narrative untouched");
+  assert.ok(bound.items.some((i) => i.name === "Local Grill"), "legal local restaurant survives");
+  assert.ok(bound.items.some((i) => i.name === "Owner Museum"), "legal local attraction survives");
+});
+
+// 10 — full sequence: distant restaurant + foreign meal placeholder + stale narrative -> all counts zero after repair.
+test("Round 5: normalize + gate + invariant-repair together leave every ownership count zero (food + narrative + synthetic)", () => {
+  const payload = buildPayload({
+    recommendations: [buildRecommendation({ id: "owner-rest", name: "Owner Area Cafe", category: "cafe", location: "Owner Area", lat: R5_OWNER.lat + 0.01, lon: R5_OWNER.lon + 0.01 })],
+  });
+  const day = r5Day({
+    dayNumber: 1,
+    notes: "יום רגוע. היום בנוי סביב Far Metro כדי לשמור על קצב טבעי.",
+    items: [
+      buildItem({ name: "Le Bernardin", category: "restaurant", recommendationId: "rec-lb", lat: R5_FAR.lat, lon: R5_FAR.lon }),
+      buildCoordinatelessItem({ name: "הפסקת צהריים מומלצת באזור Far Metro", category: "cafe", itemRole: "meal_opportunity", location: "Far Metro", slot: "lunch" }),
+      buildItem({ name: "Owner Sight", lat: R5_OWNER.lat, lon: R5_OWNER.lon }),
+    ],
+  });
+  const days = [day, r5Day({ dayNumber: 2, items: [buildItem({ name: "Owner Sight 2", lat: R5_OWNER.lat, lon: R5_OWNER.lon })] }),
+    r5Day({ dayNumber: 3, cityRegion: "Far Metro", accommodation: "לינה נוחה באזור Far Metro", title: "יום 3 בFar Metro", notes: "היום בנוי סביב Far Metro.", items: [buildItem({ name: "Far Sight", lat: R5_FAR.lat, lon: R5_FAR.lon })] }),
+    r5Day({ dayNumber: 4, cityRegion: "Far Metro", accommodation: "לינה נוחה באזור Far Metro", title: "יום 4 בFar Metro", notes: "היום בנוי סביב Far Metro.", items: [buildItem({ name: "Far Museum", lat: R5_FAR.lat, lon: R5_FAR.lon })] })];
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+
+  const { days: repaired, before, after } = enforceItineraryInvariantsWithRepair(days, R5_FRAME, R5_ANCHORS, R3_MOBILITY, payload, R5_PROFILE, window);
+  assert.ok(before.realFoodVenueOwnerMismatch + before.narrativeOwnerMismatch + before.syntheticOwnerMismatch > 0, "sanity: violations existed");
+  assert.equal(after.illegalScheduledRealPlaces, 0);
+  assert.equal(after.realFoodVenueOwnerMismatch, 0);
+  assert.equal(after.narrativeOwnerMismatch, 0);
+  assert.equal(after.syntheticOwnerMismatch, 0);
+  assert.equal(after.invalidTransitionOwnership, 0);
+  assert.ok(!repaired[0].items.some((i) => i.name === "Le Bernardin"));
+  assert.ok(repaired[0].notes.includes("Owner Area") && !repaired[0].notes.includes("Far Metro"));
+});
+
+// ==================================================
+// ROUND 6 — LAST REAL-POI GEOGRAPHY ESCAPE (any category, incl. museum)
+// ==================================================
+
+// Area A anchor, and a genuinely-separate "Metro B" ~222 km away that has
+// its OWN pool anchor. A POI ~111 km from A (WITHIN the 120 km sparse-tier
+// radius, so evaluateScheduledPlaceLegality alone says "legal") but whose
+// own location text names "Metro B".
+const R6_A = { lat: 0, lon: 0 };
+const R6_METRO_B = { lat: 0, lon: 1.5 };       // ~167 km east of A — a genuinely separate metro
+const R6_BETWEEN = { lat: 0, lon: 0.9 };       // ~100 km east of A (INSIDE the 120 km radius) but ~67 km from Metro B — genuinely "in" Metro B
+const R6_FRAME = buildTestFrame([{ areaLabel: "Area A", nights: 3, startDayNumber: 1, endDayNumber: 3 }]);
+// areaAnchors includes a pool-derived "Metro B" the trip does NOT structurally visit.
+const R6_ANCHORS = new Map<string, { lat: number; lon: number } | null>([["Area A", R6_A], ["Metro B", R6_METRO_B]]);
+const R6_MOBILITY = { tier: "large_sparse" as const, localityRadiusKm: 120, normalDayTravelBudgetMinutes: 160 };
+const R6_PAYLOAD = buildPayload();
+const R6_PROFILE = buildTripPreferenceProfile(basePreferences, "Country X", 3);
+
+function r6Day(items: AiGeneratedItem[], overrides: Partial<AiGeneratedDay> = {}): AiGeneratedDay {
+  return buildDay({ dayNumber: 1, cityRegion: "Area A", accommodation: "לינה נוחה באזור Area A", title: "יום 1 בArea A", notes: "היום בנוי סביב Area A.", items, ...overrides });
+}
+function r6Venue(name: string, category: AiGeneratedItem["category"], location: string, coords: { lat: number; lon: number }): AiGeneratedItem {
+  return buildItem({ name, category, location, recommendationId: `rec-${name.replace(/\s+/g, "-")}`, lat: coords.lat, lon: coords.lon });
+}
+
+// A–D — a distant venue of ANY category whose own text names Metro B is flagged even though ~111 km < 120 km radius.
+for (const [label, category] of [["museum", "museum"], ["restaurant", "restaurant"], ["cafe", "cafe"], ["shopping venue", "shopping"]] as const) {
+  test(`Round 6: a ${label} whose location names a genuinely-separate known area is illegal even inside the raw radius`, () => {
+    const day = r6Day([r6Venue(`Distant ${label}`, category, "Metro B", R6_BETWEEN), buildItem({ name: "Local A Sight", lat: R6_A.lat, lon: R6_A.lon })]);
+    const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+    assert.ok(report.illegalScheduledRealPlaces >= 1, `${label} at 111km naming Metro B must be counted`);
+
+    const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+    const { days, after } = enforceItineraryInvariantsWithRepair([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD, R6_PROFILE, window);
+    assert.equal(after.illegalScheduledRealPlaces, 0);
+    assert.ok(!days[0].items.some((i) => i.name === `Distant ${label}`), `the distant ${label} is removed/replaced`);
+  });
+}
+
+// E — a local museum survives untouched.
+test("Round 6: a local museum (in the day owner's own area) survives", () => {
+  const day = r6Day([r6Venue("Local A Museum", "museum", "Area A", { lat: R6_A.lat + 0.01, lon: R6_A.lon })]);
+  const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+  const { days } = enforceItineraryInvariantsWithRepair([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD, R6_PROFILE, window);
+  assert.ok(days[0].items.some((i) => i.name === "Local A Museum"));
+});
+
+// F — a local restaurant survives untouched.
+test("Round 6: a local restaurant (in the day owner's own area) survives", () => {
+  const day = r6Day([r6Venue("Local A Bistro", "restaurant", "Area A", { lat: R6_A.lat + 0.01, lon: R6_A.lon })]);
+  const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+});
+
+// G — a generic meal opportunity is not treated as a real place.
+test("Round 6: a generic meal opportunity is never counted as a real scheduled place", () => {
+  const meal = buildCoordinatelessItem({ name: "🍽 זמן מומלץ לארוחת צהריים באזור Area A", category: "cafe", itemRole: "meal_opportunity", location: "Area A", slot: "lunch" });
+  const day = r6Day([meal, buildItem({ name: "Local A Sight", lat: R6_A.lat, lon: R6_A.lon })]);
+  const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+});
+
+// H — a free-time block is not treated as a real place.
+test("Round 6: a free-time block is never counted as a real scheduled place", () => {
+  const ft = buildCoordinatelessItem({ name: "זמן פנוי לגלות את Area A", category: "attraction", itemRole: "free_time", location: "Area A" });
+  const day = r6Day([ft, buildItem({ name: "Local A Sight", lat: R6_A.lat, lon: R6_A.lon })]);
+  const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+});
+
+// I — the canonical stay-transition item is never treated as an activity/real place.
+test("Round 6: the canonical stay-transition item is never counted as a real scheduled place", () => {
+  const twoStayFrame = buildTestFrame([
+    { areaLabel: "Area A", nights: 1, startDayNumber: 1, endDayNumber: 1 },
+    { areaLabel: "Metro B", nights: 1, startDayNumber: 2, endDayNumber: 2 },
+  ]);
+  const anchors = new Map<string, { lat: number; lon: number } | null>([["Area A", R6_A], ["Metro B", R6_METRO_B]]);
+  const transferDay = buildDay({
+    dayNumber: 2, cityRegion: "Metro B", accommodation: "לינה נוחה באזור Metro B", title: "יום 2 בMetro B", notes: "היום בנוי סביב Metro B.",
+    items: [
+      buildStayTransitionItem({ fromBase: "Area A", toBase: "Metro B", fromCoordinates: R6_A, toCoordinates: R6_METRO_B, transportMode: "car", estimatedTravelMinutes: 200, dayNumber: 2 }),
+      buildItem({ name: "Metro B Arrival Stroll", lat: R6_METRO_B.lat, lon: R6_METRO_B.lon }),
+    ],
+  });
+  const report = validateFinalItineraryInvariants([transferDay], twoStayFrame, anchors, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(report.illegalScheduledRealPlaces, 0);
+  assert.equal(report.invalidTransitionOwnership, 0);
+});
+
+// J — full sequence: a distant museum + a distant restaurant naming a separate area, all cleared, total zero.
+test("Round 6: the full finalization sequence leaves illegalScheduledRealPlaces = 0 for distant venues of mixed category", () => {
+  const day = r6Day([
+    r6Venue("Distant Museum", "museum", "Metro B", R6_BETWEEN),
+    r6Venue("Distant Diner", "restaurant", "Metro B", R6_BETWEEN),
+    buildItem({ name: "Local A Sight", lat: R6_A.lat, lon: R6_A.lon }),
+  ]);
+  const days = [day, r6Day([buildItem({ name: "Local A Sight 2", lat: R6_A.lat, lon: R6_A.lon })], { dayNumber: 2 }),
+    r6Day([buildItem({ name: "Local A Sight 3", lat: R6_A.lat, lon: R6_A.lon })], { dayNumber: 3 })];
+  const window = { earliestUsableTimeOnArrivalDay: null, latestUsableTimeOnDepartureDay: null } as never;
+
+  const localityDays = enforceNormalDayLocality(days, R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD, R6_PROFILE, window).days;
+  const roleDays = enforceTransportRoleGuard(localityDays, R6_PAYLOAD, R6_PROFILE, R6_FRAME, R6_ANCHORS).days;
+  const gateDays = enforceFinalPlaceLegalityGate(roleDays, R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD, R6_PROFILE, window).days;
+  const { days: finalDays, after } = enforceItineraryInvariantsWithRepair(gateDays, R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD, R6_PROFILE, window);
+
+  assert.equal(after.illegalScheduledRealPlaces, 0);
+  assert.ok(!finalDays[0].items.some((i) => i.name === "Distant Museum"));
+  assert.ok(!finalDays[0].items.some((i) => i.name === "Distant Diner"));
+  assert.ok(finalDays[0].items.some((i) => i.name === "Local A Sight"), "the local item is untouched");
+});
+
+// K — the diagnostic 3-way breakdown always sums back to the ONE authoritative total.
+test("Round 6: illegalReal{Attractions,FoodVenues,OtherVenues} always sum to illegalScheduledRealPlaces", () => {
+  const day = r6Day([
+    r6Venue("Distant Museum", "museum", "Metro B", R6_BETWEEN),
+    r6Venue("Distant Diner", "restaurant", "Metro B", R6_BETWEEN),
+    r6Venue("Distant Cafe", "cafe", "Metro B", R6_BETWEEN),
+    r6Venue("Distant Nightlife", "nightlife", "Metro B", R6_BETWEEN),
+    buildItem({ name: "Local A Sight", lat: R6_A.lat, lon: R6_A.lon }),
+  ]);
+  const report = validateFinalItineraryInvariants([day], R6_FRAME, R6_ANCHORS, R6_MOBILITY, R6_PAYLOAD);
+  assert.equal(
+    report.illegalRealAttractions + report.illegalRealFoodVenues + report.illegalRealOtherVenues,
+    report.illegalScheduledRealPlaces,
+    "breakdown must partition the authoritative total exactly",
+  );
+  assert.equal(report.illegalRealAttractions, 1, "the museum");
+  assert.equal(report.illegalRealFoodVenues, 2, "restaurant + cafe");
+  assert.equal(report.illegalRealOtherVenues, 1, "nightlife");
 });

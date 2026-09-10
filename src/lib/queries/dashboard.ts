@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 
 import { useTripHubTrips } from "@/lib/queries/trip-hub";
-import { useCountries } from "@/lib/queries/countries";
+import { useMapCountryStatuses } from "@/lib/queries/countries";
 import { useTripRatingsForItineraries } from "@/lib/queries/trip-ratings";
 import {
   computePassportStats,
@@ -35,22 +35,23 @@ export interface DashboardStats {
  * Derives every number from the same central trip source Trips/Passport
  * already use (`useTripHubTrips()` -> `country_itineraries`), instead of
  * the legacy, disconnected `trips`/`country_ratings` tables the seeds never
- * populate. `countriesPlanned` is the one legacy read kept — it answers a
- * genuinely different question (manually-flagged map intent), not trip
- * history, so there's no `country_itineraries` equivalent to derive it from.
+ * populate. Spec "PART B — MAP STATUS MUST BE SERVER AUTHORITATIVE" —
+ * `countriesPlanned` reads the same server-computed `effectiveStatus`
+ * (`useMapCountryStatuses` -> /api/map/countries) every other
+ * status-showing surface renders, so it can never disagree with the map.
  */
 export function useDashboardStats() {
   const tripsQuery = useTripHubTrips();
-  const countriesQuery = useCountries();
+  const mapStatusesQuery = useMapCountryStatuses();
   const trips = useMemo(() => tripsQuery.data ?? [], [tripsQuery.data]);
 
   const completedIds = useMemo(() => getCompletedTrips(trips).map((trip) => trip.id), [trips]);
   const ratingsQuery = useTripRatingsForItineraries(completedIds);
 
-  const isLoading = tripsQuery.isLoading || countriesQuery.isLoading || ratingsQuery.isLoading;
+  const isLoading = tripsQuery.isLoading || mapStatusesQuery.isLoading || ratingsQuery.isLoading;
 
   const data = useMemo<DashboardStats | undefined>(() => {
-    if (tripsQuery.isLoading || countriesQuery.isLoading) return undefined;
+    if (tripsQuery.isLoading || mapStatusesQuery.isLoading) return undefined;
 
     const completed = getCompletedTrips(trips);
     const passportStats = computePassportStats(trips);
@@ -71,7 +72,7 @@ export function useDashboardStats() {
 
     return {
       countriesVisited: passportStats.countriesVisited,
-      countriesPlanned: (countriesQuery.data ?? []).filter((country) => country.status === "planned").length,
+      countriesPlanned: (mapStatusesQuery.data ?? []).filter((country) => country.effectiveStatus === "planned").length,
       citiesVisited: passportStats.citiesVisited,
       totalTrips: completed.length,
       totalDaysTraveled: passportStats.knownTravelDays,
@@ -88,7 +89,7 @@ export function useDashboardStats() {
         })
         .slice(0, 5),
     };
-  }, [trips, tripsQuery.isLoading, countriesQuery.data, countriesQuery.isLoading, ratingsQuery.data]);
+  }, [trips, tripsQuery.isLoading, mapStatusesQuery.data, mapStatusesQuery.isLoading, ratingsQuery.data]);
 
   return { data, isLoading };
 }

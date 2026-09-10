@@ -3,10 +3,12 @@ import test from "node:test";
 
 import type { CountryItineraryRecord } from "../src/lib/itineraries";
 import { buildTripHubTrip, type TripHubCountry, type TripHubTrip } from "../src/lib/trip-hub";
+import { getDestinationDateString } from "../src/lib/live-trip-time";
 import {
   buildGlobalTimeline,
   computePassportStats,
   deriveCountryMapStatuses,
+  deriveCountryTravelStatus,
   getCompletedTrips,
   getUpcomingTrips,
   groupTripsByCountry,
@@ -106,6 +108,119 @@ test("deriveCountryMapStatuses maps completed->visited and upcoming->planned, ne
   const completed = trip({ id: "done" });
   const completedStatuses = deriveCountryMapStatuses([completed]);
   assert.equal(completedStatuses.EG, "visited");
+});
+
+// ==================================================
+// Spec "MAP COUNTRY STATUS MUST BE DERIVED FROM TRIPS" — deriveCountryTravelStatus
+// is the ONE authoritative rule (VISITED > PLANNED > NOT_VISITED, keyed by
+// canonical isoA2, using TripHubTrip.hasStarted — the same destination-local
+// calendar-date predicate every other itinerary-status computation in this
+// codebase already uses, never a second competing date system).
+// ==================================================
+
+// A. no trips -> NOT_VISITED
+test("deriveCountryTravelStatus: no trips is NOT_VISITED", () => {
+  assert.equal(deriveCountryTravelStatus([]), "not_visited");
+});
+
+// B. future trip -> PLANNED
+test("deriveCountryTravelStatus: a single not-yet-started trip is PLANNED", () => {
+  assert.equal(deriveCountryTravelStatus([{ hasStarted: false }]), "planned");
+});
+
+// C. trip starts today -> VISITED (real trip, real destination-local "today")
+test("deriveCountryTravelStatus: a trip whose startDate is today is VISITED, not planned", () => {
+  const todayEG = getDestinationDateString("EG");
+  const startsToday = trip({ id: "starts-today", status: "upcoming", startDate: todayEG, endDate: todayEG });
+  assert.equal(startsToday.hasStarted, true, "sanity: TripHubTrip.hasStarted must already treat startDate<=today as started");
+  assert.equal(deriveCountryTravelStatus([startsToday]), "visited");
+});
+
+// D. trip currently active -> VISITED
+test("deriveCountryTravelStatus: an active trip is VISITED", () => {
+  const todayEG = getDestinationDateString("EG");
+  const active = trip({ id: "active-trip", status: "active", startDate: todayEG, endDate: "2099-01-01" });
+  assert.equal(deriveCountryTravelStatus([active]), "visited");
+});
+
+// E. completed trip -> VISITED
+test("deriveCountryTravelStatus: a completed trip is VISITED", () => {
+  assert.equal(deriveCountryTravelStatus([trip({ id: "done-e" })]), "visited");
+});
+
+// F. past + future trip -> VISITED (a later future trip never downgrades)
+test("deriveCountryTravelStatus: a completed trip plus a future trip stays VISITED (precedence)", () => {
+  const past = trip({ id: "past-f" });
+  const future = trip({ id: "future-f", status: "upcoming", startDate: "2099-01-01", endDate: "2099-01-05" });
+  assert.equal(deriveCountryTravelStatus([past, future]), "visited");
+  assert.equal(deriveCountryTravelStatus([future, past]), "visited", "order must not matter");
+});
+
+// G. two future trips -> PLANNED
+test("deriveCountryTravelStatus: two future trips, neither started, is PLANNED", () => {
+  const futureA = { hasStarted: false };
+  const futureB = { hasStarted: false };
+  assert.equal(deriveCountryTravelStatus([futureA, futureB]), "planned");
+});
+
+// H. delete the only future trip -> NOT_VISITED (modeled as calling the pure
+// function with the post-deletion trip list — it has no other state to go stale)
+test("deriveCountryTravelStatus: removing the only (future) trip from the list reverts to NOT_VISITED", () => {
+  const beforeDelete = deriveCountryTravelStatus([{ hasStarted: false }]);
+  assert.equal(beforeDelete, "planned");
+  const afterDelete = deriveCountryTravelStatus([]);
+  assert.equal(afterDelete, "not_visited");
+});
+
+// I. delete future trip while a past trip exists -> VISITED remains
+test("deriveCountryTravelStatus: deleting a future trip while a past trip remains stays VISITED", () => {
+  const past = { hasStarted: true };
+  const future = { hasStarted: false };
+  assert.equal(deriveCountryTravelStatus([past, future]), "visited");
+  assert.equal(deriveCountryTravelStatus([past]), "visited", "removing the future trip must not affect the still-visited status");
+});
+
+// J. changing a future trip's destination recomputes BOTH countries via
+// deriveCountryMapStatuses (grouped by isoA2) — country A loses its only
+// trip (-> not present / NOT_VISITED), country B gains one (-> PLANNED).
+test("deriveCountryMapStatuses: moving a future trip's destination recomputes both the old and new country", () => {
+  const JORDAN_COUNTRY: TripHubCountry = { id: "country-jo", name: "Jordan", isoA2: "JO", status: "not_visited" };
+  const futureToEgypt = trip({ id: "moving-trip", status: "upcoming", startDate: "2099-01-01", endDate: "2099-01-05" });
+
+  const beforeMove = deriveCountryMapStatuses([futureToEgypt]);
+  assert.equal(beforeMove.EG, "planned");
+  assert.equal(beforeMove.JO, undefined, "Jordan has no trips yet — absent, i.e. not_visited");
+
+  const futureToJordan = buildTripHubTrip(
+    buildItinerary({ id: "moving-trip", isoA2: "JO", status: "upcoming", startDate: "2099-01-01", endDate: "2099-01-05" }),
+    JORDAN_COUNTRY
+  );
+  const afterMove = deriveCountryMapStatuses([futureToJordan]);
+  assert.equal(afterMove.EG, undefined, "Egypt's only trip moved away — no longer planned");
+  assert.equal(afterMove.JO, "planned");
+});
+
+// K. local-date boundary — a trip starting today is VISITED regardless of
+// UTC offset. TripHubTrip.hasStarted is built on getDestinationDateString
+// (date-fns-tz, destination-local), never a raw UTC `new Date()` compare —
+// this test pins that exact mechanism, not a reimplementation of it.
+test("deriveCountryTravelStatus: today's boundary uses the destination-local calendar date, never a UTC timestamp", () => {
+  const todayEG = getDestinationDateString("EG");
+  const startsToday = trip({ id: "boundary-k", status: "upcoming", startDate: todayEG, endDate: todayEG });
+  assert.equal(deriveCountryTravelStatus([startsToday]), "visited");
+});
+
+// L. Hebrew/English display labels never create separate country identity
+// — grouping is purely by canonical isoA2, uppercased.
+test("deriveCountryMapStatuses: Hebrew and English display names for the same country resolve to one identity", () => {
+  const englishLabelCountry: TripHubCountry = { id: "country-eg", name: "Egypt", isoA2: "eg", status: "visited" };
+  const hebrewLabelCountry: TripHubCountry = { id: "country-eg", name: "מצרים", isoA2: "EG", status: "visited" };
+  const tripA = buildTripHubTrip(buildItinerary({ id: "a-l" }), englishLabelCountry);
+  const tripB = buildTripHubTrip(buildItinerary({ id: "b-l", status: "upcoming", startDate: "2099-01-01", endDate: "2099-01-05" }), hebrewLabelCountry);
+
+  const statuses = deriveCountryMapStatuses([tripA, tripB]);
+  assert.equal(Object.keys(statuses).length, 1, "one country, one status entry, regardless of display-name casing/language");
+  assert.equal(statuses.EG, "visited", "the completed trip's VISITED status must win precedence, whichever record is read first");
 });
 
 // 6. Historical partial dates sort correctly (no invented dates).

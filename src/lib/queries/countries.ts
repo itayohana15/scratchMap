@@ -3,12 +3,35 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { createClient } from "@/lib/supabase/client";
+import type { EffectiveCountryStatus } from "@/lib/server/country-statuses";
 import type { Tables, TablesInsert, TablesUpdate } from "@/lib/supabase/types";
 
 export const countryKeys = {
   all: ["countries"] as const,
   byIso: (iso: string) => ["countries", "iso", iso.toLowerCase()] as const,
+  /** Spec "MAP STATUS MUST BE SERVER AUTHORITATIVE" — the server-computed effective-status list. */
+  mapStatuses: ["countries", "map-statuses"] as const,
 };
+
+/**
+ * Spec "PART B — MAP STATUS MUST BE SERVER AUTHORITATIVE" — the ONE hook
+ * every status-showing surface (map fill, sidebar, filters, country detail
+ * badge, dashboard counters) reads. It returns the server-derived
+ * `effectiveStatus` per country; the client never re-derives the rule from
+ * trips. Invalidated by every trip create/delete/edit (see trip-hub.ts /
+ * country-itineraries.ts) and by manual `countries.status` edits.
+ */
+export function useMapCountryStatuses() {
+  return useQuery({
+    queryKey: countryKeys.mapStatuses,
+    queryFn: async (): Promise<EffectiveCountryStatus[]> => {
+      const response = await fetch("/api/map/countries");
+      if (!response.ok) throw new Error("Failed to load country statuses");
+      const data = (await response.json()) as { countries: EffectiveCountryStatus[] };
+      return data.countries;
+    },
+  });
+}
 
 export function useCountries() {
   const supabase = createClient();
@@ -70,6 +93,8 @@ export function useUpsertCountry() {
       queryClient.setQueryData(countryKeys.byIso(data.iso_a2), data);
       queryClient.invalidateQueries({ queryKey: countryKeys.all });
       queryClient.invalidateQueries({ queryKey: countryKeys.byIso(data.iso_a2) });
+      // A manual status change on a trip-less country must repaint the map.
+      queryClient.invalidateQueries({ queryKey: countryKeys.mapStatuses });
     },
   });
 }

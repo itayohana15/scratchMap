@@ -14,6 +14,7 @@
   "include": [
     "src/lib/trip-workspace.ts",
     "src/lib/itineraries.ts",
+    "src/lib/server/country-statuses.ts",
     "src/lib/trip-bookings.ts",
     "src/lib/trip-documents.ts",
     "src/lib/trip-checklist.ts",
@@ -67,6 +68,7 @@
     "tests/trip-actual.test.ts",
     "tests/trip-memories.test.ts",
     "tests/travel-passport.test.ts",
+    "tests/country-statuses.test.ts",
     "tests/preference-learning.test.ts",
     "tests/format.test.ts",
     "tests/trip-preference-overrides.test.ts",
@@ -95,7 +97,9 @@
     "tests/overpass.test.ts",
     "tests/planner-qa-trace.test.ts",
     "tests/fixture-capture.test.ts",
-    "tests/client-debug.test.ts"
+    "tests/client-debug.test.ts",
+    "tests/route-sequencing.test.ts",
+    "tests/scheduled-place-legality.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }
