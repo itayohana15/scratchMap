@@ -9,6 +9,19 @@ export interface GeocodedPlace {
   name: string;
   lat: number;
   lon: number;
+  // Round 9.4 §B — Nominatim's own response already carries these
+  // (osm_type/class/type/address) but this wrapper used to discard them
+  // entirely, keeping only name/lat/lon. That is the exact reason a case
+  // like "White Mountains Community College" being resolved as a STAY
+  // could never be diagnosed before: nothing recorded WHY the top search
+  // result was an amenity=college rather than a genuine place=town/city.
+  // Purely additive/optional — no existing caller reads these, so nothing
+  // about current behavior changes; observability only (spec "do not fix
+  // yet").
+  osmType?: string;
+  placeClass?: string;
+  placeType?: string;
+  adminPath?: string;
 }
 
 const USER_AGENT = "ScratchMap/1.0 (personal travel-tracking app, single user, low volume)";
@@ -37,6 +50,10 @@ interface NominatimResult {
   name?: string;
   lat: string;
   lon: string;
+  osm_type?: string;
+  class?: string;
+  type?: string;
+  address?: Record<string, string>;
 }
 
 export interface SearchPlacesOptions {
@@ -60,6 +77,12 @@ export async function searchPlaces(
     format: "json",
     q: query,
     limit: String(opts.limit ?? 5),
+    // Round 9.4 §B — addressdetails=1 makes Nominatim include the admin
+    // hierarchy (address.state/county/...) in its response; class/type/
+    // osm_type are already present in the default response but were
+    // previously discarded by the mapping below. Additive only — never
+    // changes which results are returned or their order/ranking.
+    addressdetails: "1",
   });
   if (opts.countryCode) params.set("countrycodes", opts.countryCode.toLowerCase());
   if (opts.viewbox) {
@@ -81,5 +104,14 @@ export async function searchPlaces(
     name: item.name || item.display_name.split(",")[0],
     lat: parseFloat(item.lat),
     lon: parseFloat(item.lon),
+    osmType: item.osm_type,
+    placeClass: item.class,
+    placeType: item.type,
+    adminPath: item.address
+      ? Object.entries(item.address)
+          .filter(([key]) => key !== "country_code")
+          .map(([, value]) => value)
+          .join(" > ")
+      : undefined,
   }));
 }

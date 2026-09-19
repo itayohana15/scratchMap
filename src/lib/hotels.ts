@@ -89,8 +89,19 @@ export function rankHotels(
   candidates: HotelCandidate[],
   activityClusters: ActivityCluster[],
   airportCoords: { lat: number; lon: number } | null,
-  transferAnchors: Array<{ lat: number; lon: number }> = []
+  transferAnchors: Array<{ lat: number; lon: number }> = [],
+  /**
+   * Round 9.3.1 §20 — the number of nights this hotel search is for.
+   * Undefined/omitted preserves the exact pre-existing weighting (every
+   * current caller keeps behaving identically). A genuine ONE-night stay
+   * (spec's own explicit "one-night airport stop" example) is the one case
+   * where airport convenience may legitimately matter as much as activity
+   * access — a multi-night stay never lets a single arrival/departure
+   * convenience dominate access to every sightseeing day it actually has.
+   */
+  stayNights?: number
 ): RankedHotel[] {
+  const isOneNightStay = stayNights === 1;
   return candidates
     .map((hotel) => {
       const activityTravelTimes = activityClusters.map((cluster) =>
@@ -128,10 +139,15 @@ export function rankHotels(
       // transfer anchor was actually given — otherwise the original
       // activity/airport split is preserved exactly, so every existing
       // caller (none of which pass transferAnchors) sees no score change.
+      // A genuine one-night stay swaps to an activity/airport split closer
+      // to even (spec §20) — every OTHER stay length keeps the original,
+      // activity-dominant weighting untouched.
       const locationScore =
         transferScore != null
           ? Math.round(activityProximityScore * 0.6 + airportScore * 0.25 + transferScore * 0.15)
-          : Math.round(activityProximityScore * 0.7 + airportScore * 0.3);
+          : isOneNightStay
+            ? Math.round(activityProximityScore * 0.5 + airportScore * 0.5)
+            : Math.round(activityProximityScore * 0.7 + airportScore * 0.3);
 
       return {
         ...hotel,

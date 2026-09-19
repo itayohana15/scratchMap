@@ -75,7 +75,7 @@ export function resetOverpassCallStats(): void {
 // here means endpoint fallback and the User-Agent fix apply everywhere at
 // once and can never drift apart between call sites again.
 
-type FetchLike = typeof fetch;
+export type FetchLike = typeof fetch;
 
 function isRetryableStatus(status: number): boolean {
   // 429 (rate-limited) and 5xx (server-side failure) are legitimately
@@ -593,4 +593,188 @@ export async function queryNearbyPlaces(
     // already succeeded so recordOverpassCall(true) above stands.
     return [];
   }
+}
+
+// --- Round 9: stay-scoped sightseeing candidate refill --------------------
+
+/**
+ * A real candidate discovered around a STAY's own anchor (never a whole
+ * country) — the shape stay-activity-pool.ts's refillStayActivityPool
+ * converts into a full TripRecommendation. Every field comes straight from
+ * OSM tags via the SAME parsing rules queryOverpassPlaces already uses
+ * (normalizeOverpassElements) — nothing fabricated.
+ */
+export interface OverpassNearbyRecommendation {
+  name: string;
+  category: RecommendationCategory;
+  location: string;
+  shortDescription: string | null;
+  lat: number;
+  lon: number;
+  openingHours: string | null;
+  wikipediaUrl: string | null;
+  website: string | null;
+}
+
+/**
+ * Round 9 §4 — the stay-scoped twin of queryOverpassPlaces: bounded by a
+ * real radius around ONE anchor point (a stay's own base, never the whole
+ * country), and category-aware (only ever asks for categories
+ * categoryHasOpenDataSource already knows a real OSM tag mapping for — see
+ * CATEGORY_TAG_FILTERS, the SAME table queryOverpassPlaces itself uses, so
+ * this can never invent a new tag set). One combined query per call
+ * (kinder to the shared public instance than one request per category),
+ * classified back into per-category buckets by which tag filter actually
+ * matched, then capped to `perCategoryLimit` each. `fetchImpl` is
+ * injectable for tests — never a real network call unless the caller
+ * (or its default) actually wants one.
+ */
+export async function queryNearbyRecommendations(
+  lat: number,
+  lon: number,
+  radiusMeters: number,
+  categories: RecommendationCategory[],
+  perCategoryLimit: number,
+  options: { fetchImpl?: FetchLike; timeoutMs?: number; areaLabelForLocation?: string } = {}
+): Promise<OverpassNearbyRecommendation[]> {
+  return (await queryNearbyRecommendationsDetailed(lat, lon, radiusMeters, categories, perCategoryLimit, options)).results;
+}
+
+/**
+ * Round 9.3.3 — same query/parse behavior as {@link queryNearbyRecommendations},
+ * but surfaces WHY zero results came back instead of collapsing "the
+ * provider failed" and "the provider genuinely has nothing here" into the
+ * same empty array. `queryNearbyRecommendations` itself must keep its
+ * existing never-throws contract (callers/tests rely on that), so this is
+ * a separate entry point used by callers that need to tell a real
+ * provider outage apart from true low supply (e.g. refillStayActivityPool's
+ * accounting).
+ */
+export async function queryNearbyRecommendationsDetailed(
+  lat: number,
+  lon: number,
+  radiusMeters: number,
+  categories: RecommendationCategory[],
+  perCategoryLimit: number,
+  options: { fetchImpl?: FetchLike; timeoutMs?: number; areaLabelForLocation?: string } = {}
+): Promise<{
+  results: OverpassNearbyRecommendation[];
+  providerFailed: boolean;
+  failureReason: string | null;
+  rawElementCount: number;
+  /** Round 9.3.4 §2/§8 — reported per-group diagnostics, never re-derived by guessing at the query the caller built. */
+  selectorCount: number;
+  queryLength: number;
+  elapsedMs: number;
+  endpoint: string | null;
+}> {
+  const requestedCategories = categories.filter((category) => categoryHasOpenDataSource(category));
+  if (requestedCategories.length === 0) {
+    return { results: [], providerFailed: false, failureReason: null, rawElementCount: 0, selectorCount: 0, queryLength: 0, elapsedMs: 0, endpoint: null };
+  }
+
+  const tagToCategory = new Map<string, RecommendationCategory>();
+  const selectors: string[] = [];
+  for (const category of requestedCategories) {
+    for (const filter of CATEGORY_TAG_FILTERS[category] ?? []) {
+      tagToCategory.set(filter, category);
+      selectors.push(`nwr${toOverpassSelector(filter)}(around:${radiusMeters},${lat},${lon});`);
+    }
+  }
+  if (selectors.length === 0) {
+    return { results: [], providerFailed: false, failureReason: null, rawElementCount: 0, selectorCount: 0, queryLength: 0, elapsedMs: 0, endpoint: null };
+  }
+
+  const query = `
+    [out:json][timeout:22];
+    (
+      ${selectors.join("\n      ")}
+    );
+    out center ${Math.max(perCategoryLimit * requestedCategories.length * 3, 40)};
+  `;
+  const selectorCount = selectors.length;
+  const queryLength = query.length;
+  const startedAt = Date.now();
+
+  const outcome = await fetchOverpass(query, {
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+    next: { revalidate: 60 * 60 * 12 },
+  });
+  const elapsedMs = Date.now() - startedAt;
+  if (outcome.kind !== "success") {
+    recordOverpassCall(false);
+    return { results: [], providerFailed: true, failureReason: outcome.reason, rawElementCount: 0, selectorCount, queryLength, elapsedMs, endpoint: outcome.endpoint };
+  }
+
+  let data: OverpassResponse;
+  try {
+    data = (await outcome.response.json()) as OverpassResponse;
+  } catch {
+    recordOverpassCall(true); // the HTTP transport succeeded; only the body was malformed
+    return { results: [], providerFailed: true, failureReason: "malformed_response_body", rawElementCount: 0, selectorCount, queryLength, elapsedMs, endpoint: outcome.endpoint };
+  }
+  captureProviderFixture("overpass", query, { query, response: data });
+  recordOverpassCall(true);
+
+  const byCategory = new Map<RecommendationCategory, Array<{ place: OverpassNearbyRecommendation; score: number }>>();
+  for (const el of data.elements) {
+    const tags = el.tags ?? {};
+    const name = tags.name || tags["name:en"];
+    const placeLat = el.lat ?? el.center?.lat;
+    const placeLon = el.lon ?? el.center?.lon;
+    if (!name || placeLat == null || placeLon == null) continue;
+
+    // Which requested category does this element's own tags match? The
+    // first matching filter wins — an element could technically satisfy
+    // more than one (rare); it is still only ever counted once.
+    let matchedCategory: RecommendationCategory | null = null;
+    for (const [filter, category] of tagToCategory) {
+      const [key, value] = filter.split("=");
+      if (tags[key] === value) {
+        matchedCategory = category;
+        break;
+      }
+    }
+    if (!matchedCategory) continue;
+
+    const wikipediaTag = tags.wikipedia;
+    const wikipediaUrl = wikipediaTag
+      ? (() => {
+          const [wikiLang, ...rest] = wikipediaTag.split(":");
+          const title = rest.join(":") || wikiLang;
+          const lang = rest.length > 0 ? wikiLang : "en";
+          return `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title)}`;
+        })()
+      : null;
+
+    const place: OverpassNearbyRecommendation = {
+      name,
+      category: matchedCategory,
+      location: options.areaLabelForLocation ?? "",
+      shortDescription: tags.description ?? tags["description:en"] ?? null,
+      lat: placeLat,
+      lon: placeLon,
+      openingHours: tags.opening_hours ?? null,
+      wikipediaUrl,
+      website: tags.website ?? tags["contact:website"] ?? null,
+    };
+    const bucket = byCategory.get(matchedCategory) ?? [];
+    bucket.push({ place, score: score(tags) });
+    byCategory.set(matchedCategory, bucket);
+  }
+
+  const seenNames = new Set<string>();
+  const results: OverpassNearbyRecommendation[] = [];
+  for (const bucket of byCategory.values()) {
+    const ranked = bucket.sort((a, b) => b.score - a.score);
+    for (const entry of ranked) {
+      const key = entry.place.name.toLowerCase();
+      if (seenNames.has(key)) continue;
+      seenNames.add(key);
+      results.push(entry.place);
+      if (results.filter((r) => r.category === entry.place.category).length >= perCategoryLimit) break;
+    }
+  }
+  return { results, providerFailed: false, failureReason: null, rawElementCount: data.elements.length, selectorCount, queryLength, elapsedMs, endpoint: outcome.endpoint };
 }

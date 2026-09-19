@@ -35,6 +35,152 @@ export class ItineraryGenerationInfeasibleError extends Error {
   }
 }
 
+/** Round 9.1 §16/§17/§26 — per-stay detail inside a PlannerFailureSummary/InsufficientRealActivitySupplyError. */
+export interface StayFailureDetail {
+  stayId: string;
+  owner: string;
+  requiredRealActivities: number;
+  desiredCandidates: number;
+  legalCandidates: number;
+  providerRequests: number;
+  providerFailures: number;
+  supplyDegraded: boolean;
+  /** True when this stay's own legalCandidates fell below its minimumViableCandidateCount — the actual SUPPLY-failure signal (spec §16), never the healthy-reserve target. */
+  belowMinimum: boolean;
+  /**
+   * Round 9.3.3 continuation §6 — the three-way distinction the round
+   * requires, kept separate from `belowMinimum` (which only says THAT a
+   * stay is short, not WHY): HEALTHY_SUPPLY (met its minimum),
+   * TRUE_LOW_SUPPLY (below minimum, but the provider genuinely responded —
+   * `providerFailures === 0` — so the destination itself is just sparse),
+   * or PROVIDER_FAILURE (below minimum AND at least one real provider
+   * outage/timeout occurred — this round's own OverpassProviderFailureError
+   * fix is what makes `providerFailures` a trustworthy signal here rather
+   * than silently indistinguishable from zero real candidates).
+   */
+  supplyState: "HEALTHY_SUPPLY" | "TRUE_LOW_SUPPLY" | "PROVIDER_FAILURE";
+}
+
+function classifyStaySupplyState(stay: {
+  belowMinimum: boolean;
+  providerFailures: number;
+}): "HEALTHY_SUPPLY" | "TRUE_LOW_SUPPLY" | "PROVIDER_FAILURE" {
+  if (!stay.belowMinimum) return "HEALTHY_SUPPLY";
+  return stay.providerFailures > 0 ? "PROVIDER_FAILURE" : "TRUE_LOW_SUPPLY";
+}
+
+/**
+ * Round 9.3.3 continuation §7 — thrown ONLY for a genuinely CATASTROPHIC
+ * provider-infrastructure failure on a multi-day stay: zero real
+ * candidates collected, on a stay that genuinely needed real content, AND
+ * at least one real provider outage/timeout actually occurred (never
+ * merely a destination with few real POIs — that stays
+ * InsufficientRealActivitySupplyError/TRUE_LOW_SUPPLY, unchanged). Kept
+ * distinct from PLAN_NOT_FEASIBLE/BUDGET_NOT_FEASIBLE/a Gemini failure so
+ * a caller can tell "the destination is just quiet" apart from "our own
+ * provider infrastructure was unavailable" — the API must never disguise
+ * the second as a normal successful (mostly-FreeTime) itinerary.
+ */
+export class RealPlaceDiscoveryUnavailableError extends Error {
+  readonly code = "REAL_PLACE_DISCOVERY_UNAVAILABLE" as const;
+  readonly stayFailures: StayFailureDetail[];
+
+  constructor(message: string, stayFailures: StayFailureDetail[]) {
+    super(message);
+    this.name = "RealPlaceDiscoveryUnavailableError";
+    this.stayFailures = stayFailures;
+  }
+}
+
+/**
+ * Round 9.4.2 §G — the "regression firewall", never a substitute for
+ * fixing the fallback itself (spec: "This is not a substitute for fixing
+ * fallback"). A DIRECT, non-ratio-based hard gate: a non-trivial real
+ * candidate pool existed and the FINAL itinerary has literally zero
+ * scheduled real activities. Kept distinct from
+ * InsufficientRealActivityCoverageError (a ratio/majority-based judgment
+ * call that can have edge cases where it doesn't fire — exactly what let
+ * the proven production bug reach persistence undetected) — this one
+ * fires on the unambiguous, unconditional shape alone.
+ */
+export class RealPlaceContentLostError extends Error {
+  readonly code = "REAL_PLACE_CONTENT_LOST" as const;
+  readonly diagnostics: {
+    totalRealActivityCandidates: number;
+    finalRealActivities: number;
+    normalDayCount: number;
+    fallbackUsed: boolean;
+    perStay?: StayCoverageSummary[];
+  };
+
+  constructor(message: string, diagnostics: RealPlaceContentLostError["diagnostics"]) {
+    super(message);
+    this.name = "RealPlaceContentLostError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/** Round 9.4.3 §C/§J — one real place occupying one scheduled slot, identified by its authoritative recommendationId. */
+export interface RealPlaceDuplicateOccurrence {
+  dayNumber: number;
+  phaseId: string | null;
+  category: RecommendationCategory;
+}
+
+/** Round 9.4.3 §C/§J — a single real place (by recommendationId) found scheduled more than once across the final itinerary. */
+export interface RealPlaceDuplicateGroup {
+  recommendationId: string;
+  name: string;
+  occurrences: RealPlaceDuplicateOccurrence[];
+}
+
+/**
+ * Round 9.4.3 §J — the final duplicate firewall. Proven production trace
+ * (gen-mu7kn7ef-s9cg5z4x): the same real recommendationId (e.g. "Harvard
+ * Club of Boston") removed, restored, and reassigned across repair
+ * attempts, with duplicatePlaces never reaching 0 — every attempt then
+ * fails passesValidation, cascading all the way to a generic
+ * PLAN_NOT_FEASIBLE / "לא הצלחנו להסיר כפילויות" with no indication of
+ * WHICH place or WHY. This is a regression firewall, not the primary fix
+ * (resolveExactIdDuplicates + the phase-aware repairCrossRegionDayContent
+ * fix below are the primary fix) — it exists so that if a real-place
+ * duplicate ever DOES survive to a would-be-successful return, the caller
+ * gets the exact identity instead of a generic failure.
+ */
+export class RealPlaceDuplicatesRemainError extends Error {
+  readonly code = "REAL_PLACE_DUPLICATES_REMAIN" as const;
+  readonly diagnostics: {
+    duplicateCount: number;
+    duplicates: RealPlaceDuplicateGroup[];
+  };
+
+  constructor(message: string, diagnostics: RealPlaceDuplicatesRemainError["diagnostics"]) {
+    super(message);
+    this.name = "RealPlaceDuplicatesRemainError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/**
+ * Round 9.1 §16/§17 — thrown ONLY when the root cause is genuinely
+ * insufficient real-candidate SUPPLY (a stay's own legal pool fell below
+ * its minimum-viable floor after discovery + bounded refill), never for a
+ * planner/quality problem (duplicates, geography, diversity) with a
+ * healthy supply — that stays PLAN_NOT_FEASIBLE, a DIFFERENT code (spec
+ * §17: "do not use the same error code"). The API route maps this to its
+ * own 422 body, distinct from generic PLAN_NOT_FEASIBLE.
+ */
+export class InsufficientRealActivitySupplyError extends Error {
+  readonly code = "INSUFFICIENT_REAL_ACTIVITY_SUPPLY" as const;
+  readonly stayFailures: StayFailureDetail[];
+
+  constructor(message: string, stayFailures: StayFailureDetail[]) {
+    super(message);
+    this.name = "InsufficientRealActivitySupplyError";
+    this.stayFailures = stayFailures;
+  }
+}
+
 import type { CountryAiRecommendation } from "@/lib/ai/country-knowledge";
 import { estimateMinutesForMode, selectTransportMode, type TransportMode } from "@/lib/transport-mode";
 import countryFactsData from "@/lib/facts/country-facts-data.json";
@@ -92,6 +238,7 @@ import {
   classifyVisitScale,
   classifyWeatherSensitivity,
   getTripLengthBucket,
+  TRIP_LENGTH_BUCKETS,
   MAX_CONSECUTIVE_HIGH_ENERGY_DAYS,
   MAX_STAY_STRUCTURE_REPAIR_PASSES,
   describeActivityMixTargets,
@@ -105,6 +252,7 @@ import {
   type TripFrameDayTripHint,
   type TripFramePlanningTrace,
   resolveItemEffectiveEndTime,
+  resolveVisitDurationMinutes,
   type StayTransition,
 } from "@/lib/server/itinerary-planning-principles";
 import {
@@ -133,8 +281,20 @@ import {
   classifyPoolExhaustionReasons,
   type PlaceInsertionSource,
 } from "@/lib/planner-qa-trace";
+import {
+  logRealPlaceQA,
+  logRealPlaceQACompact,
+  diffRealActivitySnapshots,
+  logRepairStepDelta,
+  logRepairAttemptStart,
+  logRepairAttemptEnd,
+  logRepairRoundTrip,
+  type RealActivityIdentitySnapshot,
+  type RepairSnapshotItem,
+} from "@/lib/server/real-place-qa";
 import { describeHolidayContext } from "@/lib/facts/jewish-holidays";
-import { getOverpassCallStats } from "@/lib/places/overpass";
+import { getOverpassCallStats, queryNearbyRecommendationsDetailed, type OverpassNearbyRecommendation as OverpassGroupCandidate } from "@/lib/places/overpass";
+import type { GenerationProgressReporter } from "@/lib/server/generation-progress";
 import { fetchDrivingRouteBestEffort } from "@/lib/routing/osrm-server";
 import {
   captureGeminiFixture,
@@ -144,7 +304,80 @@ import {
   startFixtureCaptureSession,
   type GeoResolutionFixtureEntry,
 } from "@/lib/server/fixture-capture";
-import { violatesOpeningHours } from "./opening-hours";
+import {
+  parseOpeningHours,
+  evaluateOpeningHoursLegality,
+  isKnownHoursViolation,
+  resolveLastEntryMinutes,
+  parseOpeningHoursWindow,
+  type OpeningHoursLegalityStatus,
+} from "./opening-hours";
+import {
+  computeStayCapacity,
+  assignCandidatesToStays,
+  buildStayActivityPool,
+  refillStayActivityPool,
+  buildTripActivityPortfolios,
+  computeRecencyPenalty,
+  estimateDayActivityTarget,
+  acceptRawCandidatesIntoPool,
+  acceptRawMealCandidates,
+  classifyQueryGroupOutcome,
+  orderActivityQueryGroupsByPreference,
+  MEAL_QUERY_GROUP,
+  ACTIVITY_DISCOVERY_RADIUS_CAP_KM,
+  computeDesiredCandidateCount,
+  computeMinimumViableCandidateCount,
+  type StayDayCapacityInput,
+  type StayActivityPool,
+  type StayActivityPortfolio,
+  type StayActivityPoolCandidate,
+  type RecentActivityHistoryEntry,
+  type RefillOptions,
+  type ActivityQueryGroupDefinition,
+  type QueryGroupResult,
+  type QueryGroupOutcome,
+} from "@/lib/server/stay-activity-pool";
+import {
+  classifyActivity,
+  determinePlanningRole,
+  type ActivityFamily,
+  type ActivitySubtype,
+} from "@/lib/server/activity-taxonomy";
+import {
+  classifyMealVenue,
+  buildCuisinePreferenceWeights,
+  CUISINE_FAMILIES,
+  type CuisineFamily,
+  type MealType,
+} from "@/lib/server/meal-cuisine-taxonomy";
+import {
+  computeMealCuisineRecencyPenalty,
+  selectMealVenueFromPool,
+  buildTripMealVenuePools,
+  buildStayMealVenuePool,
+  RECENT_MEAL_HISTORY_DECAY_DAYS,
+  type RecentMealHistoryEntry,
+  type StayMealVenuePool,
+} from "@/lib/server/stay-meal-venue-pool";
+import {
+  resolveStaySkeleton,
+  dedupeResolvedStays,
+  deterministicFallbackSkeleton,
+  buildSingleBaseFallbackProposal,
+  validateTripStaySkeleton,
+  buildTripFrameFromResolvedStays,
+  reallocateNightsAfterDiscovery,
+  rankReserveStaysForPromotion,
+  decideReservePromotion,
+  applyReservePromotion,
+  computeStayValueProfile,
+  allocateNightsByMarginalValue,
+  type ProposedStay,
+  type ResolvedStay,
+  type StaySkeletonSource,
+  type StaySkeletonFrame,
+} from "@/lib/server/trip-stay-skeleton";
 import {
   buildFallbackAiItinerary,
   buildMapLink,
@@ -252,7 +485,7 @@ export interface RawGeneratedPlan {
 // deliberate: repairPlan's normalization/repair machinery always runs on
 // real Gemini output before it's accepted, so there is no "raw, untouched
 // Gemini" path to report separately from it.
-export type ItineraryGenerationSource = "gemini_repaired" | "fallback_template";
+export type ItineraryGenerationSource = "gemini_repaired" | "fallback_template" | "portfolio_composed" | "portfolio_composed_soft_checkpoint";
 
 /**
  * Distinguishes "the candidate provider was unreachable" from "the plan is
@@ -289,6 +522,26 @@ export function resolveCandidateProviderStatus(payload: AiItineraryRequest): Can
   return { overpass, gemini: "used" };
 }
 
+// Round 9.3.6.1 §8/§11 — "practical" (the free-time/logistics filler
+// category buildFreeTimeItem assigns, explicitly excluded from
+// calculateDayLoadMinutes and isScheduledRealPlace elsewhere in this file)
+// was MISSING from this set despite being a real member of
+// RecommendationCategory. normalizeCategory falls through to "attraction"
+// for anything not in this set — so every time a composed plan's items
+// round-tripped through toRawGeneratedPlan (RawGeneratedItem has no
+// itemRole field at all) and back through repairPlan's own enrichAiDay
+// ingestion (the ACTUAL production path for every composed-portfolio
+// generation, per the repairPlan(toRawGeneratedPlan(composed.plan), ...)
+// call), a free-time filler silently became a fake "attraction" — with
+// its own often-400+-minute duration now counted as real activity load
+// (calculateDayLoadMinutes's "practical" exclusion no longer matched) and
+// no remaining structural signal (itemRole is gone; category no longer
+// says "practical") to tell it apart from a genuine real POI. Proven via
+// a deterministic 7-stay reproduction: fixOverloadedDays, unable to tell
+// the miscategorized filler apart from real content, evicted real,
+// verified POIs alongside it to bring the (falsely inflated) day load
+// back under capacity — exactly the "real supply existed, day still ended
+// up zero-real" shape reported in production.
 const CATEGORY_VALUES = new Set<RecommendationCategory>([
   "attraction",
   "restaurant",
@@ -303,11 +556,14 @@ const CATEGORY_VALUES = new Set<RecommendationCategory>([
   "seasonal_event",
   "hotel",
   "transportation",
+  "practical",
 ]);
 
 const SLOT_VALUES = new Set<DayPart>(["morning", "lunch", "afternoon", "dinner", "evening", "night"]);
 const SLOT_ORDER: DayPart[] = ["morning", "lunch", "afternoon", "dinner", "evening", "night"];
 const FOOD_CATEGORIES = new Set<RecommendationCategory>(["restaurant", "cafe"]);
+/** Round 9.2.1 — neutral cuisine-weight default (every family = 1) for callers that haven't computed the trip's own preference-derived weights. */
+const EMPTY_CUISINE_WEIGHTS: Record<CuisineFamily, number> = Object.fromEntries(CUISINE_FAMILIES.map((family) => [family, 1])) as Record<CuisineFamily, number>;
 const FALLBACK_RATE_TO_ILS: Record<string, number> = {
   USD: 3.45,
   EUR: 3.98,
@@ -714,7 +970,7 @@ const TRIP_FRAME_INTENT_VALUES = new Set<TripFramePhase["intent"]>(["city", "nat
  * AND stay-transition distance/time, rather than two separately-computed
  * versions drifting apart.
  */
-function computeAreaAnchors(payload: AiItineraryRequest): Map<string, { lat: number; lon: number } | null> {
+export function computeAreaAnchors(payload: AiItineraryRequest): Map<string, { lat: number; lon: number } | null> {
   const sums = new Map<string, { latSum: number; lonSum: number; count: number }>();
 
   for (const recommendation of [...payload.recommendations, ...payload.selectedPlaces]) {
@@ -732,6 +988,30 @@ function computeAreaAnchors(payload: AiItineraryRequest): Map<string, { lat: num
     anchors.set(area, entry.count > 0 ? { lat: entry.latSum / entry.count, lon: entry.lonSum / entry.count } : null);
   }
   return anchors;
+}
+
+/**
+ * Round 9.3.1 — a real bug found via this round's own live replay:
+ * computeAreaAnchors derives an anchor ONLY from payload.recommendations/
+ * selectedPlaces coordinates, which are ALWAYS empty for a skeleton-driven
+ * trip before discovery ever runs — so refillTripRecommendationPool's own
+ * per-stay anchor was silently null, and Overpass was never even queried
+ * for any stay. `tripFrame.phases[].anchor` (set by
+ * buildTripFrameFromResolvedStays, TripFramePhase's own docstring) is the
+ * AUTHORITATIVE resolved coordinate when the frame came from the stay
+ * skeleton — always preferred over the recommendation-derived guess,
+ * which remains the fallback for the older POI-clustering path (never set
+ * phase.anchor) so its existing callers are unaffected.
+ */
+export function resolveAreaAnchorsForFrame(
+  tripFrame: TripFrame,
+  fallbackAnchors: Map<string, { lat: number; lon: number } | null>
+): Map<string, { lat: number; lon: number } | null> {
+  const merged = new Map(fallbackAnchors);
+  for (const phase of tripFrame.phases) {
+    if (phase.anchor !== undefined) merged.set(phase.areaLabel, phase.anchor);
+  }
+  return merged;
 }
 
 /**
@@ -1155,14 +1435,222 @@ async function refineTripFrameWithGemini(
   }
 }
 
-async function buildTripFrame(
+/**
+ * Round 9.3 §1/§2 — THE root-cause gate. buildDeterministicTripFrame's own
+ * geographic clustering derives every area purely from real coordinates in
+ * payload.recommendations/selectedPlaces; with none available (the normal
+ * case since Round 9.2 removed the client's country-wide POI prefetch),
+ * `planClustersByRole` finds zero areas and buildDeterministicTripFrame's
+ * own documented fallback collapses the ENTIRE trip to one phase whose
+ * areaLabel is literally the destination country's name — this is true
+ * whether the trip is 4 days or 42. This predicate is the ONLY thing that
+ * decides whether the stay-skeleton stage below runs; it fires exactly on
+ * that collapse, never on a trip that already has a real pinned area or
+ * real multi-area clustering data.
+ */
+export function needsStaySkeleton(deterministicFrame: TripFrame, payload: AiItineraryRequest): boolean {
+  if (deterministicFrame.phases.length !== 1) return false;
+  const pinnedArea = normalizeAreaLabel(
+    payload.preferences.accommodationArea || payload.preferences.preferredRegions || ""
+  );
+  if (pinnedArea) return false; // an explicit single-base signal, not a failure
+  const onlyArea = normalizeAreaLabel(deterministicFrame.phases[0].areaLabel);
+  const countryArea = normalizeAreaLabel(payload.countryName);
+  return Boolean(onlyArea) && onlyArea === countryArea;
+}
+
+const STAY_SKELETON_MODEL = "gemini-flash-lite-latest";
+const STAY_SKELETON_TIMEOUT_MS = 15_000;
+const STAY_SKELETON_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    stays: {
+      type: Type.ARRAY,
+      description: "2-10 real geographic bases for this trip. NEVER attraction/restaurant/POI names — cities, towns, national-park or island base names only.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          areaName: { type: Type.STRING, description: "A real, geocodable city/town/region/park-gateway name, optionally with country for disambiguation." },
+          nights: { type: Type.NUMBER },
+          reasons: { type: Type.ARRAY, items: { type: Type.STRING } },
+        },
+        required: ["areaName", "nights"],
+      },
+    },
+  },
+  required: ["stays"],
+};
+
+/**
+ * Round 9.3 §3/§4 — the ENTIRE input is trip-shape/preference data, never a
+ * POI list (spec §4: "Do NOT send a giant country-wide POI list"). Gemini
+ * decides WHERE to base the trip, not what to do there.
+ */
+export function buildStaySkeletonPrompt(payload: AiItineraryRequest, dayCount: number): string {
+  const bucket = getTripLengthBucket(dayCount);
+  const arrivalAirport = payload.preferences.flights?.outbound?.arrivalAirport || null;
+  const departureAirport = payload.preferences.flights?.return?.departureAirport || null;
+  const arrivalInfo = arrivalAirport ? findAirportByIata(arrivalAirport) : null;
+  const departureInfo = departureAirport ? findAirportByIata(departureAirport) : null;
+
+  return [
+    `אתה מתכנן את השלד הגיאוגרפי של טיול ל${payload.countryName}, ${dayCount} ימים.`,
+    `הצע 2-10 בסיסי לינה אמיתיים (ערים/אזורים/עיירות שער לפארק לאומי/בסיסי אי) — לעולם לא שמות אטרקציות, מסעדות או נקודות עניין ספציפיות.`,
+    `הנחיית אורך טיול: ${bucket.guidance}`,
+    arrivalInfo ? `נחיתה: ${arrivalInfo.city}.` : "אין מידע על שדה תעופה לנחיתה.",
+    departureInfo ? `המראה חזרה: ${departureInfo.city}.` : "אין מידע על שדה תעופה להמראה.",
+    `מספר נוסעים: ${payload.preferences.travelers}.`,
+    payload.preferences.interests ? `תחומי עניין: ${payload.preferences.interests}.` : "",
+    payload.preferences.tripPace ? `קצב מועדף: ${payload.preferences.tripPace}.` : "",
+    payload.preferences.budget ? `תקציב כולל משוער: ${payload.preferences.budget}.` : "",
+    payload.preferences.transportationPreferences ? `העדפת תחבורה: ${payload.preferences.transportationPreferences}.` : "",
+    payload.preferences.mustVisitPlaces ? `מקומות שחובה לכלול: ${payload.preferences.mustVisitPlaces}.` : "",
+    payload.preferences.accessibilityNeeds ? `צרכי נגישות: ${payload.preferences.accessibilityNeeds}.` : "",
+    payload.preferences.tripStyle ? `סגנון טיול רצוי: ${payload.preferences.tripStyle}.` : "",
+    `כל בסיס חייב לקבל nights (מספר לילות) ו-reasons (מערך מחרוזות קצרות, למשל "culture", "food", "major sights"). אל תמציא שמות מקומות שאינם קיימים באמת. סכום הלילות צריך להתקרב ל-${Math.max(1, dayCount - 1)} (מספר הלילות הכולל של הטיול).`,
+    `החזר JSON בלבד, תואם לסכמה.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Round 9.3 §3 — Gemini's role here is bounded, high-level geographic
+ * planning only. Optional by construction (mirrors
+ * refineComposedPlanWithGemini's injectable pattern exactly, Round 9.2) —
+ * `geminiCallOverride` lets tests avoid any real network/API-key
+ * dependency; production omits it and gets the real GoogleGenAI-backed
+ * default. Any failure at all (no key, network, bad JSON, timeout) returns
+ * null — the caller falls back to the deterministic skeleton (spec §8:
+ * "Gemini must not be a single point of failure").
+ */
+export async function proposeStaySkeletonWithGemini(
   payload: AiItineraryRequest,
   dayCount: number,
-  knowledge?: CountryAiRecommendation | null
-): Promise<TripFrame> {
+  geminiCallOverride?: (prompt: string) => Promise<string | null>
+): Promise<ProposedStay[] | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!geminiCallOverride && !apiKey) return null;
+
+  try {
+    const prompt = buildStaySkeletonPrompt(payload, dayCount);
+    const callGemini =
+      geminiCallOverride ??
+      (async (thePrompt: string) => {
+        const client = new GoogleGenAI({ apiKey: apiKey! });
+        const response = await client.models.generateContent({
+          model: STAY_SKELETON_MODEL,
+          contents: thePrompt,
+          config: { responseMimeType: "application/json", responseSchema: STAY_SKELETON_SCHEMA },
+        });
+        return response.text ?? null;
+      });
+    const raw = await Promise.race([
+      callGemini(prompt),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("stay-skeleton timeout")), STAY_SKELETON_TIMEOUT_MS)),
+    ]);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { stays?: Array<{ areaName?: string; nights?: number; reasons?: string[] }> };
+    if (!Array.isArray(parsed.stays) || parsed.stays.length === 0) return null;
+    return parsed.stays
+      .filter((s): s is { areaName: string; nights?: number; reasons?: string[] } => Boolean(s.areaName?.trim()))
+      .map((s, index) => ({
+        proposedId: `gemini-${index + 1}`,
+        areaName: s.areaName.trim(),
+        nights: s.nights != null && Number.isFinite(s.nights) ? Math.max(0, Math.round(s.nights)) : 1,
+        reasons: Array.isArray(s.reasons) ? s.reasons.filter((r): r is string => typeof r === "string") : [],
+      }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Round 9.3 — THE stay-skeleton stage: propose (Gemini, then deterministic
+ * fallback) -> resolve (real geocoding) -> dedupe -> validate -> build
+ * frame. Returns null only when every source (Gemini AND the deterministic
+ * fallback AND the single-base last resort) fails to produce a VALID
+ * skeleton — the caller then falls back to the old deterministic-cluster
+ * frame rather than ever silently returning nothing (spec §7: "If still
+ * impossible: surface an explicit planner supply/skeleton failure", wired
+ * at the classifyPlanFailure layer below, never a bare crash here).
+ */
+export async function buildTripFrameFromSkeleton(
+  payload: AiItineraryRequest,
+  dayCount: number,
+  geminiCallOverride?: (prompt: string) => Promise<string | null>,
+  /** Injectable — tests pass a fake to avoid any real Nominatim network call. */
+  searchPlacesOverride?: Parameters<typeof resolveStaySkeleton>[3]
+): Promise<{ result: StaySkeletonFrame; skeletonSource: StaySkeletonSource } | null> {
+  const totalNights = Math.max(1, dayCount - 1);
+  const arrivalAirport = payload.preferences.flights?.outbound?.arrivalAirport || null;
+  const arrivalAnchor = arrivalAirport ? findAirportByIata(arrivalAirport) : null;
+  const departureAirport = payload.preferences.flights?.return?.departureAirport || null;
+  const departureAnchor = departureAirport ? findAirportByIata(departureAirport) : null;
+
+  const tryBuild = async (
+    proposals: ProposedStay[],
+    source: StaySkeletonSource
+  ): Promise<{ result: StaySkeletonFrame; skeletonSource: StaySkeletonSource } | null> => {
+    if (proposals.length === 0) return null;
+    const { resolved, unresolvedCount } = await resolveStaySkeleton(proposals, payload.isoA2, source, searchPlacesOverride);
+    const deduped = dedupeResolvedStays(resolved);
+    const validation = validateTripStaySkeleton(deduped, unresolvedCount, totalNights, payload.countryName, resolved.length - deduped.length);
+    logGenerationStage("[StaySkeletonQA] validation", { source, ...validation });
+    if (!validation.valid) return null;
+    return { result: buildTripFrameFromResolvedStays(deduped, dayCount, arrivalAnchor, departureAnchor), skeletonSource: source };
+  };
+
+  const geminiProposals = await proposeStaySkeletonWithGemini(payload, dayCount, geminiCallOverride);
+  if (geminiProposals) {
+    const geminiResult = await tryBuild(geminiProposals, "gemini_resolved");
+    if (geminiResult) return geminiResult;
+  }
+
+  const fallbackProposals = deterministicFallbackSkeleton(payload);
+  const fallbackResult = await tryBuild(fallbackProposals, "fallback_cluster");
+  if (fallbackResult) return fallbackResult;
+
+  // Absolute last resort — still resolved through the real geocoder, still
+  // honestly tagged, never a bare unresolved country string (spec §8).
+  const singleBaseResult = await tryBuild([buildSingleBaseFallbackProposal(payload)], "single_base_fallback");
+  if (singleBaseResult) return singleBaseResult;
+
+  return null;
+}
+
+export async function buildTripFrame(
+  payload: AiItineraryRequest,
+  dayCount: number,
+  knowledge?: CountryAiRecommendation | null,
+  staySkeletonGeminiOverride?: (prompt: string) => Promise<string | null>,
+  staySkeletonSearchPlacesOverride?: Parameters<typeof buildTripFrameFromSkeleton>[3]
+): Promise<{ frame: TripFrame; reserveStays: ResolvedStay[] }> {
   const deterministicFrame = buildDeterministicTripFrame(payload, dayCount);
-  if (deterministicFrame.phases.length <= 1) return deterministicFrame;
-  return refineTripFrameWithGemini(deterministicFrame, payload, knowledge);
+
+  if (needsStaySkeleton(deterministicFrame, payload)) {
+    const skeleton = await buildTripFrameFromSkeleton(payload, dayCount, staySkeletonGeminiOverride, staySkeletonSearchPlacesOverride);
+    if (skeleton) {
+      logGenerationStage("[StaySkeletonQA]", {
+        source: skeleton.skeletonSource,
+        proposedStayCount: skeleton.result.stays.length,
+        resolvedStayCount: skeleton.result.stays.length,
+        finalStayCount: skeleton.result.frame.phases.length,
+        reserveStayCount: skeleton.result.reserveStays.length,
+        nightsByStay: skeleton.result.frame.phases.map((p) => ({ area: p.areaLabel, nights: p.nights })),
+      });
+      return { frame: skeleton.result.frame, reserveStays: skeleton.result.reserveStays };
+    }
+    // Every skeleton source failed validation — fall through to the old
+    // deterministic-cluster frame (still the country-level single phase in
+    // the worst case) rather than throwing here; the failure becomes
+    // visible downstream via classifyPlanFailure/InsufficientRealActivitySupplyError
+    // once local discovery/portfolio building also comes up empty for it.
+    logGenerationStage("[StaySkeletonQA] all skeleton sources failed — falling back to country-level frame");
+  }
+
+  if (deterministicFrame.phases.length <= 1) return { frame: deterministicFrame, reserveStays: [] };
+  return { frame: await refineTripFrameWithGemini(deterministicFrame, payload, knowledge), reserveStays: [] };
 }
 
 function describeTripFrame(frame: TripFrame) {
@@ -1727,6 +2215,137 @@ function isScheduledRealPlace(
   return true;
 }
 
+/** Round 9.4 §M/§N — every real-activity identity currently scheduled, for diffRealActivitySnapshots' before/after comparisons. Meal venues excluded on purpose (activities and meals are tracked as separate conservation lines everywhere else in this round's logging). */
+export function snapshotRealActivities(days: AiGeneratedDay[]): RealActivityIdentitySnapshot[] {
+  const snapshot: RealActivityIdentitySnapshot[] = [];
+  for (const day of days) {
+    for (const item of day.items) {
+      if (!isScheduledRealPlace(item) || item.category === "restaurant" || item.category === "cafe") continue;
+      snapshot.push({ id: item.recommendationId ?? `coords:${item.lat}:${item.lon}:${item.name}`, name: item.name, dayNumber: day.dayNumber });
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * Round 9.4.1 §B/§D — the ONE shared classification every repair-step
+ * trace uses (never a bespoke per-step classifier). Identity is tracked
+ * by recommendationId when the item genuinely has one; a coords+name key
+ * otherwise — NEVER name alone (spec §D). `hasRecommendationId` is kept
+ * separate from the identity string itself so a real item "recreated
+ * without their ID" (same coords/name, but the id field is now null) is
+ * detected as a genuine identity downgrade, not silently treated as
+ * "unchanged" just because the derived key happens to still match.
+ */
+export function snapshotDayItemsForRepairTrace(days: AiGeneratedDay[], tripFrame: TripFrame): RepairSnapshotItem[] {
+  const snapshot: RepairSnapshotItem[] = [];
+  for (const day of days) {
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    for (const item of day.items) {
+      const isReal = isScheduledRealPlace(item);
+      const isMeal = item.category === "restaurant" || item.category === "cafe";
+      const kind: RepairSnapshotItem["kind"] = isReal
+        ? isMeal
+          ? "real_meal"
+          : "real_activity"
+        : isGenericMealOpportunity(item)
+          ? "meal_opportunity"
+          : isSyntheticScheduleItem(item)
+            ? "synthetic_activity"
+            : "other";
+      snapshot.push({
+        id: item.recommendationId ?? `coords:${item.lat}:${item.lon}:${normalizePlaceNameSlug(item.name)}`,
+        name: item.name,
+        category: item.category,
+        itemRole: item.itemRole ?? null,
+        phaseId: phase?.id ?? null,
+        dayNumber: day.dayNumber,
+        lat: item.lat,
+        lon: item.lon,
+        kind,
+        hasRecommendationId: item.recommendationId != null,
+      });
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * Round 9.4.1 §B — THE shared wrapper every mutating repair primitive in
+ * repairPlan's attempt loop goes through, so no step needs hand-written
+ * logging logic of its own (spec: "Do not hand-write different logging
+ * logic for every step"). A true no-op wrapper shape — `transform` is
+ * always called exactly once, its return value is always what's returned,
+ * so wrapping a step can never change what it does, only what gets
+ * observed around it. Logging itself is cheap-gated inside
+ * logRepairStepDelta (via logRealPlaceQA's own isPlannerQaTraceEnabled
+ * check), but the before/after snapshots are still computed unconditionally
+ * here — acceptable for a forensics-only round, never claimed as a
+ * zero-cost primitive.
+ */
+function traceRepairStep(
+  attempt: number,
+  stepIndex: number,
+  stepName: string,
+  tripFrame: TripFrame,
+  days: AiGeneratedDay[],
+  transform: () => AiGeneratedDay[]
+): AiGeneratedDay[] {
+  if (!isPlannerQaTraceEnabled()) return transform();
+  const before = snapshotDayItemsForRepairTrace(days, tripFrame);
+  const after = transform();
+  const afterSnapshot = snapshotDayItemsForRepairTrace(after, tripFrame);
+  logRepairStepDelta(attempt, stepIndex, stepName, before, afterSnapshot);
+  return after;
+}
+
+/**
+ * Round 7 — the effective activity duration for opening-hours legality:
+ * the SAME visit-duration model the real scheduler uses
+ * (resolveVisitDurationMinutes / classifyVisitScale), never a separate
+ * invented number. A reservation-required venue with its own explicit
+ * estimate keeps it; everything else is clamped into its visit-scale range.
+ */
+function effectiveActivityDurationMinutes(item: AiGeneratedItem): number {
+  return resolveVisitDurationMinutes(item, classifyVisitScale(item));
+}
+
+/**
+ * Round 7 — THE authoritative opening-hours legality verdict for one
+ * scheduled item on one calendar day. Applies ONLY to real scheduled
+ * venues (isScheduledRealPlace); generic meal-opportunity / free-time /
+ * transit-practical / stay-transition items have no real opening-hours
+ * constraint and always return LEGAL. Judges the whole activity interval
+ * `[start, start + effectiveDuration]` against the structured opening
+ * intervals for the item's own local weekday (day.date). Unknown/garbled
+ * hours → UNKNOWN (never a violation, never "legal evidence").
+ */
+function evaluateItemOpeningHoursLegality(
+  item: AiGeneratedItem,
+  dayDate: string
+): { status: OpeningHoursLegalityStatus; parsedKind: "known" | "always" | "closed" | "unknown" } {
+  if (!isScheduledRealPlace(item)) return { status: "LEGAL", parsedKind: "always" };
+  const parsed = parseOpeningHours(item.openingHours);
+  if (parsed.kind === "unknown") return { status: "UNKNOWN", parsedKind: "unknown" };
+  const startMinutes = clockToMinutes(item.plannedStartTime);
+  if (startMinutes == null || !dayDate) return { status: "UNKNOWN", parsedKind: parsed.kind };
+  const legacyWindow = parseOpeningHoursWindow(item.openingHours);
+  const lastEntryMinutes = legacyWindow ? resolveLastEntryMinutes(item, legacyWindow) : null;
+  const result = evaluateOpeningHoursLegality({
+    localDate: dayDate,
+    startMinutes,
+    durationMinutes: effectiveActivityDurationMinutes(item),
+    parsed,
+    lastEntryMinutes: lastEntryMinutes != null && legacyWindow && lastEntryMinutes < legacyWindow.closesMinutes ? lastEntryMinutes : null,
+  });
+  return { status: result.status, parsedKind: parsed.kind };
+}
+
+/** Round 7 — a real venue with parseable hours that genuinely cannot contain its scheduled activity interval (not UNKNOWN, not LEGAL). */
+function itemHasKnownOpeningHoursViolation(item: AiGeneratedItem, dayDate: string): boolean {
+  return isKnownHoursViolation(evaluateItemOpeningHoursLegality(item, dayDate).status);
+}
+
 /**
  * Round 6 — THE coordinate-having twin of enforceNormalDayLocality's
  * coordinate-less `matchesOwnArea`/`matchedOtherPhase` text check. A single
@@ -1988,17 +2607,54 @@ export function findMissingMealSlots(items: AiGeneratedItem[]) {
   return missingSlots;
 }
 
+/** DayPart meal slot -> the meal-cuisine-taxonomy MealType it must have real suitability evidence for (spec §9's "cafe lunch rule"). scoreMealCandidate is only ever called with "lunch"/"dinner" in practice; any other DayPart falls back to LUNCH's own gate rather than throwing. */
+const MEAL_SLOT_TO_MEAL_TYPE: Partial<Record<DayPart, MealType>> = { lunch: "LUNCH", dinner: "DINNER" };
+
+/** A hard-ish exclusion score (spec §9/§21 — never an outright thrown error, since callers still want a comparable number for diagnostics, but no selection path in this file ever prefers a mealTypeFit:false candidate to a fit:true one or to the synthetic fallback). */
+const MEAL_TYPE_MISMATCH_SCORE = -1000;
+
 export function scoreMealCandidate(
   recommendation: AiItineraryRequest["recommendations"][number],
   day: AiGeneratedDay,
   slot: DayPart,
   profile: TripPreferenceProfile,
   usedMealNames: Set<string>,
-  payload: AiItineraryRequest
+  payload: AiItineraryRequest,
+  /** Round 9.2.1 §12 — trip-wide cuisine memory, threaded the same way usedMealNames is (shared, appended-to by the caller after each real selection). Optional/defaulted so every pre-existing call site keeps compiling unchanged. */
+  recentMealHistory: RecentMealHistoryEntry[] = [],
+  dayIndex: number = day.dayNumber,
+  cuisineWeights: Record<CuisineFamily, number> = EMPTY_CUISINE_WEIGHTS
 ) {
-  let score = 0;
   const { anchor, nextAnchor } = getRelevantMealAnchors(day, slot);
   const isExplicitMealRequest = payload.selectedPlaces.some((place) => place.id === recommendation.id);
+
+  // Round 9.2.1 §7-9 — THE meal-type-suitability gate. Evidence-based
+  // (category baseline + keyword + opening-hours-window, never "it's
+  // open" alone) — replaces the old, evidence-free
+  // `slot === "lunch" && category === "cafe" -> +18` heuristic that let
+  // any cafe satisfy any meal merely by category. A candidate with no
+  // suitability evidence for THIS exact slot is excluded, never nudged.
+  const mealClassification = classifyMealVenue({
+    category: recommendation.category,
+    name: recommendation.name,
+    shortDescription: recommendation.shortDescription,
+    openingHours: recommendation.openingHours,
+    recommendedTimeOfDay: recommendation.recommendedTimeOfDay,
+    approximatePrice: recommendation.approximatePrice,
+    reservationRequired: recommendation.reservationRequired,
+  });
+  const requiredMealType = MEAL_SLOT_TO_MEAL_TYPE[slot] ?? "LUNCH";
+  if (!mealClassification.suitableMealTypes.includes(requiredMealType)) {
+    return MEAL_TYPE_MISMATCH_SCORE;
+  }
+
+  // A real, evidence-based fit bonus (spec §8/§11's own "mealTypeFit" scoring
+  // term) — replaces the old category-only `slot==="lunch"&&category==="cafe"`
+  // style bonus with the same magnitude, but now genuinely earned: only
+  // reached once the venue has ACTUAL suitability evidence for this exact
+  // slot (the gate above), never merely because its raw category happens to
+  // match.
+  let score = 18;
   const mealTransportation =
     recommendation.category === "cafe"
       ? "הליכה"
@@ -2020,8 +2676,6 @@ export function scoreMealCandidate(
     explicitRequest: isExplicitMealRequest,
   });
 
-  if (slot === "lunch" && recommendation.category === "cafe") score += 18;
-  if (slot === "dinner" && recommendation.category === "restaurant") score += 18;
   if (
     recommendation.recommendedTimeOfDay === slot ||
     recommendation.recommendedTimeOfDay === "any"
@@ -2077,6 +2731,17 @@ export function scoreMealCandidate(
   }
 
   if (recommendation.approximatePrice != null) score += 2;
+
+  // Round 9.2.1 §11/§13/§14 — cuisine preference + local-relevance bonuses,
+  // always soft, never enough alone to override a bad route/budget fit.
+  const cuisineWeight = Math.max(1, ...mealClassification.cuisineFamilies.map((f) => cuisineWeights[f] ?? 1), 1);
+  score += Math.round((cuisineWeight - 1) * 20);
+  if (mealClassification.cuisineFamilies.includes("LOCAL_TRADITIONAL")) score += 10;
+
+  // Round 9.2.1 §12 — soft trip-wide cuisine repetition penalty (never a
+  // hard ban — a genuinely scarce destination can still repeat, spec §12/§27).
+  score -= computeMealCuisineRecencyPenalty(mealClassification, recentMealHistory, dayIndex);
+
   return score;
 }
 
@@ -2085,7 +2750,11 @@ export function pickNearbyMealRecommendation(
   day: AiGeneratedDay,
   slot: DayPart,
   profile: TripPreferenceProfile,
-  usedMealNames: Set<string>
+  usedMealNames: Set<string>,
+  /** Round 9.2.1 §12 — optional, defaulted so every pre-existing call site keeps compiling unchanged. See scoreMealCandidate's own doc. */
+  recentMealHistory: RecentMealHistoryEntry[] = [],
+  dayIndex: number = day.dayNumber,
+  cuisineWeights: Record<CuisineFamily, number> = EMPTY_CUISINE_WEIGHTS
 ) {
   const usedNames = new Set(day.items.map((item) => item.name.trim().toLowerCase()));
   const baseCandidates = [...payload.recommendations, ...payload.selectedPlaces]
@@ -2132,7 +2801,10 @@ export function pickNearbyMealRecommendation(
         slot,
         profile,
         usedMealNames,
-        payload
+        payload,
+        recentMealHistory,
+        dayIndex,
+        cuisineWeights
       ),
     }))
     .sort((left, right) => right.score - left.score);
@@ -2701,36 +3373,74 @@ export function repairDayGeography(
 }
 
 /**
- * Real code-level opening-hours enforcement (spec items 16/17, regression
- * tests 84/85) — items are only ever swapped when `violatesOpeningHours`
- * confidently says so (parsed both the hours and the planned start time;
- * see opening-hours.ts's "never reject what we can't parse" rule), never
- * guessed from ambiguous source text. Same substitution pattern as
- * `repairDayGeography`: prefer a real matching candidate, fall back to a
- * generic free-exploration replacement. Bounded per day so a day with
- * several violations still converges without looping the whole plan.
+ * Round 7 — interval-aware opening-hours enforcement. A real scheduled
+ * venue with parseable hours must fit its whole activity interval
+ * `[start … start + effectiveDuration]` inside a valid opening interval for
+ * that day's local weekday (evaluateItemOpeningHoursLegality). Repair order
+ * per violating item (spec §5):
+ *
+ *   A. MOVE THE SAME ITEM — reorder it within the day so scheduleDayItems
+ *      re-times it into a legal slot; the venue is preserved.
+ *   B. REORDER SAME-DAY ITEMS — the A step tries both "as early as
+ *      possible" and "as late as possible"; the one that yields a legal
+ *      time with no new violation / overflow wins.
+ *   D. REPLACE — a legal candidate from the same day/stay pool whose OWN
+ *      hours are legal (or unknown) at the resulting time.
+ *   E. SAFE SYNTHETIC FALLBACK — free-exploration / meal placeholder rather
+ *      than ever keeping a known-closed real venue.
+ *
+ * Locked / fixedTime items are never moved or replaced (spec §6) — they
+ * are left exactly as-is and surface as `lockedOpeningHoursConflicts` in
+ * the pure final validator, so the itinerary is never falsely reported
+ * fully legal.
+ *
+ * Unknown / unparseable hours are never treated as a violation (spec §2).
  */
 export function repairOpeningHoursViolations(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile
 ): AiGeneratedDay[] {
-  // Root-cause fix (spec §A/§F "opening_hours_repair must never reinsert a
-  // globally used real POI") — built ONCE from the CURRENT full itinerary,
-  // then mutated in place across every day this .map() processes, so a
-  // replacement chosen for day 3 is visible as used when day 30 runs its
-  // own repair later in this SAME pass. The old code rebuilt a fresh Set
-  // from only `nextDay.items` (that one day alone) on every call, so this
-  // function had zero visibility into any other day's content at all.
+  // Built ONCE from the CURRENT full itinerary, then mutated in place across
+  // every day so a replacement chosen for an early day is visible as used
+  // when a later day runs its own repair in this same pass.
   const usageState = buildItineraryUsageState(days);
+
+  const reorderAttempt = (
+    day: AiGeneratedDay,
+    target: AiGeneratedItem,
+    position: "front" | "back"
+  ): AiGeneratedDay => {
+    const others = day.items.filter((entry) => entry !== target);
+    const reordered = position === "front" ? [target, ...others] : [...others, target];
+    return fillDerivedDayFields(resequenceDayItems({ ...day, items: reordered }), payload, profile);
+  };
+
   return days.map((day) => {
     let nextDay = day;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       const violatingItem = nextDay.items.find(
-        (item) => !item.locked && !item.fixedTime && violatesOpeningHours(item)
+        (item) => !item.locked && !item.fixedTime && itemHasKnownOpeningHoursViolation(item, nextDay.date)
       );
       if (!violatingItem) break;
 
+      // A / B — try to keep the SAME venue by reordering it within the day.
+      let resolvedByReorder = false;
+      for (const position of ["back", "front"] as const) {
+        const candidateDay = reorderAttempt(nextDay, violatingItem, position);
+        const movedItem = candidateDay.items.find((entry) => entry.name === violatingItem.name && entry.recommendationId === violatingItem.recommendationId);
+        const noNewViolation = candidateDay.items.every(
+          (entry) => entry.locked || entry.fixedTime || !itemHasKnownOpeningHoursViolation(entry, candidateDay.date)
+        );
+        if (movedItem && !itemHasKnownOpeningHoursViolation(movedItem, candidateDay.date) && noNewViolation) {
+          nextDay = candidateDay;
+          resolvedByReorder = true;
+          break;
+        }
+      }
+      if (resolvedByReorder) continue;
+
+      // D — replace with a legal candidate whose own hours also fit.
       releaseItineraryUsage(usageState, violatingItem);
       const replacement = pickReplacementRecommendation({
         traceSource: "opening_hours_repair",
@@ -2740,15 +3450,29 @@ export function repairOpeningHoursViolations(
         profile,
         usageState,
       });
-      const nextItem = replacement
+      let nextItem = replacement
         ? buildReplacementItem(replacement, violatingItem, nextDay, payload)
         : buildFreeExplorationReplacement(violatingItem, nextDay);
-      registerItineraryUsage(usageState, nextItem);
-      nextDay = fillDerivedDayFields(
+      let candidateDay = fillDerivedDayFields(
         resequenceDayItems(replaceItemInDay(nextDay, violatingItem, nextItem)),
         payload,
         profile
       );
+      const placedReplacement = candidateDay.items.find((entry) => entry.name === nextItem.name);
+      // E — if the chosen real replacement itself lands illegal at its new
+      // time, fall back to the synthetic block, which has no hours.
+      if (replacement && placedReplacement && itemHasKnownOpeningHoursViolation(placedReplacement, candidateDay.date)) {
+        registerItineraryUsage(usageState, nextItem); // keep it marked used — do not reinsert elsewhere
+        nextItem = buildFreeExplorationReplacement(violatingItem, nextDay);
+        candidateDay = fillDerivedDayFields(
+          resequenceDayItems(replaceItemInDay(nextDay, violatingItem, nextItem)),
+          payload,
+          profile
+        );
+      } else {
+        registerItineraryUsage(usageState, nextItem);
+      }
+      nextDay = candidateDay;
     }
     return nextDay;
   });
@@ -2775,7 +3499,10 @@ export function insertMissingMeals(
   profile: TripPreferenceProfile,
   usedMealNames: Set<string>,
   dayCount?: number,
-  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null,
+  /** Round 9.2.1 §12 — shared and mutated across the whole trip's day-processing loop, exactly like usedMealNames (same by-reference threading pattern) — appended to (in place, via push) every time a real meal venue is actually scheduled, read by scoreMealCandidate via pickNearbyMealRecommendation above. Optional/defaulted so every pre-existing call site keeps compiling unchanged. */
+  recentMealHistory: RecentMealHistoryEntry[] = [],
+  cuisineWeights: Record<CuisineFamily, number> = EMPTY_CUISINE_WEIGHTS
 ): AiGeneratedDay {
   let nextDay = day;
   // Real bug found during end-to-end QA generation (a live Israel trip): a
@@ -2802,12 +3529,38 @@ export function insertMissingMeals(
       nextDay,
       missingMealSlot,
       profile,
-      usedMealNames
+      usedMealNames,
+      recentMealHistory,
+      day.dayNumber,
+      cuisineWeights
     );
 
     const nextMealItem = recommendation
       ? buildSupplementalMealItem(recommendation, missingMealSlot, nextDay, payload)
       : buildFallbackMealPlaceholder(nextDay, missingMealSlot, payload, usedMealNames);
+
+    if (recommendation) {
+      // Round 9.2.1 §12 — record this real selection's cuisine BEFORE the
+      // next slot in this same loop (or the next day, via the caller's
+      // shared array) scores against it; mirrors usedMealNames.add just
+      // below in repairDayStructure, but per-slot rather than per-day so a
+      // lunch immediately informs the SAME day's dinner scoring too.
+      const classification = classifyMealVenue({
+        category: recommendation.category,
+        name: recommendation.name,
+        shortDescription: recommendation.shortDescription,
+        openingHours: recommendation.openingHours,
+        recommendedTimeOfDay: recommendation.recommendedTimeOfDay,
+        approximatePrice: recommendation.approximatePrice,
+        reservationRequired: recommendation.reservationRequired,
+      });
+      recentMealHistory.push({
+        dayIndex: day.dayNumber,
+        mealType: missingMealSlot === "dinner" ? "DINNER" : "LUNCH",
+        cuisineFamilies: classification.cuisineFamilies,
+        cuisineSubtypes: classification.cuisineSubtypes,
+      });
+    }
 
     if (nextMealItem && nextMealItem.name) {
       nextDay = {
@@ -2837,11 +3590,14 @@ export function repairDayStructure(
    * same loop sees them as used.
    */
   usageState: ItineraryUsageState = createItineraryUsageState(),
-  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null,
+  /** Round 9.2.1 §12 — same by-reference threading as usedMealNames/usageState above. Optional/defaulted so every pre-existing call site keeps compiling unchanged. */
+  recentMealHistory: RecentMealHistoryEntry[] = [],
+  cuisineWeights: Record<CuisineFamily, number> = EMPTY_CUISINE_WEIGHTS
 ) {
   let nextDay = resequenceDayItems({ ...day, items: sortItems(day.items.map(normalizeGeneratedItemCoordinates)) });
   for (const item of nextDay.items) releaseItineraryUsage(usageState, item);
-  nextDay = insertMissingMeals(nextDay, payload, profile, usedMealNames, dayCount, arrivalDepartureWindow);
+  nextDay = insertMissingMeals(nextDay, payload, profile, usedMealNames, dayCount, arrivalDepartureWindow, recentMealHistory, cuisineWeights);
 
   if (!nextDay.title || /^day\s+\d+$/i.test(nextDay.title.trim())) {
     const area = normalizeAreaLabel(nextDay.cityRegion || nextDay.items[0]?.location || payload.countryName);
@@ -2891,7 +3647,7 @@ export function repairDayStructure(
   // whether this is still a full-day-anchor day (e.g. by replacing the
   // anchor itself), which can newly require meals that weren't needed (or
   // weren't insertable) before it ran.
-  nextDay = insertMissingMeals(resequenceDayItems(nextDay), payload, profile, usedMealNames, dayCount, arrivalDepartureWindow);
+  nextDay = insertMissingMeals(resequenceDayItems(nextDay), payload, profile, usedMealNames, dayCount, arrivalDepartureWindow, recentMealHistory, cuisineWeights);
 
   for (const meal of nextDay.items.filter((item) => isFoodItem(item.category))) {
     usedMealNames.add(meal.name.trim().toLowerCase());
@@ -4626,7 +5382,26 @@ export function enforceBudgetOnDays(
 export function repairCrossRegionDayContent(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
-  profile: TripPreferenceProfile
+  profile: TripPreferenceProfile,
+  /**
+   * Round 9.4.3 §F root-cause fix — proven production evidence (traceId
+   * gen-mu7kn7ef-s9cg5z4x): "Harvard Club of Boston" and "The Glen House
+   * Hotel" oscillated phase-6 -> phase-2 -> phase-6 across repair
+   * attempts. Root cause: findCompatibleDayIndexForOutlier picked a
+   * target day purely by whichever OTHER day currently happened to have
+   * the nearest real coordinates — a signal that shifts every attempt as
+   * unrelated repair steps churn other days' content, with zero awareness
+   * of tripFrame/phase structure at all. enforceNormalDayLocality (the
+   * function that IS phase/anchor-authoritative) never oscillates in
+   * isolation for the same coordinate, because its own
+   * "belongsToAnotherStay" comparison is a pure function of the item's
+   * OWN coordinates against the TripFrame's fixed anchors — it settles
+   * once. Optional so this remains additive: every pre-existing call site
+   * that predates this parameter keeps compiling and keeps its old
+   * (unbounded) search — only repairPlan's own real call site below
+   * passes it.
+   */
+  tripFrame?: TripFrame | null
 ): { days: AiGeneratedDay[]; protectedGeographicConflicts: ProtectedGeographicConflict[] } {
   const protectedGeographicConflicts: ProtectedGeographicConflict[] = [];
   const workingDays = days.slice();
@@ -4661,7 +5436,7 @@ export function repairCrossRegionDayContent(
         continue;
       }
 
-      const targetIndex = findCompatibleDayIndexForOutlier(workingDays, dayIndex, outlier, profile);
+      const targetIndex = findCompatibleDayIndexForOutlier(workingDays, dayIndex, outlier, profile, tripFrame);
       if (targetIndex != null) {
         workingDays[targetIndex] = {
           ...workingDays[targetIndex],
@@ -4712,14 +5487,37 @@ export function repairCrossRegionDayContent(
   return { days: workingDays, protectedGeographicConflicts };
 }
 
-/** Nearest OTHER day whose own items already sit close to the outlier, with room left under its own capacity — never a day already flagged as a transfer/day-trip, whose cross-region spread is expected. */
+/**
+ * Nearest OTHER day whose own items already sit close to the outlier, with
+ * room left under its own capacity — never a day already flagged as a
+ * transfer/day-trip, whose cross-region spread is expected.
+ *
+ * Round 9.4.3 §F — when tripFrame is available, candidate days are
+ * restricted to the origin day's OWN authoritative phase (never a
+ * different phase/stay). This function's job is to fix a WITHIN-STAY
+ * geographic outlier (an item that doesn't cohere with the rest of its
+ * own day) by relocating it to a better-fitting day of the SAME stay —
+ * it must never be the mechanism that decides an item belongs to a
+ * DIFFERENT stay entirely, since its "nearest coordinates" signal is
+ * itself derived from whatever content OTHER days currently happen to
+ * hold, which shifts across repair attempts as unrelated steps churn
+ * those days (the proven root cause of the phase-6/phase-2 oscillation).
+ * A genuine cross-stay misplacement is enforceNormalDayLocality's job —
+ * that function is anchor-authoritative and settles once; this one, once
+ * bounded to same-phase days, can never fight it. When no tripFrame is
+ * given (every pre-existing caller), the search is unbounded exactly as
+ * before.
+ */
 function findCompatibleDayIndexForOutlier(
   days: AiGeneratedDay[],
   originIndex: number,
   outlier: AiGeneratedItem,
-  profile: TripPreferenceProfile
+  profile: TripPreferenceProfile,
+  tripFrame?: TripFrame | null
 ): number | null {
   if (outlier.lat == null || outlier.lon == null) return null;
+
+  const originPhase = tripFrame ? findFramePhaseForDay(tripFrame, days[originIndex].dayNumber) : null;
 
   let bestIndex: number | null = null;
   let bestDistanceKm = CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM;
@@ -4727,6 +5525,7 @@ function findCompatibleDayIndexForOutlier(
   for (let index = 0; index < days.length; index += 1) {
     if (index === originIndex) continue;
     const candidateDay = days[index];
+    if (originPhase && findFramePhaseForDay(tripFrame as TripFrame, candidateDay.dayNumber)?.id !== originPhase.id) continue;
     if (isIntercityTransferDay(candidateDay) || isDayTripDay(candidateDay)) continue;
     if (calculateDayLoadMinutes(candidateDay) >= profile.dailyCapacityMinutes) continue;
 
@@ -5571,6 +6370,213 @@ const QUALITY_SCORE_TARGET = 85;
  * duplicate — surfaced to the user via the existing duplicatePlaces
  * diagnostic instead of silently dropped.
  */
+/**
+ * Round 9.4.3 §H — collects every real place that carries the SAME
+ * recommendationId in 2+ places across the final itinerary. Exact-ID
+ * identity is authoritative whenever it exists (spec "Do not infer
+ * duplicate identity from name alone when recommendationId exists") —
+ * this never falls back to fuzzy name/coordinate matching, which
+ * removeFuzzyDuplicatePlaces already covers separately for the
+ * recommendationId-less case. Pure and side-effect-free so both the
+ * repair pass below and the final firewall share one identical notion of
+ * "what counts as a duplicate."
+ */
+export function computeRealPlaceDuplicateGroups(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame | null
+): RealPlaceDuplicateGroup[] {
+  const occurrencesById = new Map<string, RealPlaceDuplicateOccurrence[]>();
+  const nameById = new Map<string, string>();
+
+  for (const day of days) {
+    const phase = tripFrame ? findFramePhaseForDay(tripFrame, day.dayNumber) : null;
+    for (const item of day.items) {
+      // A synthetic FreeTime/MealOpportunity placeholder (spec §D "do not
+      // treat meal placeholders or synthetic blocks as real-place
+      // duplicates") can still carry a STALE recommendationId —
+      // buildFreeExplorationReplacement spreads the original item's own
+      // fields and only overrides name/category/location/itemRole, never
+      // clearing recommendationId. itemRole (the same authoritative
+      // signal isSyntheticScheduleItem/isRealPlaceForUsageTracking already
+      // use everywhere else in this file) is what actually decides "is
+      // this a real, trackable place" — never recommendationId presence
+      // alone.
+      if (!item.recommendationId || isSyntheticScheduleItem(item)) continue;
+      const list = occurrencesById.get(item.recommendationId) ?? [];
+      list.push({ dayNumber: day.dayNumber, phaseId: phase?.id ?? null, category: item.category });
+      occurrencesById.set(item.recommendationId, list);
+      nameById.set(item.recommendationId, item.name);
+    }
+  }
+
+  const groups: RealPlaceDuplicateGroup[] = [];
+  for (const [recommendationId, occurrences] of occurrencesById) {
+    if (occurrences.length > 1) {
+      groups.push({ recommendationId, name: nameById.get(recommendationId) ?? "", occurrences });
+    }
+  }
+  return groups;
+}
+
+/**
+ * Round 9.4.3 §J — the final duplicate firewall. Thrown at the same
+ * successful-return boundaries assertFinalRealActivityCoverage already
+ * guards, so a real-place exact-ID duplicate can never silently reach
+ * persistence regardless of which upstream repair step let it survive.
+ */
+export function assertNoRealPlaceDuplicatesRemain(days: AiGeneratedDay[], tripFrame: TripFrame | null): void {
+  const duplicates = computeRealPlaceDuplicateGroups(days, tripFrame);
+  if (duplicates.length === 0) return;
+  throw new RealPlaceDuplicatesRemainError(
+    `${duplicates.length} real place(s) are scheduled more than once across the itinerary: ${duplicates.map((group) => group.name).join(", ")}.`,
+    { duplicateCount: duplicates.length, duplicates }
+  );
+}
+
+/**
+ * Round 9.4.3 §H — which occurrence of an exact-ID duplicate to KEEP.
+ * Higher is better. A locked/fixedTime occurrence is never a candidate
+ * for removal at all (spec "user locked/fixedTime protection" + §Q
+ * "preserve existing protected-item semantics") — it always outranks
+ * every non-protected occurrence, mirroring isProtectedItem's treatment
+ * everywhere else in this file (never touched by a repair pass, only
+ * ever reported). Among non-protected occurrences: the day whose
+ * TripFrame phase is genuinely this coordinate's nearest anchor (the same
+ * authoritative "which stay does this real place actually belong to"
+ * signal enforceNormalDayLocality's own belongsToAnotherStay check
+ * already uses) wins first; a day with no known opening-hours violation
+ * is a secondary tiebreak.
+ */
+function scoreDuplicateOccurrenceForKeep(
+  item: AiGeneratedItem,
+  day: AiGeneratedDay,
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>
+): number {
+  if (item.locked || item.fixedTime) return Number.POSITIVE_INFINITY;
+
+  let score = 0;
+  const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+  if (phase && item.lat != null && item.lon != null) {
+    const ownAnchor = areaAnchors.get(phase.areaLabel);
+    if (ownAnchor) {
+      const ownDistanceKm = haversineKm(ownAnchor.lat, ownAnchor.lon, item.lat, item.lon);
+      const isAuthoritativePhase = tripFrame.phases.every((otherPhase) => {
+        if (otherPhase === phase) return true;
+        const otherAnchor = areaAnchors.get(otherPhase.areaLabel);
+        if (!otherAnchor) return true;
+        return haversineKm(otherAnchor.lat, otherAnchor.lon, item.lat as number, item.lon as number) >= ownDistanceKm;
+      });
+      if (isAuthoritativePhase) score += 100;
+    }
+  }
+  if (!itemHasKnownOpeningHoursViolation(item, day.date)) score += 10;
+  return score;
+}
+
+/**
+ * Round 9.4.3 §C/§D/§G/§H — the primary fix for the proven production
+ * duplicate-oscillation bug (traceId gen-mu7kn7ef-s9cg5z4x: the same
+ * recommendationId — e.g. "Harvard Club of Boston" — surviving on two
+ * different days/phases at once, with duplicatePlaces never reaching 0
+ * across all 4 repair attempts). recommendationId is authoritative
+ * identity (spec §H) — for every id claimed 2+ times, keeps exactly the
+ * highest-scored occurrence (scoreDuplicateOccurrenceForKeep) and
+ * replaces every other occurrence with a DIFFERENT, currently-unused
+ * legal candidate via the SAME pickReplacementRecommendation/
+ * buildFreeExplorationReplacement machinery every other repair step in
+ * this file already uses — never the same recommendationId again (the
+ * surviving occurrence stays registered in usageState throughout, so
+ * pickReplacementRecommendation's own isItineraryPlaceUsed filter
+ * excludes it automatically). Idempotent (a second call with no
+ * duplicates left is a no-op) and monotonic by construction — it only
+ * ever REMOVES occurrences from occurrencesById groups of size > 1, never
+ * creates a new group, and the one survivor per id is never itself
+ * touched.
+ *
+ * Two locked/fixedTime occurrences of the very same id is a genuine data
+ * conflict, not a repair decision this function can make silently (spec
+ * §Q) — left untouched for the final firewall (assertNoRealPlaceDuplicatesRemain)
+ * to report precisely instead.
+ */
+export function resolveExactIdDuplicates(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile
+): AiGeneratedDay[] {
+  const occurrences = new Map<string, Array<{ dayIndex: number; itemIndex: number; score: number }>>();
+  days.forEach((day, dayIndex) => {
+    day.items.forEach((item, itemIndex) => {
+      // Same exclusion as computeRealPlaceDuplicateGroups — a synthetic
+      // placeholder carrying a stale recommendationId is never a real
+      // occurrence to weigh or remove.
+      if (!item.recommendationId || isSyntheticScheduleItem(item)) return;
+      const score = scoreDuplicateOccurrenceForKeep(item, day, tripFrame, areaAnchors);
+      const list = occurrences.get(item.recommendationId) ?? [];
+      list.push({ dayIndex, itemIndex, score });
+      occurrences.set(item.recommendationId, list);
+    });
+  });
+
+  const losers = new Set<string>();
+  for (const list of occurrences.values()) {
+    if (list.length <= 1) continue;
+    const protectedCount = list.filter((entry) => entry.score === Number.POSITIVE_INFINITY).length;
+    if (protectedCount >= 2) continue; // genuine locked/fixedTime conflict — never silently resolved.
+    const sorted = [...list].sort((left, right) => right.score - left.score || left.dayIndex - right.dayIndex);
+    for (const loser of sorted.slice(1)) {
+      if (loser.score === Number.POSITIVE_INFINITY) continue; // never remove a locked/fixedTime occurrence.
+      losers.add(`${loser.dayIndex}:${loser.itemIndex}`);
+    }
+  }
+  if (losers.size === 0) return days;
+
+  const usageState = buildItineraryUsageState(days);
+  const mutableDays = days.map((day) => ({ ...day, items: [...day.items] }));
+  const touchedDayIndexes = new Set<number>();
+
+  for (const key of losers) {
+    const [dayIndexText, itemIndexText] = key.split(":");
+    const dayIndex = Number(dayIndexText);
+    const itemIndex = Number(itemIndexText);
+    const day = mutableDays[dayIndex];
+    const item = day.items[itemIndex];
+
+    // Multiset release (spec: "same object copied twice" and "same
+    // recommendation reconstructed twice" are the same identity) — the
+    // surviving occurrence's own registration is untouched, so the
+    // candidate search below can never re-select this exact id (spec §H
+    // rule 6: "never fill the gap with the same recommendationId").
+    releaseItineraryUsage(usageState, item);
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    const stayAnchor = phase ? areaAnchors.get(phase.areaLabel) ?? null : null;
+    const replacement = pickReplacementRecommendation({
+      traceSource: "other_existing_path",
+      payload,
+      day,
+      item,
+      profile,
+      usageState,
+      maxDistanceKm: mobilityProfile.localityRadiusKm,
+      stayAreaAnchor: stayAnchor,
+    });
+    const nextItem = replacement
+      ? buildReplacementItem(replacement, item, day, payload)
+      : buildFreeExplorationReplacement(item, day);
+    registerItineraryUsage(usageState, nextItem);
+    day.items[itemIndex] = nextItem;
+    touchedDayIndexes.add(dayIndex);
+  }
+
+  for (const dayIndex of touchedDayIndexes) {
+    mutableDays[dayIndex] = fillDerivedDayFields(resequenceDayItems(normalizeDayCollections(mutableDays[dayIndex])), payload, profile);
+  }
+  return mutableDays;
+}
+
 export function removeFuzzyDuplicatePlaces(
   days: AiGeneratedDay[],
   payload: AiItineraryRequest,
@@ -6800,6 +7806,28 @@ export interface FinalItineraryInvariantReport {
   illegalRealOtherVenues: number;
   /** Round 5 — days whose narrative text (day.notes) positively names a DIFFERENT TripFrame phase's area than the day's owner. */
   narrativeOwnerMismatch: number;
+  /**
+   * Round 7 — the ONE authoritative opening-hours acceptance counter: every
+   * real scheduled venue with PARSEABLE hours whose scheduled activity
+   * interval cannot legally fit an opening interval for that day's local
+   * weekday (start before opening / after closing / in a gap / duration
+   * overruns closing / closed that weekday). Locked/fixedTime conflicts are
+   * NOT included here — they are counted in `lockedOpeningHoursConflicts`.
+   */
+  openingHoursViolations: number;
+  /** Round 7 — real scheduled venues whose hours could not be parsed at all (never a violation, surfaced so "unknown" is visibly distinct from "known-legal"). */
+  openingHoursUnknownItems: number;
+  /** Round 7 — locked / fixedTime real venues that DO conflict with their own opening hours; preserved (never silently moved), reported so the itinerary is never falsely "fully legal". */
+  lockedOpeningHoursConflicts: number;
+  /**
+   * Round 7 — purely diagnostic split of `openingHoursViolations` by shape.
+   * `opensAfterScheduledStart + closesBeforeScheduledEnd + closedAtStart +
+   * closedAllDay === openingHoursViolations` always. NEVER gate on these.
+   */
+  opensAfterScheduledStart: number;
+  closesBeforeScheduledEnd: number;
+  closedAtStart: number;
+  closedAllDay: number;
   /** Per-violation detail, for logging/tests — never used to gate anything. */
   details: Array<{ dayNumber: number; itemName: string; kind: string; note?: string }>;
 }
@@ -6848,6 +7876,13 @@ export function validateFinalItineraryInvariants(
   let illegalRealAttractions = 0;
   let illegalRealFoodVenues = 0;
   let illegalRealOtherVenues = 0;
+  let openingHoursViolations = 0;
+  let openingHoursUnknownItems = 0;
+  let lockedOpeningHoursConflicts = 0;
+  let opensAfterScheduledStart = 0;
+  let closesBeforeScheduledEnd = 0;
+  let closedAtStart = 0;
+  let closedAllDay = 0;
   // Purely diagnostic: split ONE `illegalScheduledRealPlaces` hit into exactly
   // one of three buckets so they always sum back to the authoritative total.
   const SIGHTSEEING_CATEGORIES = new Set<RecommendationCategory>([
@@ -6966,6 +8001,28 @@ export function validateFinalItineraryInvariants(
         continue;
       }
 
+      // Round 7 — opening-hours legality (a separate axis from geography):
+      // the scheduled activity interval must fit a real opening interval
+      // for this day's local weekday. Applies to every real scheduled
+      // venue, food included. Locked/fixedTime conflicts are preserved and
+      // reported separately, never counted as a repairable violation.
+      const ohStatus = evaluateItemOpeningHoursLegality(item, day.date).status;
+      if (ohStatus === "UNKNOWN") {
+        openingHoursUnknownItems += 1;
+      } else if (isKnownHoursViolation(ohStatus)) {
+        if (item.locked || item.fixedTime) {
+          lockedOpeningHoursConflicts += 1;
+          details.push({ dayNumber: day.dayNumber, itemName: item.name, kind: `locked_opening_hours_conflict:${ohStatus}` });
+        } else {
+          openingHoursViolations += 1;
+          if (ohStatus === "OPENS_AFTER_START") opensAfterScheduledStart += 1;
+          else if (ohStatus === "CLOSES_BEFORE_END") closesBeforeScheduledEnd += 1;
+          else if (ohStatus === "CLOSED_ALL_DAY") closedAllDay += 1;
+          else closedAtStart += 1;
+          details.push({ dayNumber: day.dayNumber, itemName: item.name, kind: `opening_hours_violation:${ohStatus}` });
+        }
+      }
+
       // Real named venue — restaurant / cafe / bar / attraction / museum /
       // park alike (Round 5: `category === "food"` is NOT an exemption).
       const isFoodVenue = isFoodItem(item.category);
@@ -7024,6 +8081,13 @@ export function validateFinalItineraryInvariants(
     illegalRealAttractions,
     illegalRealFoodVenues,
     illegalRealOtherVenues,
+    openingHoursViolations,
+    openingHoursUnknownItems,
+    lockedOpeningHoursConflicts,
+    opensAfterScheduledStart,
+    closesBeforeScheduledEnd,
+    closedAtStart,
+    closedAllDay,
     details,
   };
 }
@@ -7058,13 +8122,24 @@ export function enforceItineraryInvariantsWithRepair(
     before.lodgingOwnerMismatch +
     before.syntheticOwnerMismatch +
     before.realFoodVenueOwnerMismatch +
-    before.narrativeOwnerMismatch;
+    before.narrativeOwnerMismatch +
+    // Round 7 — a repairable known-hours conflict also forces the bounded
+    // repair below (lockedOpeningHoursConflicts is NOT included: it cannot
+    // be repaired, only reported).
+    before.openingHoursViolations;
   if (total === 0) {
     return { days, before, after: before };
   }
 
   const dailyCapacityMinutes = deriveDailyCapacityMinutes(payload.preferences.tripPace);
   const stayTransitions = buildStayTransitions(tripFrame, areaAnchors);
+  // Round 7 — opening-hours repair runs FIRST in the bounded repair (it
+  // reorders / replaces within a day; it never changes which day owns an
+  // item, so it cannot regress geography). The geometry/owner repair below
+  // then runs on the result, and the PURE validator re-runs at the end.
+  days = before.openingHoursViolations > 0
+    ? repairOpeningHoursViolations(days, payload, profile)
+    : days;
   // Round 4 — deterministically re-bind every day to its canonical owner
   // and re-derive display / lodging / synthetic labels BEFORE the per-item
   // repair below, so those repairs see a structurally consistent day.
@@ -7178,11 +8253,1539 @@ export function enforceItineraryInvariantsWithRepair(
     }
   }
 
+  // Round 7 — the geometry/owner repair above resequences every changed
+  // day, which can re-time an item the opening-hours pass had already
+  // moved into a legal slot. Re-run the (idempotent) opening-hours repair
+  // on the settled object so the PURE re-validation below sees the final
+  // truth. Nothing after this line changes an item's scheduled time.
+  const openingHoursSettled = repairOpeningHoursViolations(mutableDays, payload, profile);
+  for (let i = 0; i < mutableDays.length; i += 1) mutableDays[i] = openingHoursSettled[i];
+
   const after = validateFinalItineraryInvariants(mutableDays, tripFrame, areaAnchors, mobilityProfile, payload, window);
   return { days: mutableDays, before, after };
 }
 
-function finalizeArrivalDepartureContent(
+/* ================================================================== *
+ * Round 8 — real-activity QUALITY (a safe, empty itinerary is a fail)  *
+ * ================================================================== */
+
+/**
+ * Round 8 — THE meaningful-real-activity predicate. A narrower subset of
+ * isScheduledRealPlace: excludes real MEAL VENUES too (a real restaurant is
+ * a real place for geography/hours purposes, but the product's "did this
+ * day give the traveler something to actually DO" question is about
+ * sightseeing/activity content — attraction, museum, landmark, nature,
+ * shopping, nightlife, hidden_gem, seasonal_event, day_trip). A real meal
+ * venue still counts toward the broader `realActivityCount`, never toward
+ * `meaningfulRealActivityCount` — matches the spec's own GOOD examples
+ * (museum + historic district + shopping, meals listed separately).
+ *
+ * Round 9.2.1 §1/§18/§19 — rewired from the plain `!isFoodItem(category)`
+ * check to the shared classification-based determinePlanningRole, so a
+ * genuine food EXPERIENCE (food tour, cooking class, tasting, market tour —
+ * classified via activity-taxonomy's own existing food_experience keyword
+ * match) still counts as meaningful, even when its raw provider category
+ * happens to be "restaurant"/"cafe" — an ordinary restaurant/cafe/bakery/
+ * bar never does, regardless of fame (spec §31 "do not call a restaurant a
+ * food experience merely to satisfy activity coverage" — this only ever
+ * recognizes food_experience via the SAME deterministic keyword evidence
+ * activity-taxonomy already uses everywhere else, never a new bespoke rule
+ * here).
+ */
+function isMeaningfulRealActivity(item: AiGeneratedItem): boolean {
+  if (!isScheduledRealPlace(item)) return false;
+  const classification = classifyActivity({
+    category: item.category,
+    name: item.name,
+    shortDescription: item.shortDescription,
+    reservationRequired: item.reservationRequired,
+    approximatePrice: item.approximatePrice,
+  });
+  return determinePlanningRole(item.category, classification) !== "MEAL_VENUE";
+}
+
+/**
+ * Round 8 — the hard minimum count of meaningful real activities a day of
+ * this derived type must carry before it counts as "below minimum". Never
+ * city/country-specific; purely a function of day type + whether an
+ * EXPLICIT rest/buffer window already justifies a lighter day (spec
+ * "restWindow should be explicit on lighter days" — an explicit restWindow
+ * is the one honest signal that a day was deliberately made lighter, not
+ * merely a repair pass giving up).
+ */
+function minimumMeaningfulRealActivities(dayType: DerivedDayType, hasExplicitRestWindow: boolean): number {
+  if (dayType === "arrival" || dayType === "departure") return 0; // spec: 0-2 depending on usable time
+  if (dayType === "transfer") return 0; // spec: 0-1 light real activity only if feasible
+  if (dayType === "day_trip") return 1; // the day-trip anchor itself
+  return hasExplicitRestWindow ? 1 : 2; // normal day: light (explicit) = 1, full sightseeing day = 2
+}
+
+export interface ItineraryQualityDayDetail {
+  dayNumber: number;
+  dayType: DerivedDayType;
+  meaningfulRealActivityCount: number;
+  realActivityCount: number;
+  syntheticActivityCount: number;
+  minimumRequired: number;
+  belowMinimum: boolean;
+  /** True when a day with zero meaningful real activity is structurally expected (arrival/departure/transfer) or explicitly marked as a rest day (restWindow). */
+  justifiedLight: boolean;
+  onlySyntheticContent: boolean;
+  /** Round 9 — the day's first meaningful real activity's own classification (schedule order = the day's own "opening act"); null on a day with no meaningful real activity at all. */
+  dominantFamily: ActivityFamily | null;
+  dominantSubtype: ActivitySubtype | null;
+}
+
+export interface ItineraryQualityReport {
+  /** All real scheduled places, food venues included (subset semantics match isScheduledRealPlace). */
+  realActivityCount: number;
+  /** Non-food sightseeing/activity real places only — the count the hard minimum is judged against. */
+  meaningfulRealActivityCount: number;
+  syntheticActivityCount: number;
+  /** syntheticActivityCount / (realActivityCount + syntheticActivityCount), 0 when the day/trip has no scheduled content at all. */
+  syntheticShare: number;
+  daysWithZeroRealActivities: number;
+  /** A day with zero REAL activity of any kind (food included) that still carries at least one synthetic filler item — the exact "free_time + meal_opportunity + free_time" failure shape. */
+  daysWithOnlySyntheticContent: number;
+  /** daysWithOnlySyntheticContent that are NOT structurally justified (not arrival/departure/transfer, no explicit restWindow) — the real acceptance signal. */
+  unjustifiedDaysWithOnlySyntheticContent: number;
+  daysBelowMinimumRealActivities: number;
+  /** Normal days whose synthetic share exceeds the budget (~35%) AND are below the real-activity minimum — a day can be synthetic-heavy AND still meet its minimum (e.g. one landmark + a long deliberate free afternoon), which is fine. */
+  excessiveSyntheticDays: number;
+  /** Days where a zero/below-minimum result IS structurally justified (arrival/departure/transfer/explicit rest) — reported so the total is never mistaken for a hidden failure. */
+  structurallyJustifiedLightDays: number;
+  /** Round 9 §23 — counts of every meaningful real activity's own classification, trip-wide. */
+  familyDistribution: Partial<Record<ActivityFamily, number>>;
+  subtypeDistribution: Partial<Record<ActivitySubtype, number>>;
+  /** Round 9 §23 — the longest run of consecutive days sharing the same dominant primary family / subtype (1 when no two adjacent days repeat; 0 when the trip has no meaningful real activity at all). */
+  consecutiveSameFamilyDays: number;
+  consecutiveSameSubtypeDays: number;
+  /**
+   * Round 9 §19/§24 — synthetic items on a day that was BELOW its own
+   * meaningful-real-activity minimum: synthetic content that exists
+   * because a real one could not be found, as distinct from a deliberate
+   * free/shopping/rest block on a day that already met its minimum. A
+   * proxy (this codebase does not yet persist a `flexibleReason` field on
+   * AiGeneratedItem — spec §19's tagging is a disclosed gap), but a
+   * deterministic and honest one: never fabricated, always derived from
+   * the same real/synthetic counts already computed above.
+   */
+  candidateExhaustionFallbackCount: number;
+  /** Round 9.2.1 §20 — real MEAL_VENUE-role places only (ordinary restaurant/cafe/bakery/bar), the complement of meaningfulRealActivityCount within realActivityCount. Never used to satisfy activity coverage. */
+  realMealVenueCount: number;
+  /** Round 9.2.1 §20 — synthetic 🍽 MealOpportunity placeholders specifically, a subset of syntheticActivityCount (the rest being free_time/other synthetic filler). */
+  syntheticMealOpportunityCount: number;
+  /** Round 9.2.1 §18/§20 — real places classified as a genuine food EXPERIENCE (food tour, cooking class, tasting, market tour) — counted separately for visibility even though they already count toward meaningfulRealActivityCount above (spec §18: these belong to the activity portfolio, never the meal system). */
+  foodExperienceActivityCount: number;
+  /**
+   * Round 9.2.1 §20 — a real meal venue scheduled in a slot its own
+   * suitableMealTypes evidence does NOT support (spec §9's whole point,
+   * audited here independently of whichever pipeline scheduled it — this
+   * catches a mismatch even on a Gemini-authored day that never went
+   * through scoreMealCandidate's own gate at all).
+   */
+  mealTypeMismatchCount: number;
+  /** Round 9.2.1 §20 — a real meal venue whose distance from its own day's adjacent anchors is large enough to read as an unreasonable detour (spec §10/§26) — a post-hoc geographic audit, independent of whichever selection path produced the day. */
+  mealRouteDetourViolations: number;
+  /** Round 9.2.1 §20 — a cuisine subtype repeated within RECENT_MEAL_HISTORY_DECAY_DAYS of its own previous occurrence, trip-wide (spec §12/§27) — a soft-diversity AUDIT count, never itself a validation gate. */
+  repeatedCuisineCount: number;
+  /** Round 9.2.1 §20/§21 — same signal as syntheticMealOpportunityCount, named to match spec §20's own vocabulary exactly; kept as a distinct alias rather than a second independent counter so the two can never drift apart. */
+  syntheticMealFallbackCount: number;
+  /** Round 9.2.1 §20 — days where EVERY feasible meal slot ended up synthetic (both lunch and dinner, when both were feasible) — the honest proxy available at this pure-validator layer for genuine meal-POOL exhaustion (this function only sees the final days, never the live StayMealVenuePool a generation run actually built; a single mismatched slot is mealTypeMismatchCount/syntheticMealOpportunityCount's own signal, this one is reserved for the stronger "the whole day's meal supply came up empty" shape). */
+  mealPoolExhaustionCount: number;
+  perDay: ItineraryQualityDayDetail[];
+}
+
+/** Normal-day synthetic-share budget (spec §4: "should generally not exceed ~25-35%"). Not a hard block by itself — only combined with belowMinimum counts toward excessiveSyntheticDays. */
+const NORMAL_DAY_SYNTHETIC_SHARE_BUDGET = 0.35;
+
+/**
+ * Round 8 — THE pure product-quality validator, run AFTER legality/hours
+ * validation on the EXACT final itinerary. A day can have
+ * illegalScheduledRealPlaces = 0, duplicatePlaces = 0 and
+ * openingHoursViolations = 0 while still being a failed itinerary (every
+ * "activity" is free_time/meal_opportunity) — this is the counter that
+ * catches that shape. Never mutates; never re-runs a repair.
+ */
+export function validateItineraryQuality(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  arrivalDepartureWindow: ArrivalDepartureWindow | null = null
+): ItineraryQualityReport {
+  let realActivityCount = 0;
+  let meaningfulRealActivityCount = 0;
+  let syntheticActivityCount = 0;
+  let daysWithZeroRealActivities = 0;
+  let daysWithOnlySyntheticContent = 0;
+  let unjustifiedDaysWithOnlySyntheticContent = 0;
+  let daysBelowMinimumRealActivities = 0;
+  let excessiveSyntheticDays = 0;
+  let structurallyJustifiedLightDays = 0;
+  let candidateExhaustionFallbackCount = 0;
+  let realMealVenueCount = 0;
+  let syntheticMealOpportunityCount = 0;
+  let foodExperienceActivityCount = 0;
+  const familyDistribution: Partial<Record<ActivityFamily, number>> = {};
+  const subtypeDistribution: Partial<Record<ActivitySubtype, number>> = {};
+  const perDay: ItineraryQualityDayDetail[] = [];
+
+  for (const day of days) {
+    const dayType = deriveDayType(day, tripFrame, arrivalDepartureWindow);
+    const hasExplicitRestWindow = Boolean(day.restWindow && day.restWindow.trim());
+    let dayReal = 0;
+    let dayMeaningfulReal = 0;
+    let daySynthetic = 0;
+    let dominantFamily: ActivityFamily | null = null;
+    let dominantSubtype: ActivitySubtype | null = null;
+
+    for (const item of day.items) {
+      if (isStayTransitionItem(item) || item.category === "hotel" || item.category === "transportation" || item.category === "practical") continue;
+      if (isScheduledRealPlace(item)) {
+        dayReal += 1;
+        const classification = classifyActivity({
+          category: item.category,
+          name: item.name,
+          shortDescription: item.shortDescription,
+          reservationRequired: item.reservationRequired,
+          approximatePrice: item.approximatePrice,
+        });
+        if (determinePlanningRole(item.category, classification) === "MEAL_VENUE") {
+          realMealVenueCount += 1;
+        } else {
+          dayMeaningfulReal += 1;
+          if (classification.subtype === "food_experience") foodExperienceActivityCount += 1;
+          familyDistribution[classification.primaryFamily] = (familyDistribution[classification.primaryFamily] ?? 0) + 1;
+          subtypeDistribution[classification.subtype] = (subtypeDistribution[classification.subtype] ?? 0) + 1;
+          if (dominantFamily == null) {
+            dominantFamily = classification.primaryFamily;
+            dominantSubtype = classification.subtype;
+          }
+        }
+      } else if (isSyntheticScheduleItem(item) || isGenericMealOpportunity(item)) {
+        daySynthetic += 1;
+        if (isGenericMealOpportunity(item)) syntheticMealOpportunityCount += 1;
+      }
+    }
+
+    realActivityCount += dayReal;
+    meaningfulRealActivityCount += dayMeaningfulReal;
+    syntheticActivityCount += daySynthetic;
+
+    const minimumRequired = minimumMeaningfulRealActivities(dayType, hasExplicitRestWindow);
+    const belowMinimum = dayMeaningfulReal < minimumRequired;
+    const justifiedLight = dayType !== "normal" || hasExplicitRestWindow;
+    const onlySyntheticContent = dayReal === 0 && daySynthetic > 0;
+    const total = dayReal + daySynthetic;
+    const syntheticShare = total > 0 ? daySynthetic / total : 0;
+
+    if (dayReal === 0) daysWithZeroRealActivities += 1;
+    if (onlySyntheticContent) {
+      daysWithOnlySyntheticContent += 1;
+      if (!justifiedLight) unjustifiedDaysWithOnlySyntheticContent += 1;
+    }
+    if (belowMinimum) {
+      daysBelowMinimumRealActivities += 1;
+      candidateExhaustionFallbackCount += daySynthetic;
+      if (justifiedLight) structurallyJustifiedLightDays += 1;
+      else if (dayType === "normal" && syntheticShare > NORMAL_DAY_SYNTHETIC_SHARE_BUDGET) excessiveSyntheticDays += 1;
+    }
+
+    perDay.push({
+      dayNumber: day.dayNumber,
+      dayType,
+      meaningfulRealActivityCount: dayMeaningfulReal,
+      realActivityCount: dayReal,
+      syntheticActivityCount: daySynthetic,
+      minimumRequired,
+      belowMinimum,
+      justifiedLight,
+      onlySyntheticContent,
+      dominantFamily,
+      dominantSubtype,
+    });
+  }
+
+  let consecutiveSameFamilyDays = 0;
+  let consecutiveSameSubtypeDays = 0;
+  let runFamily = 0;
+  let runSubtype = 0;
+  for (let i = 0; i < perDay.length; i += 1) {
+    const current = perDay[i];
+    const previous = i > 0 ? perDay[i - 1] : null;
+    runFamily = current.dominantFamily != null && previous?.dominantFamily === current.dominantFamily ? runFamily + 1 : current.dominantFamily != null ? 1 : 0;
+    runSubtype = current.dominantSubtype != null && previous?.dominantSubtype === current.dominantSubtype ? runSubtype + 1 : current.dominantSubtype != null ? 1 : 0;
+    consecutiveSameFamilyDays = Math.max(consecutiveSameFamilyDays, runFamily);
+    consecutiveSameSubtypeDays = Math.max(consecutiveSameSubtypeDays, runSubtype);
+  }
+
+  // Round 9.2.1 §20 — meal-specific audit metrics, computed independently
+  // of whichever pipeline produced these days (they re-classify every real
+  // meal venue from scratch), so they catch a mismatch even on a
+  // Gemini-authored day that never went through scoreMealCandidate's own
+  // gate. A strictly additive second pass — never changes any count above.
+  let mealTypeMismatchCount = 0;
+  let mealRouteDetourViolations = 0;
+  let repeatedCuisineCount = 0;
+  let mealPoolExhaustionCount = 0;
+  const cuisineHistory: Array<{ dayIndex: number; subtypes: string[] }> = [];
+
+  for (const day of days) {
+    const orderedItems = sortItems(day.items);
+    let daySyntheticMealSlots = 0;
+    let dayFeasibleMealSlots = 0;
+
+    for (let i = 0; i < orderedItems.length; i += 1) {
+      const item = orderedItems[i];
+      const isMealSlot = item.slot === "lunch" || item.slot === "dinner";
+      if (isGenericMealOpportunity(item) && isMealSlot) {
+        daySyntheticMealSlots += 1;
+        dayFeasibleMealSlots += 1;
+        continue;
+      }
+      if (!isScheduledRealPlace(item) || !isMealSlot) continue;
+      const classification = classifyActivity({
+        category: item.category,
+        name: item.name,
+        shortDescription: item.shortDescription,
+        reservationRequired: item.reservationRequired,
+        approximatePrice: item.approximatePrice,
+      });
+      if (determinePlanningRole(item.category, classification) !== "MEAL_VENUE") continue;
+      dayFeasibleMealSlots += 1;
+
+      const mealClassification = classifyMealVenue({
+        category: item.category,
+        name: item.name,
+        shortDescription: item.shortDescription,
+        openingHours: item.openingHours,
+        approximatePrice: item.approximatePrice,
+        reservationRequired: item.reservationRequired,
+      });
+      const requiredMealType: MealType = item.slot === "dinner" ? "DINNER" : "LUNCH";
+      if (!mealClassification.suitableMealTypes.includes(requiredMealType)) mealTypeMismatchCount += 1;
+
+      const previous = orderedItems[i - 1];
+      const next = orderedItems[i + 1];
+      const neighborKms = [previous, next]
+        .filter((neighbor): neighbor is AiGeneratedItem => neighbor != null && hasValidCoordinates(neighbor) && hasValidCoordinates(item))
+        .map((neighbor) => haversineKm(neighbor.lat as number, neighbor.lon as number, item.lat as number, item.lon as number));
+      // A generous, disclosed threshold (never the hard MEAL_MAX_* walking/
+      // driving-minutes limits enforced elsewhere) — this is a QUALITY
+      // audit signal, not a legality gate; flags only a clear, unambiguous
+      // detour rather than every mildly-inconvenient placement.
+      if (neighborKms.some((km) => km > 12)) mealRouteDetourViolations += 1;
+
+      if (mealClassification.cuisineSubtypes.length > 0) {
+        const repeated = cuisineHistory.some(
+          (entry) =>
+            day.dayNumber - entry.dayIndex < RECENT_MEAL_HISTORY_DECAY_DAYS &&
+            entry.subtypes.some((s) => mealClassification.cuisineSubtypes.includes(s as never))
+        );
+        if (repeated) repeatedCuisineCount += 1;
+        cuisineHistory.push({ dayIndex: day.dayNumber, subtypes: mealClassification.cuisineSubtypes });
+      }
+    }
+
+    if (dayFeasibleMealSlots >= 2 && daySyntheticMealSlots === dayFeasibleMealSlots) {
+      mealPoolExhaustionCount += 1;
+    }
+  }
+
+  const totalContent = realActivityCount + syntheticActivityCount;
+  return {
+    realActivityCount,
+    meaningfulRealActivityCount,
+    syntheticActivityCount,
+    syntheticShare: totalContent > 0 ? syntheticActivityCount / totalContent : 0,
+    daysWithZeroRealActivities,
+    daysWithOnlySyntheticContent,
+    unjustifiedDaysWithOnlySyntheticContent,
+    daysBelowMinimumRealActivities,
+    excessiveSyntheticDays,
+    structurallyJustifiedLightDays,
+    familyDistribution,
+    subtypeDistribution,
+    consecutiveSameFamilyDays,
+    consecutiveSameSubtypeDays,
+    candidateExhaustionFallbackCount,
+    realMealVenueCount,
+    syntheticMealOpportunityCount,
+    foodExperienceActivityCount,
+    mealTypeMismatchCount,
+    mealRouteDetourViolations,
+    repeatedCuisineCount,
+    syntheticMealFallbackCount: syntheticMealOpportunityCount,
+    mealPoolExhaustionCount,
+    perDay,
+  };
+}
+
+/**
+ * Round 8 — quality acceptance: legality/hours/duplicate validators being
+ * zero is NOT sufficient (spec: "A legally safe but empty itinerary is not
+ * acceptable"). Fails only on the UNJUSTIFIED shape — a normal/day-trip day
+ * with no meaningful real content at all when nothing structural explains
+ * it. A trip with genuinely justified light days (arrival/departure/
+ * transfer/explicit rest) always passes regardless of how many of those
+ * exist.
+ */
+export function passesQualityValidation(report: ItineraryQualityReport): boolean {
+  return report.unjustifiedDaysWithOnlySyntheticContent === 0;
+}
+
+/** Round 9.3.5 §17 — one row per stay in the coverage-failure diagnostic, so "X/Y days empty despite Z candidates" is never trip-wide-only again; distinguishes "one stay has no supply" from "every stay has supply but composer underuses it" at a glance. */
+export interface StayCoverageSummary {
+  stayId: string;
+  owner: string;
+  normalDays: number;
+  uncoveredDays: number;
+  poolSize: number;
+  portfolioSelected: number;
+  unusedCandidates: number;
+}
+
+/**
+ * Round 9.3.6 — the exact `phase.id -> {poolSize, portfolioSelected}` shape
+ * `assertRealActivityCoverage`'s `staySupplyContext` expects, extracted so
+ * every call site builds it the SAME way instead of hand-rolling an inline
+ * `new Map(...)` each time. This was the missing piece at repairPlan's own
+ * internal call site: it never built this map at all (no poolsByStay in
+ * scope), so `assertRealActivityCoverage` silently defaulted every stay's
+ * poolSize/portfolioSelected to 0 via its own `?? 0` fallback — matching a
+ * real production trip that showed poolSize: 0 for all 7 stays despite
+ * payload.recommendations having 39 real candidates and 16/34 days already
+ * carrying real content (the supply was never absent, the diagnostic was
+ * blind). Never used to gate/filter anything — purely observational.
+ */
+export function buildStaySupplyDiagnosticsMap(
+  tripFrame: TripFrame,
+  poolsByStay: Map<string, StayActivityPool>,
+  portfoliosByStay: Map<string, StayActivityPortfolio>
+): Map<string, { poolSize: number; portfolioSelected: number; isCatastrophicProviderFailure: boolean }> {
+  // Round 9.3.7 §D/§K — buildStayFailureDetails/isCatastrophicallyDiscoveryUnavailable
+  // are the SAME confirmed-provider-failure signal assessTripDiscoveryHealth
+  // uses; folded in here so assertRealActivityCoverage's own stricter
+  // per-stay gate can tell "this stay had a confirmed real provider outage"
+  // apart from "this stay's pool is just naturally near-empty" (spec
+  // §12A's protected genuine-scarcity case) without a second, parallel
+  // classification.
+  const catastrophicStayIds = new Set(
+    buildStayFailureDetails(poolsByStay)
+      .filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay))
+      .map((stay) => stay.stayId)
+  );
+  return new Map(
+    tripFrame.phases.map((phase) => [
+      phase.id,
+      {
+        poolSize: poolsByStay.get(phase.id)?.candidates.length ?? 0,
+        portfolioSelected: portfoliosByStay.get(phase.id)?.selected.length ?? 0,
+        isCatastrophicProviderFailure: catastrophicStayIds.has(phase.id),
+      },
+    ])
+  );
+}
+
+/**
+ * Round 9.3.6 §14 — `payload.recommendations` mixes real ACTIVITY
+ * candidates with real MEAL_VENUE candidates (and, in principle, other
+ * non-activity roles), but the coverage gate is asking one specific
+ * question: is there enough real ACTIVITY supply to explain why so many
+ * days are empty? Counting meal venues toward that number overstates
+ * activity supply (a trip-wide pool that is mostly restaurants can pass
+ * the "non-trivial pool" gate while genuinely having almost no real
+ * ACTIVITY candidates — exactly the kind of silent misclassification spec
+ * item 14 flagged), so this splits the trip-wide pool the same
+ * classifyActivity/determinePlanningRole way computeTruthfulScheduleMetrics
+ * already does for scheduled items, applied here to the CANDIDATE pool
+ * instead.
+ */
+function countRecommendationsByPlanningRole(recommendations: TripRecommendation[]): {
+  totalRecommendations: number;
+  realActivityRecommendations: number;
+  realMealVenueRecommendations: number;
+} {
+  let realActivityRecommendations = 0;
+  let realMealVenueRecommendations = 0;
+  for (const rec of recommendations) {
+    const classification = classifyActivity({
+      category: rec.category,
+      name: rec.name,
+      shortDescription: rec.shortDescription,
+    });
+    if (determinePlanningRole(rec.category, classification) === "MEAL_VENUE") {
+      realMealVenueRecommendations += 1;
+    } else {
+      realActivityRecommendations += 1;
+    }
+  }
+  return { totalRecommendations: recommendations.length, realActivityRecommendations, realMealVenueRecommendations };
+}
+
+export class InsufficientRealActivityCoverageError extends Error {
+  readonly code = "INSUFFICIENT_REAL_ACTIVITY_COVERAGE" as const;
+  readonly report: ItineraryQualityReport;
+  readonly diagnostics: {
+    normalDayCount: number;
+    unjustifiedZeroRealDayNumbers: number[];
+    /** Round 9.3.6 §14 — now the real-ACTIVITY-only count (meal venues and other non-activity roles excluded), never the raw trip-wide recommendation total; see totalRecommendations for that. */
+    recommendationPoolSize: number;
+    /** Round 9.3.6 §14 — the raw, unfiltered size of payload.recommendations, kept alongside recommendationPoolSize so a caller can see how much of the trip-wide pool was actually activity-eligible. */
+    totalRecommendations: number;
+    /** Round 9.3.6 §14 — how many of totalRecommendations were real MEAL_VENUE candidates, never counted as activity coverage supply. */
+    realMealVenueRecommendations: number;
+    /** Round 9.3.5 §17 — omitted only when the caller has no per-stay pool/portfolio data to report (the deterministic-fallback-template call site, which never built one). */
+    stays?: StayCoverageSummary[];
+  };
+  constructor(report: ItineraryQualityReport, diagnostics: InsufficientRealActivityCoverageError["diagnostics"]) {
+    super(
+      `Insufficient real-activity coverage: ${diagnostics.unjustifiedZeroRealDayNumbers.length}/${diagnostics.normalDayCount} normal days have no real content despite ${diagnostics.recommendationPoolSize} real-activity candidates loaded (${diagnostics.totalRecommendations} total recommendations, ${diagnostics.realMealVenueRecommendations} of them meal venues).`
+    );
+    this.name = "InsufficientRealActivityCoverageError";
+    this.report = report;
+    this.diagnostics = diagnostics;
+  }
+}
+
+/**
+ * Round 8 spec §12 — "a failed generation is preferable to a useless
+ * itinerary pretending to be complete." Deliberately conservative: only
+ * throws when the shape is unambiguous — a MAJORITY of normal days have
+ * zero meaningful real content with no structural excuse, AND the provider
+ * pool was demonstrably non-trivial (so this is a planning failure, not
+ * genuine destination scarcity, which degrades silently instead per spec
+ * §12A). Never called for the deterministic template fallback path (which
+ * legitimately may have few/no real candidates).
+ */
+/**
+ * Round 9.3 §16 — the ratio check above is gated on a non-trivial
+ * `payload.recommendations` pool (a genuine destination-scarcity signal,
+ * spec §12A) — but Round 9.2 made `payload.recommendations` start EMPTY
+ * for every normal wizard trip (the client no longer pre-fetches it), so
+ * that gate alone can no longer catch the exact catastrophic shape this
+ * round's real 42-day US replay produced (one phase whose OWN area is the
+ * country itself, ~100% unjustified-empty days). `tripFrameContext` below
+ * adds the ONE unconditional, pool-size-independent signal for that exact
+ * shape: a country-level single stay is never legitimate scarcity — a
+ * real city/region always exists regardless of how many candidates were
+ * found for it.
+ */
+export function assertRealActivityCoverage(
+  report: ItineraryQualityReport,
+  payload: Pick<AiItineraryRequest, "recommendations">,
+  /** Round 9.3 §16/§7 — when supplied, a single phase whose own area IS the destination country (never resolved to a real local stay) is itself treated as catastrophic for any trip long enough that a genuine single-country-wide base is implausible (matches needsStaySkeleton's own bucket-free reasoning: this is about the SHAPE of the failure, not a day-count constant). */
+  tripFrameContext?: { tripFrame: TripFrame; countryName: string },
+  /** Round 9.3.5 §17 — per-stay pool/portfolio sizes, when the caller has them (the composed path always does), so a thrown failure names exactly which stays own the uncovered days instead of only a trip-wide total. */
+  staySupplyContext?: Map<string, { poolSize: number; portfolioSelected: number; isCatastrophicProviderFailure?: boolean }>,
+  /** Round 9.4.2 §G — purely reported in RealPlaceContentLostError's own diagnostics, never affects the throw decision itself. */
+  fallbackUsed = false
+): void {
+  const normalDays = report.perDay.filter((day) => day.dayType === "normal");
+  if (normalDays.length === 0) return;
+  const unjustified = normalDays.filter((day) => day.onlySyntheticContent && !day.justifiedLight);
+  const { totalRecommendations, realActivityRecommendations, realMealVenueRecommendations } = countRecommendationsByPlanningRole(
+    payload.recommendations
+  );
+  const recommendationPoolSize = realActivityRecommendations;
+  const unjustifiedRatio = unjustified.length / normalDays.length;
+  const MIN_POOL_TO_EXPECT_COVERAGE = 10;
+  const MAJORITY_FAILURE_RATIO = 0.5;
+
+  // Unconditional (never excused by a small recommendation pool, spec §7):
+  // a single phase whose OWN area is literally the destination country,
+  // for a trip too long to plausibly be one genuine country-wide base —
+  // this is a structural planning failure, not scarcity. A real city/
+  // region always exists regardless of how many candidates were found for
+  // it, so "the pool was tiny" is never a legitimate excuse for this shape.
+  const isCountryLevelSingleStay =
+    tripFrameContext != null &&
+    tripFrameContext.tripFrame.phases.length === 1 &&
+    normalizeAreaLabel(tripFrameContext.tripFrame.phases[0].areaLabel) === normalizeAreaLabel(tripFrameContext.countryName) &&
+    normalDays.length > TRIP_LENGTH_BUCKETS.find((b) => b.id === "single_base")!.maxDays!;
+
+  // The plain ratio-based ceiling stays gated on a non-trivial pool (spec
+  // §12A's own "genuine destination scarcity degrades silently") — a tiny
+  // real pool (e.g. 1 candidate for a remote destination) can legitimately
+  // still leave 100% of normal days empty; that's Round 8 J's own
+  // established, deliberately-preserved case, untouched here.
+  const isMajorityFailure = recommendationPoolSize >= MIN_POOL_TO_EXPECT_COVERAGE && unjustifiedRatio > MAJORITY_FAILURE_RATIO;
+
+  // Round 9.3.7 §D/§K — computed whenever the caller has a TripFrame,
+  // regardless of whether the TRIP-WIDE ratio above already trips: a
+  // single provider-failed stay can legitimately be a small fraction of a
+  // large multi-stay trip (never triggering the >50% trip-wide gate) while
+  // STILL leaving every one of ITS OWN normal sightseeing days entirely
+  // synthetic — silently accepted as "successful" would be exactly the
+  // "all-FreeTime stay counted as real" outcome spec item K forbids.
+  // Deliberately narrower than "poolSize === 0": requires
+  // isCatastrophicProviderFailure specifically (a CONFIRMED real provider
+  // outage, from buildStaySupplyDiagnosticsMap), never a genuinely tiny/
+  // empty pool caused by ordinary destination scarcity (spec §12A's own
+  // protected "degrades silently" case, Round 8 J) — and gated strictly on
+  // staySupplyContext being ACTUALLY PROVIDED (never inferred from its
+  // absence, or every pre-existing caller that omits it would newly and
+  // incorrectly throw here).
+  let stays: StayCoverageSummary[] | undefined;
+  let isAnyStayFullyUnrecoverable = false;
+  if (tripFrameContext) {
+    const byPhase = new Map<string, { owner: string; normalDays: number; uncoveredDays: number }>();
+    for (const day of normalDays) {
+      const phase = findFramePhaseForDay(tripFrameContext.tripFrame, day.dayNumber);
+      if (!phase) continue;
+      const entry = byPhase.get(phase.id) ?? { owner: phase.areaLabel, normalDays: 0, uncoveredDays: 0 };
+      entry.normalDays += 1;
+      if (day.onlySyntheticContent && !day.justifiedLight) entry.uncoveredDays += 1;
+      byPhase.set(phase.id, entry);
+    }
+    stays = [...byPhase.entries()].map(([stayId, entry]) => {
+      const supply = staySupplyContext?.get(stayId);
+      const poolSize = supply?.poolSize ?? 0;
+      const portfolioSelected = supply?.portfolioSelected ?? 0;
+      return {
+        stayId,
+        owner: entry.owner,
+        normalDays: entry.normalDays,
+        uncoveredDays: entry.uncoveredDays,
+        poolSize,
+        portfolioSelected,
+        unusedCandidates: Math.max(0, poolSize - portfolioSelected),
+      };
+    });
+    if (staySupplyContext) {
+      isAnyStayFullyUnrecoverable = [...byPhase.entries()].some(([stayId, entry]) => {
+        const supply = staySupplyContext.get(stayId);
+        return supply != null && supply.isCatastrophicProviderFailure === true && entry.normalDays > 0 && entry.uncoveredDays === entry.normalDays;
+      });
+    }
+  }
+
+  // Round 9.4.2 §G — the regression firewall, checked BEFORE (and
+  // independently of) the ratio-based majority-failure logic above: a
+  // non-trivial real candidate pool existed (the SAME >=10 threshold
+  // isMajorityFailure already uses, preserving the established spec
+  // §12A "genuine scarcity degrades silently" precedent — this is never
+  // "totalRealActivityCandidates > 0" literally, which would break every
+  // existing small-pool test) and the FINAL itinerary has LITERALLY zero
+  // scheduled real activities across every normal day. This is
+  // deliberately UNCONDITIONAL on the ratio math above: the proven
+  // production case (traceId gen-mu7ihdq8-545bii8p) reached persistence
+  // with recommendationPoolSize well over 10 and realActivities===0
+  // WITHOUT this coverage check ever throwing — an edge case in the
+  // ratio/majority judgment call that this direct, unconditional check
+  // exists specifically to backstop.
+  const finalRealActivityCount = normalDays.reduce((sum, day) => sum + day.meaningfulRealActivityCount, 0);
+  const isTotalRealPlaceLoss = recommendationPoolSize >= MIN_POOL_TO_EXPECT_COVERAGE && finalRealActivityCount === 0;
+
+  if (isTotalRealPlaceLoss) {
+    throw new RealPlaceContentLostError(
+      `Real-place content was completely lost: ${recommendationPoolSize} real activity candidates existed but the final itinerary scheduled zero across ${normalDays.length} normal days.`,
+      {
+        totalRealActivityCandidates: recommendationPoolSize,
+        finalRealActivities: 0,
+        normalDayCount: normalDays.length,
+        fallbackUsed,
+        perStay: stays,
+      }
+    );
+  }
+
+  if (isCountryLevelSingleStay || isMajorityFailure || isAnyStayFullyUnrecoverable) {
+    throw new InsufficientRealActivityCoverageError(report, {
+      normalDayCount: normalDays.length,
+      unjustifiedZeroRealDayNumbers: unjustified.map((day) => day.dayNumber),
+      recommendationPoolSize,
+      totalRecommendations,
+      realMealVenueRecommendations,
+      stays,
+    });
+  }
+}
+
+/**
+ * Round 8 — repair order §5/§6/§8: for a day below its meaningful-real
+ * minimum, pull UNUSED, LEGAL real candidates from the pool ALREADY LOADED
+ * for this owner/stay (pickReplacementRecommendation already applies the
+ * geography filter, dedup-against-usageState, and category/proximity
+ * ranking) and use them to DEMOTE synthetic filler back into real content —
+ * never appended past the day's real capacity, never reusing a globally-
+ * used place. Provider network refill (spec §6 steps 2-3 — fetching MORE
+ * candidates for the same owner when the loaded pool itself is too thin) is
+ * a documented gap: this function only ever draws from
+ * `payload.recommendations` as already loaded by the caller.
+ */
+export function backfillRealActivities(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  arrivalDepartureWindow: ArrivalDepartureWindow | null,
+  /**
+   * Round 9 §21/§22 — when the caller has already built per-stay portfolios
+   * (buildTripActivityPortfolios), this is now a LAST-resort quality
+   * repair, not the primary mechanism: an unused portfolio candidate (the
+   * planner's own deliberately-selected, diversity-scored content) is tried
+   * BEFORE ever falling back to a raw pickReplacementRecommendation scan of
+   * the whole payload pool. Omitted entirely, this behaves exactly as
+   * Round 8 did (pool-only) — no behavior change for any existing caller.
+   */
+  portfoliosByStay?: Map<string, StayActivityPortfolio>
+): { days: AiGeneratedDay[]; insertions: Array<{ dayNumber: number; itemName: string; reason: "portfolio" | "pool" }> } {
+  const usageState = buildItineraryUsageState(days);
+  const insertions: Array<{ dayNumber: number; itemName: string; reason: "portfolio" | "pool" }> = [];
+  const recommendationsById = new Map(payload.recommendations.map((r) => [r.id, r]));
+
+  const nextDays = days.map((day) => {
+    const dayType = deriveDayType(day, tripFrame, arrivalDepartureWindow);
+    // Only normal/day_trip days are backfilled — arrival/departure/transfer
+    // days having zero real content is structurally expected (spec §3) and
+    // never force-filled.
+    if (dayType !== "normal" && dayType !== "day_trip") return day;
+    const hasExplicitRestWindow = Boolean(day.restWindow && day.restWindow.trim());
+    const minimumRequired = minimumMeaningfulRealActivities(dayType, hasExplicitRestWindow);
+
+    let mutableDay = day;
+    let meaningfulCount = day.items.filter((item) => isMeaningfulRealActivity(item)).length;
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    const stayAnchor = phase ? (areaAnchors.get(phase.areaLabel) ?? null) : null;
+    const portfolio = phase ? portfoliosByStay?.get(phase.id) : undefined;
+
+    // Round 9.3.3 continuation §2 — "REAL-BEFORE-FREETIME": the ORIGINAL
+    // gate here (`meaningfulCount < minimumRequired`) only topped a day up
+    // to its historical minimum, so a day that already reached that
+    // minimum could still carry a free_time item sitting on an
+    // activity-anchor slot while its own stay's portfolio had a further
+    // legal, unused real candidate available — that candidate was simply
+    // never used. The second disjunct below closes that gap: as long as
+    // the day still has a free_time-role item occupying a slot, keep
+    // trying to replace it with real supply, past the minimum, UNTIL
+    // supply is genuinely exhausted (the loop's own `!rawReplacement
+    // break` below, unchanged) or the day is a deliberate rest/flex day
+    // (`hasExplicitRestWindow`), which is explicitly exempted — a user who
+    // asked for flexibility there keeps it, this never overrides that.
+    let attempts = 0;
+    while (
+      (meaningfulCount < minimumRequired ||
+        (!hasExplicitRestWindow && mutableDay.items.some((item) => item.itemRole === "free_time"))) &&
+      attempts < 6
+    ) {
+      attempts += 1;
+      // Prefer demoting an existing synthetic filler (free_time, or a
+      // coordinate-less generic meal placeholder is left alone — meals stay
+      // meals); fall back to the day's own template item so
+      // pickReplacementRecommendation still has a slot/area/anchor to work
+      // from when the day has no synthetic filler to reclaim.
+      const syntheticTarget =
+        mutableDay.items.find((item) => item.itemRole === "free_time") ??
+        buildInsertionTemplateItem(mutableDay);
+
+      // Round 9 §21 step 1: an unused, legal portfolio candidate (selected,
+      // then optional) — the planner's own deliberate, diversity-scored
+      // choice — beats a fresh raw-pool scan.
+      let candidateRecommendation: AiItineraryRequest["recommendations"][number] | null = null;
+      let reason: "portfolio" | "pool" = "pool";
+      if (portfolio) {
+        for (const poolCandidate of [...portfolio.selected, ...portfolio.optional]) {
+          if (isItineraryPlaceUsed(usageState, { id: poolCandidate.recommendationId, name: poolCandidate.name, lat: poolCandidate.lat, lon: poolCandidate.lon })) continue;
+          const full = recommendationsById.get(poolCandidate.recommendationId);
+          if (!full) continue;
+          candidateRecommendation = full;
+          reason = "portfolio";
+          break;
+        }
+      }
+      const rawReplacement =
+        candidateRecommendation ??
+        pickReplacementRecommendation({
+          traceSource: "quality_backfill",
+          payload,
+          day: mutableDay,
+          item: syntheticTarget,
+          profile,
+          usageState,
+          replacementMode: "non_food",
+          stayAreaAnchor: stayAnchor,
+          maxDistanceKm: mobilityProfile.localityRadiusKm,
+        });
+      if (!rawReplacement) break; // pool exhausted — never widen to a distant region, never reuse a used place
+
+      const candidateItem = buildReplacementItem(rawReplacement, syntheticTarget, mutableDay, payload);
+      // Defense in depth: re-verify BOTH axes Round 6/7 already gate on —
+      // a backfilled item must never itself become the next regression.
+      const legal = evaluateScheduledPlaceLegality({
+        placeLat: candidateItem.lat,
+        placeLon: candidateItem.lon,
+        dayType,
+        stayAnchor,
+        mobilityProfile,
+        dailyCapacityMinutes: deriveDailyCapacityMinutes(payload.preferences.tripPace),
+        visitMinutes: candidateItem.estimatedDurationMinutes,
+      }).legal;
+      if (!legal) {
+        // A portfolio pick that turns out illegal here (e.g. stale
+        // ownership) never blocks the pool fallback — try again next
+        // iteration, which re-scans the (now-excluded) portfolio first.
+        if (reason === "portfolio") {
+          registerItineraryUsage(usageState, candidateItem); // mark it used-and-rejected so it isn't retried forever
+          releaseItineraryUsage(usageState, candidateItem);
+          continue;
+        }
+        break;
+      }
+
+      const isReplacingSynthetic = mutableDay.items.includes(syntheticTarget) && syntheticTarget.itemRole === "free_time";
+      const nextItems = isReplacingSynthetic
+        ? mutableDay.items.map((entry) => (entry === syntheticTarget ? candidateItem : entry))
+        : [...mutableDay.items, candidateItem];
+
+      registerItineraryUsage(usageState, candidateItem);
+      mutableDay = fillDerivedDayFields(resequenceDayItems({ ...mutableDay, items: nextItems }), payload, profile);
+      const ohStatus = evaluateItemOpeningHoursLegality(
+        mutableDay.items.find((entry) => entry.name === candidateItem.name) ?? candidateItem,
+        mutableDay.date
+      ).status;
+      if (isKnownHoursViolation(ohStatus)) {
+        // The exact slot scheduleDayItems gave it doesn't fit its hours —
+        // undo rather than hand the next stage a fresh violation.
+        releaseItineraryUsage(usageState, candidateItem);
+        mutableDay = isReplacingSynthetic
+          ? fillDerivedDayFields(resequenceDayItems({ ...mutableDay, items: mutableDay.items.map((entry) => (entry === candidateItem ? syntheticTarget : entry)) }), payload, profile)
+          : fillDerivedDayFields(resequenceDayItems({ ...mutableDay, items: mutableDay.items.filter((entry) => entry !== candidateItem) }), payload, profile);
+        continue;
+      }
+
+      meaningfulCount += 1;
+      insertions.push({ dayNumber: day.dayNumber, itemName: candidateItem.name, reason });
+    }
+
+    return mutableDay;
+  });
+
+  return { days: nextDays, insertions };
+}
+
+/**
+ * Round 9.3.3 continuation §4 — "REAL-MEAL-BEFORE-MEALOPPORTUNITY": the
+ * meal analogue of backfillRealActivities just above. insertMealsFromPool
+ * already prefers a real StayMealVenuePool candidate over a synthetic
+ * MealOpportunity DURING initial composition, but until now nothing ever
+ * revisited that choice later — a MealOpportunity scheduled because the
+ * pool looked exhausted (or wasn't built yet at that point in the
+ * pipeline) stayed a MealOpportunity forever, even once
+ * finalizeArrivalDepartureContent rebuilds a fresh, fuller pool from the
+ * FINAL candidate set. This tries, for every already-scheduled
+ * MealOpportunity, to replace it with a real venue from that fresh
+ * pool — reusing selectMealVenueFromPool/buildSupplementalMealItem
+ * unchanged (no cuisine-logic redesign), gated by the exact same
+ * geography/meal-type/timing/collision constraints insertMealsFromPool
+ * already enforces, and never double-booking a venue already used
+ * anywhere else in the trip.
+ */
+export function backfillRealMealVenues(
+  days: AiGeneratedDay[],
+  tripFrame: TripFrame,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  mealPoolsByStay: Map<string, StayMealVenuePool>,
+  dayCount?: number,
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+): { days: AiGeneratedDay[]; insertions: Array<{ dayNumber: number; itemName: string }> } {
+  const usedMealRecommendationIds = new Set<string>();
+  const usedMealNames = new Set<string>();
+  for (const day of days) {
+    for (const item of day.items) {
+      if (isFoodItem(item.category) && !isGenericMealOpportunity(item)) {
+        if (item.recommendationId) usedMealRecommendationIds.add(item.recommendationId);
+        usedMealNames.add(item.name.trim().toLowerCase());
+      }
+    }
+  }
+  const recentMealHistory: RecentMealHistoryEntry[] = [];
+  const cuisineWeights = buildCuisinePreferenceWeights([...profile.strongPreferences, ...profile.softPreferences]);
+  const insertions: Array<{ dayNumber: number; itemName: string }> = [];
+
+  const nextDays = days.map((day) => {
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    const mealPool = phase ? mealPoolsByStay.get(phase.id) : undefined;
+    if (!mealPool || mealPool.venues.length === 0) return day;
+
+    const isArrivalDay = dayCount != null && day.dayNumber === 1;
+    const isDepartureDay = dayCount != null && day.dayNumber === dayCount;
+    let mutableDay = day;
+
+    for (const opportunity of mutableDay.items.filter((item) => isGenericMealOpportunity(item))) {
+      const slot: DayPart = opportunity.category === "cafe" ? "lunch" : "dinner";
+      const isFeasible = hasUsableGapForMeal(
+        mutableDay,
+        slot === "lunch" ? LUNCH_WINDOW_MINUTES : DINNER_WINDOW_MINUTES,
+        isArrivalDay,
+        isDepartureDay,
+        arrivalDepartureWindow ?? null
+      );
+      if (arrivalDepartureWindow && !isFeasible) continue;
+
+      const { anchor, nextAnchor } = getRelevantMealAnchors(mutableDay, slot);
+      const best = selectMealVenueFromPool(
+        mealPool,
+        {
+          mealType: slot === "lunch" ? "LUNCH" : "DINNER",
+          anchor,
+          nextAnchor,
+          pace: payload.preferences.tripPace,
+          transportation: payload.preferences.transportationPreferences || mutableDay.transportation || "תחבורה מקומית",
+          recentHistory: recentMealHistory,
+          dayIndex: mutableDay.dayNumber,
+          cuisineWeights,
+          usedRecommendationIds: usedMealRecommendationIds,
+        },
+        profile
+      );
+      const fullRecommendation = best ? payload.recommendations.find((r) => r.id === best.candidate.recommendationId) ?? null : null;
+      if (!best || !fullRecommendation) continue; // pool genuinely has nothing more usable — the MealOpportunity stays, honestly
+
+      const realItem = buildSupplementalMealItem(fullRecommendation, slot, mutableDay, payload);
+      mutableDay = {
+        ...mutableDay,
+        items: mutableDay.items.map((entry) => (entry === opportunity ? realItem : entry)),
+      };
+      usedMealRecommendationIds.add(best.candidate.recommendationId);
+      usedMealNames.add(fullRecommendation.name.trim().toLowerCase());
+      recentMealHistory.push({
+        dayIndex: mutableDay.dayNumber,
+        mealType: slot === "lunch" ? "LUNCH" : "DINNER",
+        cuisineFamilies: best.candidate.classification.cuisineFamilies,
+        cuisineSubtypes: best.candidate.classification.cuisineSubtypes,
+      });
+      insertions.push({ dayNumber: mutableDay.dayNumber, itemName: realItem.name });
+    }
+
+    return mutableDay.items === day.items ? day : fillDerivedDayFields(resequenceDayItems(mutableDay), payload, profile);
+  });
+
+  return { days: nextDays, insertions };
+}
+
+/* ================================================================== *
+ * Round 9.2 — INITIAL day composition FROM the stay activity portfolio *
+ * (spec "THE STAY ACTIVITY PORTFOLIO MUST BECOME THE AUTHORITATIVE     *
+ * INPUT FOR INITIAL DAY CONSTRUCTION") — this is no longer a repair    *
+ * layer bolted on after the fact (Round 8/9's backfillRealActivities   *
+ * remains, but only as the EXCEPTIONAL safety net spec §10 asks for);  *
+ * this function is what actually DECIDES a healthy day's real content *
+ * before anything else runs.                                          *
+ * ================================================================== */
+
+export interface ComposedPortfolioPlan {
+  plan: AiItineraryResponse;
+  /** Every real activity this composer itself placed — the metric spec §12 wants to dominate backfilledRealActivities for a healthy trip. */
+  initialRealActivitiesScheduled: number;
+}
+
+/** Round 9.2 §8 — within-day-assignment geographic cohesion: candidates near what's ALREADY chosen today score higher, so diversity never creates inefficient zig-zag travel. Worldwide/generic — plain distance, no place names, no country-specific constant. */
+const GEOGRAPHIC_COHESION_BONUS_KM = 15;
+/** Round 9.2 §7 — a mild same-day family-repetition nudge (e.g. two museums the same morning), independent of the trip-wide recency penalty (computeRecencyPenalty) which looks at OTHER days. */
+const SAME_DAY_FAMILY_REPEAT_PENALTY = 6;
+
+/** Exported for direct unit testing (Round 9.2) — isolates the trip-wide
+ * recency term from the same-day family and geographic-cohesion terms,
+ * since a full composeDaysFromStayPortfolios run can't reliably isolate it:
+ * selectStayPortfolio already diversifies WHICH candidates make it into
+ * `.selected`, so a fixture built only from full composition can pass even
+ * with this function's own recency penalty removed. */
+export function scoreCandidateForDayAssignment(
+  candidate: StayActivityPoolCandidate,
+  recentHistory: RecentActivityHistoryEntry[],
+  dayNumber: number,
+  todaysChosen: StayActivityPoolCandidate[]
+): number {
+  let score = candidate.significance;
+  score -= computeRecencyPenalty(candidate.classification, recentHistory, dayNumber);
+
+  const sameFamilyToday = todaysChosen.filter((c) => c.classification.primaryFamily === candidate.classification.primaryFamily).length;
+  score -= SAME_DAY_FAMILY_REPEAT_PENALTY * sameFamilyToday;
+
+  if (candidate.lat != null && candidate.lon != null) {
+    const distancesKm = todaysChosen
+      .filter((c): c is StayActivityPoolCandidate & { lat: number; lon: number } => c.lat != null && c.lon != null)
+      .map((c) => haversineKm(c.lat, c.lon, candidate.lat as number, candidate.lon as number));
+    if (distancesKm.length > 0) {
+      const avgDistanceKm = distancesKm.reduce((sum, km) => sum + km, 0) / distancesKm.length;
+      score += Math.max(0, GEOGRAPHIC_COHESION_BONUS_KM - avgDistanceKm);
+    }
+  }
+  return score;
+}
+
+function buildEmptyComposedDay(dayNumber: number, date: string, cityRegion: string): AiGeneratedDay {
+  return {
+    dayNumber,
+    date,
+    title: "",
+    cityRegion,
+    theme: "",
+    accommodation: "",
+    notes: "",
+    transportation: "",
+    estimatedCost: null,
+    activityCost: null,
+    foodCost: null,
+    transportCost: null,
+    accommodationCost: null,
+    totalTravelMinutes: null,
+    warnings: [],
+    alternatives: [],
+    bookingRequirements: [],
+    safetyNotes: [],
+    restWindow: "",
+    transportSegments: [],
+    items: [],
+  };
+}
+
+/**
+ * Round 9.3 §11 — the composer's OWN meal insertion, consuming a literal
+ * StayMealVenuePool via selectMealVenueFromPool — no second inline pseudo-
+ * pool. Falls back to the pre-Round-9.3 insertMissingMeals machinery only
+ * when no real pool exists for this stay (e.g. a caller that hasn't built
+ * one yet, or a stay with genuinely zero meal-venue supply at all) so this
+ * never regresses a day to having no meal at all.
+ */
+function insertMealsFromPool(
+  day: AiGeneratedDay,
+  mealPool: StayMealVenuePool | undefined,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  usedMealNames: Set<string>,
+  usedMealRecommendationIds: Set<string>,
+  recentMealHistory: RecentMealHistoryEntry[],
+  cuisineWeights: Record<CuisineFamily, number>,
+  dayCount?: number,
+  arrivalDepartureWindow?: ArrivalDepartureWindow | null
+): AiGeneratedDay {
+  if (!mealPool || mealPool.venues.length === 0) {
+    return insertMissingMeals(day, payload, profile, usedMealNames, dayCount, arrivalDepartureWindow, recentMealHistory, cuisineWeights);
+  }
+
+  let nextDay = day;
+  const isArrivalDay = dayCount != null && day.dayNumber === 1;
+  const isDepartureDay = dayCount != null && day.dayNumber === dayCount;
+  const lunchIsFeasible = !arrivalDepartureWindow || hasUsableGapForMeal(nextDay, LUNCH_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+  const dinnerIsFeasible = !arrivalDepartureWindow || hasUsableGapForMeal(nextDay, DINNER_WINDOW_MINUTES, isArrivalDay, isDepartureDay, arrivalDepartureWindow);
+
+  for (const missingMealSlot of findMissingMealSlots(nextDay.items)) {
+    if (missingMealSlot === "lunch" && !lunchIsFeasible) continue;
+    if (missingMealSlot === "dinner" && !dinnerIsFeasible) continue;
+
+    const { anchor, nextAnchor } = getRelevantMealAnchors(nextDay, missingMealSlot);
+    const mealType: MealType = missingMealSlot === "dinner" ? "DINNER" : "LUNCH";
+    const best = selectMealVenueFromPool(
+      mealPool,
+      {
+        mealType,
+        anchor,
+        nextAnchor,
+        pace: payload.preferences.tripPace,
+        transportation: payload.preferences.transportationPreferences || nextDay.transportation || "תחבורה מקומית",
+        recentHistory: recentMealHistory,
+        dayIndex: day.dayNumber,
+        cuisineWeights,
+        usedRecommendationIds: usedMealRecommendationIds,
+      },
+      profile
+    );
+    const fullRecommendation = best ? payload.recommendations.find((r) => r.id === best.candidate.recommendationId) ?? null : null;
+
+    const nextMealItem = fullRecommendation
+      ? buildSupplementalMealItem(fullRecommendation, missingMealSlot, nextDay, payload)
+      : buildFallbackMealPlaceholder(nextDay, missingMealSlot, payload, usedMealNames);
+
+    if (best && fullRecommendation) {
+      usedMealRecommendationIds.add(best.candidate.recommendationId);
+      usedMealNames.add(fullRecommendation.name.trim().toLowerCase());
+      recentMealHistory.push({
+        dayIndex: day.dayNumber,
+        mealType,
+        cuisineFamilies: best.candidate.classification.cuisineFamilies,
+        cuisineSubtypes: best.candidate.classification.cuisineSubtypes,
+      });
+    }
+
+    if (nextMealItem && nextMealItem.name) {
+      nextDay = { ...nextDay, items: [...nextDay.items, nextMealItem] };
+    }
+  }
+  return nextDay;
+}
+
+/**
+ * Round 9.2 — THE deterministic, portfolio-driven initial day composer.
+ * Produces a COMPLETE AiItineraryResponse directly from
+ * StayActivityPool/StayActivityPortfolio data — no Gemini call required
+ * (spec §5: "Gemini must not be required... the deterministic planner
+ * must be capable of constructing the itinerary directly from
+ * StayActivityPortfolios"). Real anchors are assigned to normal/day_trip
+ * days FIRST (spec §6), scored by significance, trip-wide diversity decay
+ * (computeRecencyPenalty — the SAME function selectStayPortfolio itself
+ * uses, spec §7: "do not merely select a diverse portfolio and then
+ * distribute it badly"), same-day family repetition, and geographic
+ * cohesion (spec §8) — never a hard ban, always a soft score. Meals and
+ * free time are added afterward via the SAME existing machinery
+ * (insertMissingMeals, resequenceDayItems's own free-time filler) — never
+ * reinvented. `portfolio.optional` is drawn from only once `.selected` is
+ * exhausted for a stay (spec §9: the reserve stays unused otherwise).
+ */
+export function composeDaysFromStayPortfolios(
+  tripFrame: TripFrame,
+  dayCount: number,
+  arrivalDepartureWindow: ArrivalDepartureWindow,
+  poolsByStay: Map<string, StayActivityPool>,
+  portfoliosByStay: Map<string, StayActivityPortfolio>,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  /**
+   * Round 9.3 §11 — the composer's own meal source. When a real, non-empty
+   * pool exists for a stay, meal selection consumes it LITERALLY
+   * (selectMealVenueFromPool) — no second inline pseudo-pool. Optional and
+   * defaulted to an empty Map ONLY so every pre-Round-9.3 test/caller that
+   * never built one keeps compiling and falls back to the existing
+   * insertMissingMeals machinery (itself already classification-correct
+   * since Round 9.2.1) — production always passes a real one now.
+   */
+  mealPoolsByStay: Map<string, StayMealVenuePool> = new Map()
+): ComposedPortfolioPlan {
+  const recommendationsById = new Map(payload.recommendations.map((recommendation) => [recommendation.id, recommendation]));
+  const dayTypesByStay = estimatePreGenerationDayTypesByStay(tripFrame, dayCount, arrivalDepartureWindow);
+  const dayTypeByDayNumber = new Map<number, StayDayCapacityInput>();
+  // Every normal/day_trip day number for a given stay, ascending — used
+  // below to PACE portfolio consumption across the whole stay (a real bug
+  // found writing this function's own tests: a stay whose pool was thinner
+  // than `target × stayDays` got its portfolio fully drained by the middle
+  // of the stay, leaving its LAST day with zero real content even though
+  // the pool was never actually empty at the trip level — just spent
+  // unevenly). Never a hardcoded per-day count; always derived from
+  // however many normal/day_trip days this specific stay actually has.
+  const normalDayNumbersByStay = new Map<string, number[]>();
+  for (const [stayId, list] of dayTypesByStay) {
+    normalDayNumbersByStay.set(
+      stayId,
+      list.filter((entry) => entry.dayType === "normal" || entry.dayType === "day_trip").map((entry) => entry.dayNumber)
+    );
+    for (const entry of list) dayTypeByDayNumber.set(entry.dayNumber, entry);
+  }
+
+  const usedCandidateIds = new Set<string>();
+  let recentHistory: RecentActivityHistoryEntry[] = [];
+  const usedMealNames = new Set<string>();
+  const usedMealRecommendationIds = new Set<string>();
+  const recentMealHistory: RecentMealHistoryEntry[] = [];
+  const cuisineWeights = buildCuisinePreferenceWeights([...profile.strongPreferences, ...profile.softPreferences]);
+  let initialRealActivitiesScheduled = 0;
+  const days: AiGeneratedDay[] = [];
+
+  // Round 9.4 §K — logged once per stay, before composition consumes
+  // anything, so CompositionOutput below can be read as "what changed",
+  // not just an isolated final count.
+  if (isPlannerQaTraceEnabled()) {
+    for (const [stayId, dayNumbers] of normalDayNumbersByStay) {
+      const portfolio = portfoliosByStay.get(stayId);
+      const mealPool = mealPoolsByStay.get(stayId);
+      logRealPlaceQA("CompositionInput", {
+        stayId,
+        normalDays: dayNumbers.length,
+        portfolioSelected: portfolio?.selected.length ?? 0,
+        portfolioReserve: portfolio?.optional.length ?? 0,
+        mealPoolSize: mealPool?.venues.length ?? 0,
+      });
+    }
+  }
+
+  for (let dayNumber = 1; dayNumber <= dayCount; dayNumber += 1) {
+    const phase = findFramePhaseForDay(tripFrame, dayNumber);
+    const dayType: DerivedDayType = dayTypeByDayNumber.get(dayNumber)?.dayType ?? "normal";
+    const date = dateForDayNumber(payload.preferences.startDate, dayNumber) || payload.preferences.startDate;
+
+    let day = buildEmptyComposedDay(dayNumber, date, phase?.areaLabel ?? "");
+
+    // Real anchors FIRST (spec §6) — only on normal/day_trip days, the same
+    // gate backfillRealActivities already uses (arrival/departure/transfer
+    // having zero real content at THIS stage is structurally expected;
+    // Round 8's exceptional backfill can still add one later if capacity
+    // genuinely allows).
+    if (phase && (dayType === "normal" || dayType === "day_trip")) {
+      const portfolio = portfoliosByStay.get(phase.id);
+      const rawTarget = Math.max(1, Math.round(estimateDayActivityTarget({ dayNumber, dayType, hasExplicitRestWindow: false })));
+      // Pace consumption across the REST of this stay's own normal/day_trip
+      // days (this one included) so a thin-relative-to-target portfolio is
+      // spread evenly rather than front-loaded, leaving a later day empty.
+      const remainingStayDayNumbers = (normalDayNumbersByStay.get(phase.id) ?? []).filter((d) => d >= dayNumber);
+      const remainingUnusedSupply = portfolio
+        ? portfolio.selected.filter((c) => !usedCandidateIds.has(c.recommendationId)).length +
+          portfolio.optional.filter((c) => !usedCandidateIds.has(c.recommendationId)).length
+        : 0;
+      const fairShare = remainingStayDayNumbers.length > 0 ? Math.round(remainingUnusedSupply / remainingStayDayNumbers.length) : rawTarget;
+      // fairShare can legitimately be 0 when supply for this stay is
+      // already exhausted — the loop below still breaks correctly via its
+      // own `available.length === 0` check regardless of `target`'s value,
+      // so clamping the floor to 1 here never causes an incorrect
+      // over-assignment.
+      const target = Math.max(1, Math.min(rawTarget, fairShare));
+      const todaysChosen: StayActivityPoolCandidate[] = [];
+
+      while (portfolio && todaysChosen.length < target) {
+        const unused = (bucket: StayActivityPoolCandidate[]) => bucket.filter((c) => !usedCandidateIds.has(c.recommendationId));
+        const fromSelected = unused(portfolio.selected);
+        const available = fromSelected.length > 0 ? fromSelected : unused(portfolio.optional);
+        if (available.length === 0) break;
+
+        let best = available[0];
+        let bestScore = -Infinity;
+        for (const candidate of available) {
+          const score = scoreCandidateForDayAssignment(candidate, recentHistory, dayNumber, todaysChosen);
+          if (score > bestScore) {
+            bestScore = score;
+            best = candidate;
+          }
+        }
+
+        const fullRecommendation = recommendationsById.get(best.recommendationId);
+        usedCandidateIds.add(best.recommendationId); // never retried this pass either way — a missing lookup is a data-integrity gap, not a reason to loop
+        if (!fullRecommendation) continue;
+
+        const template = buildInsertionTemplateItem(day);
+        const newItem = buildReplacementItem(fullRecommendation, template, day, payload);
+        day = { ...day, items: [...day.items, newItem] };
+        todaysChosen.push(best);
+        initialRealActivitiesScheduled += 1;
+      }
+
+      recentHistory = [
+        ...recentHistory,
+        ...todaysChosen.map((candidate) => ({
+          dayIndex: dayNumber,
+          stayId: phase.id,
+          primaryFamily: candidate.classification.primaryFamily,
+          subtype: candidate.classification.subtype,
+        })),
+      ];
+    }
+
+    // Meals — Round 9.3 §11: the composer's own literal StayMealVenuePool
+    // consumer (falls back to insertMissingMeals only when this stay has no
+    // real pool at all). Scheduling/free-time filler after that is the SAME
+    // existing machinery every other pass in this file already uses.
+    day = insertMealsFromPool(day, phase ? mealPoolsByStay.get(phase.id) : undefined, payload, profile, usedMealNames, usedMealRecommendationIds, recentMealHistory, cuisineWeights, dayCount, arrivalDepartureWindow);
+    day = fillDerivedDayFields(resequenceDayItems(day), payload, profile);
+    days.push(day);
+  }
+
+  const plan: AiItineraryResponse = {
+    title: `מסלול ל${payload.countryName}`,
+    summary: "",
+    totalEstimatedCost: null,
+    estimatedTransportCost: null,
+    averageDailyCost: null,
+    costPerTraveler: null,
+    categoryBreakdown: {},
+    days,
+  };
+
+  // Round 9.4 §K — did the composer receive real candidates and simply
+  // fail to schedule them, or did it never have them to begin with? Grouped
+  // by stay so this reconciles directly against the Portfolio/ActivityPool
+  // logs above (same phase.id) and the CandidateConservation record below.
+  if (isPlannerQaTraceEnabled()) {
+    const byStay = new Map<string, { normalDays: number; real: number; realMeals: number; synthetic: number; mealOpportunities: number; freeTime: number; days: Array<{ dayNumber: number; dayType: string; realActivities: number; realMeals: number; freeTime: number; mealOpportunities: number }> }>();
+    for (const day of days) {
+      const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+      const stayId = phase?.id ?? "unowned";
+      const dayType = dayTypeByDayNumber.get(day.dayNumber)?.dayType ?? "normal";
+      const entry = byStay.get(stayId) ?? { normalDays: 0, real: 0, realMeals: 0, synthetic: 0, mealOpportunities: 0, freeTime: 0, days: [] };
+      let dayReal = 0;
+      let dayRealMeals = 0;
+      let dayFreeTime = 0;
+      let dayMealOpportunities = 0;
+      for (const item of day.items) {
+        if (isScheduledRealPlace(item)) {
+          if (item.category === "restaurant" || item.category === "cafe") dayRealMeals += 1;
+          else dayReal += 1;
+        } else if (isGenericMealOpportunity(item)) {
+          dayMealOpportunities += 1;
+        } else if (isSyntheticScheduleItem(item)) {
+          dayFreeTime += 1;
+        }
+      }
+      if (dayType === "normal" || dayType === "day_trip") entry.normalDays += 1;
+      entry.real += dayReal;
+      entry.realMeals += dayRealMeals;
+      entry.mealOpportunities += dayMealOpportunities;
+      entry.freeTime += dayFreeTime;
+      entry.days.push({ dayNumber: day.dayNumber, dayType, realActivities: dayReal, realMeals: dayRealMeals, freeTime: dayFreeTime, mealOpportunities: dayMealOpportunities });
+      byStay.set(stayId, entry);
+    }
+    const usedRealIds = new Set(
+      days.flatMap((day) => day.items.filter((item) => isScheduledRealPlace(item) && item.recommendationId).map((item) => item.recommendationId!))
+    );
+    for (const [stayId, entry] of byStay) {
+      const portfolio = portfoliosByStay.get(stayId);
+      const unusedSelected = portfolio ? portfolio.selected.filter((c) => !usedRealIds.has(c.recommendationId)).length : undefined;
+      const unusedReserve = portfolio ? portfolio.optional.filter((c) => !usedRealIds.has(c.recommendationId)).length : undefined;
+      logRealPlaceQA("CompositionOutput", {
+        stayId,
+        normalDays: entry.normalDays,
+        realActivitiesScheduled: entry.real,
+        realMealsScheduled: entry.realMeals,
+        syntheticActivities: entry.freeTime,
+        mealOpportunities: entry.mealOpportunities,
+        unusedSelectedCandidates: unusedSelected,
+        unusedReserveCandidates: unusedReserve,
+        days: entry.days,
+      });
+    }
+  }
+
+  return { plan, initialRealActivitiesScheduled };
+}
+
+/* ================================================================== *
+ * Round 9.2 — OPTIONAL Gemini refinement of an already-composed plan.  *
+ * ID-only contract (spec §3/§4): Gemini receives ONLY stable           *
+ * candidateIds already validated/scheduled by composeDaysFromStay-     *
+ * Portfolios, never a raw country-wide list, and may not invent a new  *
+ * name/coordinate/category for anything. It may only:                 *
+ *   - reorder a day's ALREADY-scheduled candidates (never move one     *
+ *     across days — that is deliberately out of scope this round, a   *
+ *     disclosed gap, not a "Gemini determines real content" risk)      *
+ *   - swap ONE scheduled candidate for ONE of that SAME stay's own     *
+ *     reserve candidates                                               *
+ * Every returned id is re-validated against the ORIGINAL portfolio     *
+ * before being trusted; an unknown id, a cross-stay id, or a malformed *
+ * response is rejected FOR THAT DAY ONLY — never a reason to fail the  *
+ * whole refinement, and the whole call is wrapped so ANY failure       *
+ * (timeout, invalid JSON, no API key, quota) falls back to the         *
+ * deterministic composed plan UNCHANGED (spec §5: Gemini optional).    *
+ * ================================================================== */
+
+const GEMINI_REFINEMENT_MODEL = "gemini-flash-lite-latest";
+const GEMINI_REFINEMENT_TIMEOUT_MS = 20_000;
+
+const GEMINI_REFINEMENT_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    days: {
+      type: Type.ARRAY,
+      description: "One entry per day this call included, in any order.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          dayNumber: { type: Type.NUMBER },
+          preferredOrder: {
+            type: Type.ARRAY,
+            description: "The exact same candidateIds provided for this day, reordered. Must not add, remove, or invent an id.",
+            items: { type: Type.STRING },
+          },
+          swapOutCandidateId: { type: Type.STRING, description: "Optional: a scheduled candidateId to replace, from the SAME day." },
+          swapInCandidateId: { type: Type.STRING, description: "Optional: a reserve candidateId (from this day's own stay reserve list) to use instead." },
+        },
+        required: ["dayNumber"],
+      },
+    },
+  },
+  required: ["days"],
+};
+
+interface GeminiRefinementDayInput {
+  dayNumber: number;
+  candidates: Array<{ candidateId: string; name: string; family: string; subtype: string; significance: number }>;
+}
+interface GeminiRefinementStayInput {
+  stayId: string;
+  owner: string;
+  days: GeminiRefinementDayInput[];
+  reserve: Array<{ candidateId: string; name: string; family: string; subtype: string; significance: number }>;
+}
+
+function buildGeminiRefinementPrompt(stays: GeminiRefinementStayInput[], countryName: string): string {
+  return [
+    `להלן מסלול טיול ב${countryName} שכבר נבנה באופן דטרמיניסטי מתוך מאגר מקומות אמיתיים, מאורגן לפי אזורי לינה (stay) וימים.`,
+    `לכל מקום יש candidateId יציב. אתה יכול להשפיע רק על שני דברים, ואך ורק דרך candidateId קיים:`,
+    `1. סדר הביקור באותו יום (preferredOrder) — אותה קבוצת candidateId בדיוק, בסדר אחר.`,
+    `2. החלפה בודדת ביום נתון (swapOutCandidateId/swapInCandidateId) — רק מתוך רשימת "reserve" של אותו stay.`,
+    `אסור לך להמציא שם, קטגוריה, קואורדינטות, או candidateId חדש. אם אין לך שיפור אמיתי להציע ליום מסוים — פשוט השאר אותו כפי שהוא (אל תכלול אותו, או החזר preferredOrder זהה).`,
+    `הנתונים:`,
+    JSON.stringify(stays, null, 2),
+  ].join("\n");
+}
+
+interface GeminiRefinementResponseDay {
+  dayNumber: number;
+  preferredOrder?: string[];
+  swapOutCandidateId?: string;
+  swapInCandidateId?: string;
+}
+
+export async function refineComposedPlanWithGemini(
+  composedPlan: AiItineraryResponse,
+  tripFrame: TripFrame,
+  portfoliosByStay: Map<string, StayActivityPortfolio>,
+  payload: AiItineraryRequest,
+  profile: TripPreferenceProfile,
+  /** Injectable — tests pass a fake to avoid any real Gemini call; production omits this and gets the real GoogleGenAI-backed default. Returns the raw JSON text, or null/throws for "no usable response". */
+  geminiCallOverride?: (prompt: string) => Promise<string | null>
+): Promise<{
+  plan: AiItineraryResponse;
+  refinementApplied: boolean;
+  /** Round 9.2 §12 observability — a swapInCandidateId Gemini named that
+   * doesn't exist in ANY stay's reserve at all (invented/stale/typo'd id). */
+  unknownCandidateIds: number;
+  /** Round 9.2 §12 observability — a swapInCandidateId that IS a real
+   * candidate somewhere in the trip, but belongs to a different stay than
+   * the day being edited (the contract's cross-stay rejection firing). */
+  crossStayCandidateIds: number;
+}> {
+  const noRefinement = { plan: composedPlan, refinementApplied: false, unknownCandidateIds: 0, crossStayCandidateIds: 0 };
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!geminiCallOverride && !apiKey) return noRefinement;
+
+  // Build the ID-only, stay-scoped input — never the raw recommendation pool.
+  const stayInputs: GeminiRefinementStayInput[] = [];
+  const candidateOwnerStay = new Map<string, string>(); // candidateId -> stayId, for cross-stay rejection below
+  for (const phase of tripFrame.phases) {
+    const portfolio = portfoliosByStay.get(phase.id);
+    if (!portfolio) continue;
+    const daysInStay = composedPlan.days.filter((day) => day.dayNumber >= phase.startDayNumber && day.dayNumber <= phase.endDayNumber);
+    const dayInputs: GeminiRefinementDayInput[] = [];
+    for (const day of daysInStay) {
+      const candidates = day.items
+        .filter((item) => item.recommendationId != null && isScheduledRealPlace(item))
+        .map((item) => {
+          const classification = classifyActivity({ category: item.category, name: item.name, shortDescription: item.shortDescription, reservationRequired: item.reservationRequired, approximatePrice: item.approximatePrice });
+          candidateOwnerStay.set(item.recommendationId!, phase.id);
+          return { candidateId: item.recommendationId!, name: item.name, family: classification.primaryFamily, subtype: classification.subtype, significance: 50 };
+        });
+      if (candidates.length > 0) dayInputs.push({ dayNumber: day.dayNumber, candidates });
+    }
+    if (dayInputs.length === 0) continue;
+    for (const candidate of portfolio.optional) candidateOwnerStay.set(candidate.recommendationId, phase.id);
+    stayInputs.push({
+      stayId: phase.id,
+      owner: phase.areaLabel,
+      days: dayInputs,
+      reserve: portfolio.optional.map((c) => ({ candidateId: c.recommendationId, name: c.name, family: c.classification.primaryFamily, subtype: c.classification.subtype, significance: c.significance })),
+    });
+  }
+  if (stayInputs.length === 0) return noRefinement;
+
+  let responseDays: GeminiRefinementResponseDay[];
+  try {
+    const prompt = buildGeminiRefinementPrompt(stayInputs, payload.countryName);
+    const callGemini =
+      geminiCallOverride ??
+      (async (thePrompt: string) => {
+        const client = new GoogleGenAI({ apiKey: apiKey! });
+        const response = await client.models.generateContent({
+          model: GEMINI_REFINEMENT_MODEL,
+          contents: thePrompt,
+          config: { responseMimeType: "application/json", responseSchema: GEMINI_REFINEMENT_SCHEMA },
+        });
+        return response.text ?? null;
+      });
+    const raw = await Promise.race([
+      callGemini(prompt),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Gemini refinement timeout")), GEMINI_REFINEMENT_TIMEOUT_MS)),
+    ]);
+    if (!raw) return noRefinement;
+    const parsed = JSON.parse(raw) as { days?: GeminiRefinementResponseDay[] };
+    responseDays = Array.isArray(parsed.days) ? parsed.days : [];
+  } catch {
+    // Any failure at all (no network, invalid JSON, quota, timeout) — the
+    // deterministic composed plan is already a complete, valid itinerary;
+    // Gemini's refinement is a pure enhancement, never a requirement.
+    return noRefinement;
+  }
+  if (responseDays.length === 0) return noRefinement;
+
+  const dayById = new Map(composedPlan.days.map((day) => [day.dayNumber, day]));
+  let anyChange = false;
+  // Tracked across the WHOLE response, not just the original plan — a
+  // reserve candidate Gemini names for two different days in the same
+  // response must still only ever be swapped in once.
+  const swappedInThisRefinement = new Set<string>();
+  let unknownCandidateIds = 0;
+  let crossStayCandidateIds = 0;
+
+  for (const responseDay of responseDays) {
+    const day = dayById.get(responseDay.dayNumber);
+    if (!day) continue;
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    if (!phase) continue;
+
+    let nextItems = [...day.items];
+
+    // Swap: only a reserve candidate belonging to the SAME stay, replacing
+    // a candidate CURRENTLY scheduled on THIS exact day.
+    if (responseDay.swapOutCandidateId && responseDay.swapInCandidateId) {
+      const outItem = nextItems.find((item) => item.recommendationId === responseDay.swapOutCandidateId);
+      const inOwnerStay = candidateOwnerStay.get(responseDay.swapInCandidateId);
+      const portfolio = portfoliosByStay.get(phase.id);
+      const inCandidate = portfolio?.optional.find((c) => c.recommendationId === responseDay.swapInCandidateId);
+      const alreadyUsedElsewhere =
+        composedPlan.days.some((d) => d.items.some((item) => item.recommendationId === responseDay.swapInCandidateId)) ||
+        swappedInThisRefinement.has(responseDay.swapInCandidateId);
+      // No geography re-check needed here: `inCandidate` came from
+      // `portfolio.optional`, and buildStayActivityPool already applied
+      // evaluateScheduledPlaceLegality against this exact stay's own
+      // anchor before any candidate was ever admitted to the pool — a
+      // second check here would need an anchor this function doesn't have
+      // and would only re-verify what's already guaranteed.
+      if (outItem && inCandidate && inOwnerStay === phase.id && !alreadyUsedElsewhere) {
+        const fullRecommendation = payload.recommendations.find((r) => r.id === inCandidate.recommendationId);
+        if (fullRecommendation) {
+          const newItem = buildReplacementItem(fullRecommendation, outItem, day, payload);
+          nextItems = nextItems.map((item) => (item === outItem ? newItem : item));
+          swappedInThisRefinement.add(responseDay.swapInCandidateId);
+          anyChange = true;
+        }
+      } else if (outItem && !inOwnerStay) {
+        unknownCandidateIds += 1;
+      } else if (outItem && inOwnerStay && inOwnerStay !== phase.id) {
+        crossStayCandidateIds += 1;
+      }
+    }
+
+    // Reorder: must be an EXACT permutation of this day's own real
+    // scheduled candidateIds — anything else (missing/added/unknown id) is
+    // rejected for this day only.
+    if (responseDay.preferredOrder && responseDay.preferredOrder.length > 0) {
+      const currentRealIds = nextItems.filter((item) => item.recommendationId != null).map((item) => item.recommendationId as string);
+      const isExactPermutation =
+        responseDay.preferredOrder.length === currentRealIds.length &&
+        new Set(responseDay.preferredOrder).size === currentRealIds.length &&
+        responseDay.preferredOrder.every((id) => currentRealIds.includes(id));
+      if (isExactPermutation) {
+        const realItemsById = new Map(nextItems.filter((item) => item.recommendationId != null).map((item) => [item.recommendationId as string, item]));
+        const nonRealItems = nextItems.filter((item) => item.recommendationId == null);
+        const reorderedReal = responseDay.preferredOrder.map((id) => realItemsById.get(id)!).filter(Boolean);
+        nextItems = [...reorderedReal, ...nonRealItems];
+        anyChange = true;
+      }
+    }
+
+    if (nextItems !== day.items) {
+      dayById.set(day.dayNumber, fillDerivedDayFields(resequenceDayItems({ ...day, items: nextItems }), payload, profile));
+    }
+  }
+
+  if (!anyChange) return { ...noRefinement, unknownCandidateIds, crossStayCandidateIds };
+  return {
+    plan: { ...composedPlan, days: composedPlan.days.map((day) => dayById.get(day.dayNumber) ?? day) },
+    refinementApplied: true,
+    unknownCandidateIds,
+    crossStayCandidateIds,
+  };
+}
+
+export function finalizeArrivalDepartureContent(
   plan: AiItineraryResponse,
   payload: AiItineraryRequest,
   profile: TripPreferenceProfile,
@@ -7190,7 +9793,13 @@ function finalizeArrivalDepartureContent(
   window: ArrivalDepartureWindow,
   tripFrame: TripFrame,
   areaAnchors: Map<string, { lat: number; lon: number } | null>,
-  mobilityProfile: DestinationMobilityProfile
+  mobilityProfile: DestinationMobilityProfile,
+  /** Round 9.2 §12 observability only — reports how many real activities THIS
+   * finalization pass's own exceptional Round-8 backfill inserted, so a
+   * caller (the portfolio-composed path) can log initialReal vs backfilled
+   * side by side without this function's return type or other call sites
+   * changing. Never affects behavior. */
+  onBackfillMetrics?: (insertions: number) => void
 ): AiItineraryResponse {
   // Spec "ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER" (Round 4) — the
   // FINAL pipeline order starts by binding every day to its canonical
@@ -7233,14 +9842,101 @@ function finalizeArrivalDepartureContent(
     window
   );
 
+  // Round 7 — required pipeline order: day/stay ownership fixed →
+  // geography legality fixed (everything above) → schedule stabilized →
+  // OPENING-HOURS REPAIR → schedule stabilized → PURE FINAL VALIDATOR.
+  // The geography gates above are time-independent for normal/arrival/
+  // departure days (pure distance), so re-timing an item here can never
+  // regress them. This is the last stage allowed to change an item's
+  // scheduled time; the PURE validator (inside enforceItineraryInvariants-
+  // WithRepair) then runs on the settled object and re-runs after its own
+  // bounded repair.
+  const openingHoursRepairedDays = repairOpeningHoursViolations(legalityGatedDays, payload, profile);
+
+  // Round 9 — build each stay's REAL (item-aware deriveDayType) pool +
+  // diversity-scored portfolio from the settled object, so the Round-8
+  // backfill below draws from the planner's own deliberate selection first
+  // (spec §21/§22 — backfill is now a LAST-resort quality repair, not the
+  // primary content mechanism).
+  const dayCapacityByStay = new Map<string, StayDayCapacityInput[]>();
+  for (const day of openingHoursRepairedDays) {
+    const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+    if (!phase) continue;
+    const list = dayCapacityByStay.get(phase.id) ?? [];
+    list.push({
+      dayNumber: day.dayNumber,
+      dayType: deriveDayType(day, tripFrame, window),
+      hasExplicitRestWindow: Boolean(day.restWindow && day.restWindow.trim()),
+    });
+    dayCapacityByStay.set(phase.id, list);
+  }
+  const { portfoliosByStay } = buildTripActivityPortfolios(
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload.recommendations,
+    dayCapacityByStay,
+    profile.mustVisitKeywords,
+    [...profile.strongPreferences, ...profile.softPreferences],
+    profile.dailyCapacityMinutes,
+    normalizeAreaLabel,
+    resolveTextualAreaMatch
+  );
+
+  // Round 8 — spec "THE PLANNER MUST CHOOSE REAL THINGS FOR THE USER TO DO":
+  // a day can be geographically/hours legal and still be a failed
+  // itinerary (every "activity" is free_time/meal_opportunity). Before the
+  // final legality/invariant gate, pull unused legal real candidates
+  // already loaded for this owner/stay and use them to demote synthetic
+  // filler back into real content — never past the day's own real
+  // capacity, never a globally-used place, every inserted item re-checked
+  // against BOTH the geography and opening-hours rules before it's kept.
+  const backfillResult = backfillRealActivities(
+    openingHoursRepairedDays,
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload,
+    profile,
+    window,
+    portfoliosByStay
+  );
+  if (backfillResult.insertions.length > 0) {
+    logGenerationStage("quality backfill: real activities inserted", { insertions: backfillResult.insertions });
+  }
+  onBackfillMetrics?.(backfillResult.insertions.length);
+  // A backfilled item can shift a day's schedule enough to nudge another
+  // item's timing — settle opening hours once more on the exact object
+  // about to reach the final gate (same "settle" pattern as Round 7).
+  const backfilledDays = repairOpeningHoursViolations(backfillResult.days, payload, profile);
+
+  // Round 9.3.3 continuation §4 — the meal analogue of the activity
+  // backfill just above, using the SAME final anchors/mobility/candidate
+  // set (never a second country-wide or inline pseudo-pool).
+  const finalMealPoolsByStay = buildTripMealVenuePools(
+    tripFrame,
+    areaAnchors,
+    mobilityProfile,
+    payload.recommendations,
+    profile.dailyCapacityMinutes,
+    normalizeAreaLabel,
+    resolveTextualAreaMatch
+  );
+  const mealBackfillResult = backfillRealMealVenues(backfilledDays, tripFrame, payload, profile, finalMealPoolsByStay, dayCount, window);
+  if (mealBackfillResult.insertions.length > 0) {
+    logGenerationStage("quality backfill: real meal venues inserted", { insertions: mealBackfillResult.insertions });
+  }
+  const mealBackfilledDays = repairOpeningHoursViolations(mealBackfillResult.days, payload, profile);
+
   // Spec "TRIP-FRAME / DAY OWNERSHIP / FINAL GEOGRAPHY INVARIANT" §Step 6 —
   // PURE validator over the exact object, then ONE bounded deterministic
   // repair, then the PURE validator again. This is the acceptance gate:
   // illegalScheduledRealPlaces / invalidTransitionOwnership /
-  // invalidSemanticRolePlacements / realItemsWithNullLegGeometry must all
-  // be zero on `finalizedDays`. No real place is inserted after this.
+  // invalidSemanticRolePlacements / realItemsWithNullLegGeometry /
+  // openingHoursViolations must all be zero on `finalizedDays`. No real
+  // place is inserted, and no scheduled time is changed, after this.
   const { days: finalizedDays, before: invariantBefore, after: invariantAfter } = enforceItineraryInvariantsWithRepair(
-    legalityGatedDays,
+    mealBackfilledDays,
     tripFrame,
     areaAnchors,
     mobilityProfile,
@@ -7258,7 +9954,9 @@ function finalizeArrivalDepartureContent(
     invariantBefore.lodgingOwnerMismatch +
     invariantBefore.syntheticOwnerMismatch +
     invariantBefore.realFoodVenueOwnerMismatch +
-    invariantBefore.narrativeOwnerMismatch;
+    invariantBefore.narrativeOwnerMismatch +
+    invariantBefore.openingHoursViolations +
+    invariantBefore.lockedOpeningHoursConflicts;
   if (invariantBeforeTotal > 0) {
     logGenerationStage("final itinerary invariant repair", { before: invariantBefore, after: invariantAfter });
   }
@@ -7382,6 +10080,48 @@ function finalizeArrivalDepartureContent(
     }
   }
 
+  // Round 8 — observability: log the quality shape on the EXACT object
+  // about to be returned, regardless of whether it ends up accepted or
+  // retried by the caller (repairPlan recomputes the same pure function on
+  // this same `finalizedDays` to decide accept-vs-retry / hard-fail).
+  const qualityReport = validateItineraryQuality(finalizedDays, tripFrame, window);
+  if (qualityReport.unjustifiedDaysWithOnlySyntheticContent > 0 || qualityReport.daysBelowMinimumRealActivities > 0) {
+    logGenerationStage("itinerary quality", { ...qualityReport });
+  }
+  // Round 9 §37 [ActivityPortfolioQA] / [StayActivityPoolQA] — QA-gated
+  // trip-wide + per-stay diversity/pool observability on the exact
+  // returned object. Never spams normal production logs.
+  if (isPlannerQaTraceEnabled()) {
+    // portfoliosByStay's own StayActivityPool objects were already logged
+    // pre-generation by refillTripRecommendationPool ([StayActivityPoolQA]
+    // "initialCandidates"/"refillCandidates"); this block reports the
+    // FINAL, post-backfill portfolio usage on the exact returned object.
+    for (const [stayId, portfolio] of portfoliosByStay) {
+      const scheduledIds = new Set(
+        finalizedDays.flatMap((day) => day.items.map((item) => item.recommendationId).filter((id): id is string => id != null))
+      );
+      logGenerationStage("[StayActivityPoolQA] portfolio usage", {
+        stayId,
+        selectedPortfolioCount: portfolio.selected.length,
+        scheduledFromPortfolio: portfolio.selected.filter((c) => scheduledIds.has(c.recommendationId)).length,
+        unusedLegalCount: portfolio.optional.length,
+      });
+    }
+    logGenerationStage("[ActivityPortfolioQA]", {
+      realActivities: qualityReport.realActivityCount,
+      meaningfulRealActivities: qualityReport.meaningfulRealActivityCount,
+      syntheticBlocks: qualityReport.syntheticActivityCount,
+      candidateExhaustionFallbacks: qualityReport.candidateExhaustionFallbackCount,
+      daysWithZeroRealActivities: qualityReport.daysWithZeroRealActivities,
+      syntheticOnlyNormalDays: qualityReport.unjustifiedDaysWithOnlySyntheticContent,
+      familyDistribution: qualityReport.familyDistribution,
+      subtypeDistribution: qualityReport.subtypeDistribution,
+      consecutiveSameFamilyDays: qualityReport.consecutiveSameFamilyDays,
+      consecutiveSameSubtypeDays: qualityReport.consecutiveSameSubtypeDays,
+      backfillInsertions: backfillResult.insertions.length,
+    });
+  }
+
   const computedCosts = buildCostsFromDays(finalizedDays, payload.preferences.travelers, payload.preferences.flights);
   const costPerTraveler =
     computedCosts.totalEstimatedCost != null && payload.preferences.travelers > 0
@@ -7415,6 +10155,10 @@ export function repairPlan(
   const dayCount = getTripDayCount(payload.preferences.startDate, payload.preferences.endDate, 0);
   const days: AiGeneratedDay[] = [];
   const usedMealNames = new Set<string>();
+  // Round 9.2.1 §12 — same by-reference threading as usedMealNames just
+  // above, shared across every day/attempt in this whole repairPlan call.
+  const recentMealHistory: RecentMealHistoryEntry[] = [];
+  const cuisineWeights = buildCuisinePreferenceWeights([...profile.strongPreferences, ...profile.softPreferences]);
   // Root-cause fix (spec §G "Gemini can still author duplicates... at
   // ingestion: if resolved canonical identity is already present elsewhere,
   // reject/replace it before downstream repairs") — shared and mutated
@@ -7422,6 +10166,22 @@ export function repairPlan(
   // repairDayStructure/repairDayGeography below (same object, same
   // itinerary-wide semantics point A demands for every repair pass).
   const usageState = createItineraryUsageState();
+
+  // Round 9.4.1 §F — the ingestion round-trip: `raw` (from
+  // toRawGeneratedPlan, e.g. the composed plan serialized back down to
+  // RawGeneratedItem, which has NO itemRole/lat/lon fields at all) is
+  // re-hydrated per-day by enrichAiDay, which re-attaches recommendationId
+  // ONLY via an exact case-insensitive NAME match against
+  // payload.recommendations/selectedPlaces. "before" here is the INTENDED
+  // identity (what name-matching SHOULD find, computed independently of
+  // enrichAiDay's own internal logic, using the same recommendations
+  // list); "after" is what enrichAiDay ACTUALLY produced — any divergence
+  // between them is a real round-trip identity loss, never inferred.
+  const roundTripBefore: RepairSnapshotItem[] = [];
+  const roundTripAfter: RepairSnapshotItem[] = [];
+  const recommendationsByName = isPlannerQaTraceEnabled()
+    ? new Map([...payload.recommendations, ...payload.selectedPlaces].map((r) => [r.name.trim().toLowerCase(), r]))
+    : null;
 
   for (let index = 0; index < dayCount; index += 1) {
     const expectedDayNumber = index + 1;
@@ -7433,6 +10193,25 @@ export function repairPlan(
     if (!rawDay) {
       days.push(fallback.days[index]);
       continue;
+    }
+
+    if (recommendationsByName) {
+      for (const item of rawDay.items) {
+        const matched = recommendationsByName.get(item.name.trim().toLowerCase());
+        if (!matched) continue;
+        roundTripBefore.push({
+          id: matched.id,
+          name: item.name,
+          category: item.category,
+          itemRole: null, // RawGeneratedItem has no itemRole field at all — the exact gap this log exists to surface
+          phaseId: null,
+          dayNumber: expectedDayNumber,
+          lat: matched.lat,
+          lon: matched.lon,
+          kind: matched.category === "restaurant" || matched.category === "cafe" ? "real_meal" : "real_activity",
+          hasRecommendationId: true,
+        });
+      }
     }
 
     const rawEnriched = enrichAiDay(
@@ -7469,6 +10248,24 @@ export function repairPlan(
       return replacement;
     });
     const enriched: AiGeneratedDay = { ...rawEnriched, items: dedupedItems };
+
+    if (recommendationsByName) {
+      for (const item of enriched.items) {
+        if (item.recommendationId == null) continue;
+        roundTripAfter.push({
+          id: item.recommendationId,
+          name: item.name,
+          category: item.category,
+          itemRole: item.itemRole ?? null,
+          phaseId: null,
+          dayNumber: expectedDayNumber,
+          lat: item.lat,
+          lon: item.lon,
+          kind: item.category === "restaurant" || item.category === "cafe" ? "real_meal" : "real_activity",
+          hasRecommendationId: true,
+        });
+      }
+    }
 
     if (geminiAttempt != null) {
       for (const item of enriched.items) {
@@ -7510,7 +10307,10 @@ export function repairPlan(
       items: enriched.items.length > 0 ? enriched.items : fallbackDay.items,
     };
 
-    days.push(repairDayStructure(normalizedDay, payload, profile, index, dayCount, usedMealNames, usageState, arrivalDepartureWindow));
+    days.push(repairDayStructure(normalizedDay, payload, profile, index, dayCount, usedMealNames, usageState, arrivalDepartureWindow, recentMealHistory, cuisineWeights));
+  }
+  if (recommendationsByName) {
+    logRepairRoundTrip("toRawGeneratedPlan -> enrichAiDay (ingestion)", roundTripBefore, roundTripAfter);
   }
 
   let repairedDays = days;
@@ -7537,10 +10337,27 @@ export function repairPlan(
   // into that attempt's own collectPlanDiagnostics call below.
   let protectedGeographicConflicts: ProtectedGeographicConflict[] = [];
   let impossibleStayTransitionDetails: ImpossibleStayTransition[] = [];
-  // Real coordinate centroid per area — shared by the structural-repair
-  // feasibility check below and the initial StayTransition build, one
-  // geography source rather than two.
-  const areaAnchors = computeAreaAnchors(payload);
+  // Round 9.4.2 §B/§H — real coordinate centroid per area, shared by the
+  // structural-repair feasibility check below, the initial StayTransition
+  // build, AND (critically) every pool-rebuild inside
+  // assertFinalRealActivityCoverage below. This used to be the RAW
+  // computeAreaAnchors(payload) — derived ONLY from recommendations' own
+  // location TEXT matching tripFrame.phases[].areaLabel exactly. Proven
+  // root cause (traceId gen-mu7ihdq8-545bii8p): when a stay-skeleton-
+  // resolved TripFrame's phases already carry the AUTHORITATIVE resolved
+  // coordinate (phase.anchor, set by buildTripFrameFromResolvedStays) but
+  // no recommendation's own location field happens to textually match
+  // that exact area label, computeAreaAnchors silently produced NO entry
+  // for that phase at all — every downstream ownership check
+  // (assignCandidatesToStays) then saw zero candidates for every stay,
+  // regardless of how many real candidates payload.recommendations
+  // actually held (291 in production). resolveAreaAnchorsForFrame is the
+  // SAME merge (tripFrame.phase.anchor authoritative, recommendation-
+  // derived text match only as a fallback for the older POI-clustering
+  // path) already used everywhere else in generateCountryItineraryPlan
+  // (finalAreaAnchors/preGenerationAreaAnchors) — repairPlan's own
+  // internal anchors were the one place still missing it.
+  const areaAnchors = resolveAreaAnchorsForFrame(tripFrame, computeAreaAnchors(payload));
   // Locality-first architecture (spec §C/§D) — one adaptive radius derived
   // from this trip's own candidate density, computed once, used by every
   // locality-aware repair step below instead of one fixed worldwide km.
@@ -7565,7 +10382,51 @@ export function repairPlan(
   let currentTripFrame = tripFrame;
   let stayTransitions = buildStayTransitions(currentTripFrame, areaAnchors);
 
+  // Round 9.3.6.1 §1/§12 — ONE shared final-coverage boundary, called at
+  // EVERY successful exit from repairPlan (never only the loop-exhaustion
+  // path). Previously the "legally-clean plan reaches its final attempt"
+  // return below accepted a real-activity-poor plan WITHOUT ever running
+  // this check, making coverage non-authoritative for exactly the shape a
+  // real 34-day/7-stay production trip hit (34 normal days, 18 unjustified
+  // zero-real days, real pools/portfolios existing all along). Reads
+  // currentTripFrame/areaAnchors/mobilityProfile at CALL time (a closure
+  // over the `let` bindings above, not a snapshot), so a structural repair
+  // that reassigns currentTripFrame mid-loop is still reflected correctly
+  // no matter which attempt this fires on. Throws exactly the same
+  // InsufficientRealActivityCoverageError/isMajorityFailure-gated
+  // invariant as before — genuine low supply (a small real pool) still
+  // degrades silently per spec §12A; this never fabricates content and
+  // never requires a fixed POIs/day count.
+  const assertFinalRealActivityCoverage = (finalDays: AiGeneratedDay[]) => {
+    const activityPools = buildTripActivityPortfolios(
+      currentTripFrame,
+      areaAnchors,
+      mobilityProfile,
+      payload.recommendations,
+      estimatePreGenerationDayTypesByStay(currentTripFrame, dayCount, arrivalDepartureWindow),
+      profile.mustVisitKeywords,
+      [...profile.strongPreferences, ...profile.softPreferences],
+      profile.dailyCapacityMinutes,
+      normalizeAreaLabel,
+      resolveTextualAreaMatch
+    );
+    assertRealActivityCoverage(
+      validateItineraryQuality(finalDays, currentTripFrame, arrivalDepartureWindow),
+      payload,
+      { tripFrame: currentTripFrame, countryName: payload.countryName },
+      buildStaySupplyDiagnosticsMap(currentTripFrame, activityPools.poolsByStay, activityPools.portfoliosByStay)
+    );
+  };
+
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    // Round 9.4.1 §B/§E — stepIndex resets per attempt (step 1, 2, 3... of
+    // THIS attempt), so RepairStepDelta logs read as a clean sequence
+    // within each attempt boundary rather than an ever-growing global
+    // counter.
+    let stepIndex = 0;
+    if (isPlannerQaTraceEnabled()) {
+      logRepairAttemptStart(attempt, snapshotDayItemsForRepairTrace(repairedDays, currentTripFrame));
+    }
     // Root-cause fix (spec §C — "build canonical usage state from the
     // CURRENT itinerary" before each pass, "do not recompute from the
     // original pre-repair itinerary after mutations") — fresh from
@@ -7573,17 +10434,24 @@ export function repairPlan(
     // attempts and not the empty state the very first build loop began
     // with.
     const structuralRepairUsageState = buildItineraryUsageState(repairedDays);
-    repairedDays = repairedDays.map((day, index) =>
-      repairDayStructure(normalizeDayCollections(day), payload, profile, index, dayCount, iterationMealNames, structuralRepairUsageState, arrivalDepartureWindow)
+    repairedDays = traceRepairStep(attempt, stepIndex++, "repairDayStructure", currentTripFrame, repairedDays, () =>
+      repairedDays.map((day, index) =>
+        repairDayStructure(normalizeDayCollections(day), payload, profile, index, dayCount, iterationMealNames, structuralRepairUsageState, arrivalDepartureWindow, recentMealHistory, cuisineWeights)
+      )
     );
-    repairedDays = ensureMustVisitCoverage(repairedDays, payload, profile);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "ensureMustVisitCoverage", currentTripFrame, repairedDays, () =>
+      ensureMustVisitCoverage(repairedDays, payload, profile)
+    );
 
     // Repairs content Gemini itself already returned wrong BEFORE the
     // title/cityRegion sync below — otherwise alignDaysToTripFrame would
     // just relabel a day to match its base while the day still contains
     // another region's activities (spec §B/§C6).
-    const crossRegionRepair = repairCrossRegionDayContent(repairedDays, payload, profile);
-    repairedDays = crossRegionRepair.days;
+    let crossRegionRepair!: ReturnType<typeof repairCrossRegionDayContent>;
+    repairedDays = traceRepairStep(attempt, stepIndex++, "repairCrossRegionDayContent", currentTripFrame, repairedDays, () => {
+      crossRegionRepair = repairCrossRegionDayContent(repairedDays, payload, profile, currentTripFrame);
+      return crossRegionRepair.days;
+    });
     protectedGeographicConflicts = crossRegionRepair.protectedGeographicConflicts;
 
     // Section A1 — before enforceStayTransitions can ever report an
@@ -7604,42 +10472,84 @@ export function repairPlan(
       profile
     );
     if (structureRepair.changed) {
+      // Round 9.4.1 §H — a genuine, real suspect for the "stale supply
+      // context" mystery: areaAnchors (used by every ownership-based pool
+      // rebuild, including repairPlan's own assertFinalRealActivityCoverage
+      // below) is a Map keyed by AREA-LABEL TEXT, built ONCE near the top
+      // of repairPlan from payload's OWN candidates — never recomputed
+      // after a structural repair changes a phase's areaLabel. If the new
+      // label isn't a key that map already has, every candidate whose
+      // ownership depends on that anchor silently resolves to zero, no
+      // matter how healthy the ORIGINAL discovery was for the OLD label.
+      // Logged here, never fixed — this round is forensics only.
+      if (isPlannerQaTraceEnabled()) {
+        const oldLabels = currentTripFrame.phases.map((p) => ({ id: p.id, areaLabel: p.areaLabel }));
+        const newLabels = structureRepair.tripFrame.phases.map((p) => ({ id: p.id, areaLabel: p.areaLabel }));
+        logRealPlaceQA("StructuralRepairFrameChange", {
+          attempt,
+          stepIndex,
+          before: oldLabels,
+          after: newLabels,
+          anyNewLabelMissingFromAreaAnchors: newLabels.some((p) => !areaAnchors.has(p.areaLabel)),
+        });
+      }
       currentTripFrame = structureRepair.tripFrame;
       stayTransitions = structureRepair.stayTransitions;
     }
 
-    repairedDays = alignDaysToTripFrame(repairedDays, currentTripFrame);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "alignDaysToTripFrame", currentTripFrame, repairedDays, () =>
+      alignDaysToTripFrame(repairedDays, currentTripFrame)
+    );
 
     // Section C2/C3: no overnight teleportation — every base change gets a
     // real, visible transition item reserving its own real time, before
     // any later step (rebalance/overload/budget) decides how much
     // optional content the day can still hold.
-    const transitionRepair = enforceStayTransitions(repairedDays, stayTransitions, payload, profile);
-    repairedDays = transitionRepair.days;
+    let transitionRepair!: ReturnType<typeof enforceStayTransitions>;
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceStayTransitions", currentTripFrame, repairedDays, () => {
+      transitionRepair = enforceStayTransitions(repairedDays, stayTransitions, payload, profile);
+      return transitionRepair.days;
+    });
     impossibleStayTransitionDetails = transitionRepair.impossibleStayTransitionDetails;
 
     const rebalanceUsageState = createItineraryUsageState();
-    repairedDays = repairedDays.map((day) =>
-      rebalanceDayItems(normalizeDayCollections(day), payload, profile, rebalanceUsageState)
+    repairedDays = traceRepairStep(attempt, stepIndex++, "rebalanceDayItems", currentTripFrame, repairedDays, () =>
+      repairedDays.map((day) => rebalanceDayItems(normalizeDayCollections(day), payload, profile, rebalanceUsageState))
     );
-    repairedDays = fixOverloadedDays(repairedDays, payload, profile);
-    repairedDays = repairOpeningHoursViolations(repairedDays, payload, profile);
-    repairedDays = enforceMealCountLimit(repairedDays, payload, profile);
-    repairedDays = enforceMealSpacing(repairedDays, payload, profile);
-    repairedDays = ensureWeatherBackup(repairedDays, payload);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "fixOverloadedDays", currentTripFrame, repairedDays, () =>
+      fixOverloadedDays(repairedDays, payload, profile)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "repairOpeningHoursViolations", currentTripFrame, repairedDays, () =>
+      repairOpeningHoursViolations(repairedDays, payload, profile)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceMealCountLimit", currentTripFrame, repairedDays, () =>
+      enforceMealCountLimit(repairedDays, payload, profile)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceMealSpacing_1", currentTripFrame, repairedDays, () =>
+      enforceMealSpacing(repairedDays, payload, profile)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "ensureWeatherBackup", currentTripFrame, repairedDays, () =>
+      ensureWeatherBackup(repairedDays, payload)
+    );
 
     // Real fix, not just a diagnostic (spec item 23) — arrival/departure
     // days are skipped here since their window is intentionally narrower
     // and already handled by their own dedicated enforcement below.
     const fillUsageState = buildItineraryUsageState(repairedDays);
-    repairedDays = repairedDays.map((day) =>
-      day.dayNumber === 1 || day.dayNumber === dayCount
-        ? day
-        : fillUnderfilledDay(day, payload, profile, fillUsageState)
+    repairedDays = traceRepairStep(attempt, stepIndex++, "fillUnderfilledDay", currentTripFrame, repairedDays, () =>
+      repairedDays.map((day) =>
+        day.dayNumber === 1 || day.dayNumber === dayCount
+          ? day
+          : fillUnderfilledDay(day, payload, profile, fillUsageState)
+      )
     );
 
-    repairedDays = capArrivalDepartureDays(repairedDays, payload, profile, dayCount);
-    repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "capArrivalDepartureDays", currentTripFrame, repairedDays, () =>
+      capArrivalDepartureDays(repairedDays, payload, profile, dayCount)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceArrivalDepartureWindow_1", currentTripFrame, repairedDays, () =>
+      enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount)
+    );
     // Deliberately NOT ensureArrivalDepartureDayHasContent here — this
     // whole block sits inside the attempt loop below, and the NEXT
     // attempt's repairDayStructure unconditionally re-runs
@@ -7650,9 +10560,11 @@ export function repairPlan(
     // discarding the pinned, window-safe time this step would have just
     // set. It's applied once, after the loop, to whatever plan is
     // actually returned, so nothing later can undo it.
-    repairedDays = lightenHighEnergyStreaks(repairedDays, payload, profile);
-    repairedDays = enforceBudgetOnDays(repairedDays, payload, profile).map((day) =>
-      fillDerivedDayFields(normalizeDayCollections(day), payload, profile)
+    repairedDays = traceRepairStep(attempt, stepIndex++, "lightenHighEnergyStreaks", currentTripFrame, repairedDays, () =>
+      lightenHighEnergyStreaks(repairedDays, payload, profile)
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceBudgetOnDays", currentTripFrame, repairedDays, () =>
+      enforceBudgetOnDays(repairedDays, payload, profile).map((day) => fillDerivedDayFields(normalizeDayCollections(day), payload, profile))
     );
 
     // Real bug found during end-to-end QA generation (a live France trip
@@ -7681,18 +10593,24 @@ export function repairPlan(
     // enforceMealSpacing is re-run afterward for the same reason: a day
     // that DID get a fresh meal inserted (or rescheduled) here needs its
     // spacing re-checked, not just the one earlier pass.
-    repairedDays = repairedDays.map((day) => {
-      const withMeals = insertMissingMeals(day, payload, profile, iterationMealNames, dayCount, arrivalDepartureWindow);
-      return withMeals === day ? day : fillDerivedDayFields(resequenceDayItems(withMeals), payload, profile);
-    });
-    repairedDays = enforceMealSpacing(repairedDays, payload, profile);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "insertMissingMeals", currentTripFrame, repairedDays, () =>
+      repairedDays.map((day) => {
+        const withMeals = insertMissingMeals(day, payload, profile, iterationMealNames, dayCount, arrivalDepartureWindow, recentMealHistory, cuisineWeights);
+        return withMeals === day ? day : fillDerivedDayFields(resequenceDayItems(withMeals), payload, profile);
+      })
+    );
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceMealSpacing_2", currentTripFrame, repairedDays, () =>
+      enforceMealSpacing(repairedDays, payload, profile)
+    );
     // Defense in depth, same reasoning as enforceMealSpacing just above:
     // insertMissingMeals is now window-aware and should never insert an
     // infeasible meal in the first place, but re-running the window
     // enforcement here catches anything else this whole block (or any
     // earlier repair step not itself window-aware) could have pushed past
     // the real arrival/departure cutoff.
-    repairedDays = enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount);
+    repairedDays = traceRepairStep(attempt, stepIndex++, "enforceArrivalDepartureWindow_2", currentTripFrame, repairedDays, () =>
+      enforceArrivalDepartureWindow(repairedDays, payload, profile, arrivalDepartureWindow, dayCount)
+    );
 
     // Section "MAKE TRAVEL METRICS ACTUALLY ACTIVE" (Part A) — a real,
     // production repair pass over the plan's own already-computed
@@ -7722,8 +10640,11 @@ export function repairPlan(
         (day) => classifyDayType.get(day.dayNumber) ?? "normal",
         stayAnchorsInVisitOrder
       );
-      const travelRepair = repairNormalDayTravelOutliers(repairedDays, mobilityProfile, payload, profile, removedItemKeysByDay);
-      repairedDays = travelRepair.days;
+      let travelRepair!: ReturnType<typeof repairNormalDayTravelOutliers>;
+      repairedDays = traceRepairStep(attempt, stepIndex++, "repairNormalDayTravelOutliers", currentTripFrame, repairedDays, () => {
+        travelRepair = repairNormalDayTravelOutliers(repairedDays, mobilityProfile, payload, profile, removedItemKeysByDay);
+        return travelRepair.days;
+      });
       const afterMetrics = computeItineraryTravelMetrics(
         repairedDays,
         (day) => classifyDayType.get(day.dayNumber) ?? "normal",
@@ -7738,6 +10659,25 @@ export function repairPlan(
       }
     } else {
       repairedDays = repairNormalDayTravelOutliers(repairedDays, mobilityProfile, payload, profile, removedItemKeysByDay).days;
+    }
+
+    // Round 9.4.3 §C/§D/§G — a single, authoritative, idempotent cleanup
+    // pass over exact-recommendationId duplicates, run once every attempt
+    // AFTER every content-mutating repair step above (whichever of them
+    // introduced a duplicate, this pass sees and resolves it — never a
+    // per-function audit-and-patch of all twelve listed insertion paths,
+    // which risks exactly the "broadly redesign repairPlan" this round
+    // explicitly rules out). Monotonic by construction (only ever shrinks
+    // an existing duplicate group's size, never creates one), so running
+    // it unconditionally every attempt cannot itself cause the count to
+    // rise again.
+    const duplicatesBefore = isPlannerQaTraceEnabled() ? computeRealPlaceDuplicateGroups(repairedDays, currentTripFrame).length : 0;
+    repairedDays = traceRepairStep(attempt, stepIndex++, "resolveExactIdDuplicates", currentTripFrame, repairedDays, () =>
+      resolveExactIdDuplicates(repairedDays, currentTripFrame, areaAnchors, mobilityProfile, payload, profile)
+    );
+    if (isPlannerQaTraceEnabled()) {
+      const duplicatesAfter = computeRealPlaceDuplicateGroups(repairedDays, currentTripFrame).length;
+      logRealPlaceQA("DuplicateRepairAttempt", { attempt, duplicateCanonicalIdentitiesBefore: duplicatesBefore, duplicateCanonicalIdentitiesAfter: duplicatesAfter });
     }
 
     let computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers, payload.preferences.flights);
@@ -7773,13 +10713,11 @@ export function repairPlan(
       attempt < 3;
 
     if (diagnostics.diversityRisk || qualifiesForQualityDiversify) {
-      repairedDays = diversifyActivities(
-        repairedDays,
-        payload,
-        profile,
-        diagnostics.dominantCategory,
-        diagnostics.activityMixSkew
-      ).map((day) => fillDerivedDayFields(normalizeDayCollections(day), payload, profile));
+      repairedDays = traceRepairStep(attempt, stepIndex++, "diversifyActivities", currentTripFrame, repairedDays, () =>
+        diversifyActivities(repairedDays, payload, profile, diagnostics.dominantCategory, diagnostics.activityMixSkew).map((day) =>
+          fillDerivedDayFields(normalizeDayCollections(day), payload, profile)
+        )
+      );
 
       computedCosts = buildCostsFromDays(repairedDays, payload.preferences.travelers, payload.preferences.flights);
       totalEstimatedCost = computedCosts.totalEstimatedCost;
@@ -7804,15 +10742,75 @@ export function repairPlan(
 
     lastPlan = repairedPlan;
     if (passesValidation(diagnostics)) {
+      const beforeFinalizeSnapshot = isPlannerQaTraceEnabled() ? snapshotDayItemsForRepairTrace(repairedPlan.days, currentTripFrame) : null;
       const finalPlan = finalizeArrivalDepartureContent(repairedPlan, payload, profile, dayCount, arrivalDepartureWindow, currentTripFrame, areaAnchors, mobilityProfile);
-      return {
-        ...finalPlan,
-        summary: buildGenerationSummary(finalPlan, profile),
-      };
+      if (beforeFinalizeSnapshot) {
+        logRepairStepDelta(attempt, stepIndex++, "finalizeArrivalDepartureContent (in-loop)", beforeFinalizeSnapshot, snapshotDayItemsForRepairTrace(finalPlan.days, currentTripFrame));
+      }
+      // Round 8 — legality/hours/duplicates being zero is necessary but not
+      // sufficient (spec "A legally safe but empty itinerary is not
+      // acceptable"). A legally-clean plan that is still real-activity-poor
+      // gets ONE more attempt (same "not a loop-until-perfect" shape as
+      // qualifiesForQualityDiversify above) before being accepted anyway —
+      // never blocks acceptance forever, since backfillRealActivities has
+      // already run inside finalizeArrivalDepartureContent and a further
+      // attempt draws from the same finite candidate pool.
+      const qualityReport = validateItineraryQuality(finalPlan.days, currentTripFrame, arrivalDepartureWindow);
+      if (passesQualityValidation(qualityReport) || attempt >= 3) {
+        if (!passesQualityValidation(qualityReport)) {
+          // Last attempt and still real-activity-poor — degrade explicitly
+          // (spec §12A) rather than silently returning a synthetic-heavy
+          // plan with no trace of why.
+          logGenerationStage("itinerary quality: accepted with unresolved gaps after final attempt", { ...qualityReport });
+        }
+        if (isPlannerQaTraceEnabled()) {
+          logRepairAttemptEnd(attempt, snapshotDayItemsForRepairTrace(finalPlan.days, currentTripFrame));
+        }
+        // Round 9.3.6.1 §1 — this used to return unconditionally once
+        // attempt >= 3, regardless of qualityReport, making real-activity
+        // coverage non-authoritative on the exact path most real multi-day
+        // trips actually take. Same shared invariant as every other exit
+        // now: throws only on the same unambiguous majority-synthetic
+        // shape with a non-trivial real pool as always (never a fixed
+        // POIs/day requirement); a genuinely small real pool still returns
+        // normally here, unchanged.
+        assertFinalRealActivityCoverage(finalPlan.days);
+        // Round 9.4.3 §J — the final duplicate firewall, same boundary as
+        // assertFinalRealActivityCoverage immediately above. resolveExactIdDuplicates
+        // already runs every attempt, so this should never fire in
+        // practice — it exists so a surviving exact-ID duplicate is
+        // reported with its precise identity instead of silently
+        // persisting or surfacing as a generic PLAN_NOT_FEASIBLE.
+        assertNoRealPlaceDuplicatesRemain(finalPlan.days, currentTripFrame);
+        return {
+          ...finalPlan,
+          summary: buildGenerationSummary(finalPlan, profile),
+        };
+      }
+      // Retry: keep this plan as the best-so-far fallback and let the loop
+      // continue (a fresh Gemini/deterministic attempt, or another
+      // structural repair pass, may surface more usable real candidates).
+      lastPlan = repairedPlan;
+    }
+    if (isPlannerQaTraceEnabled()) {
+      logRepairAttemptEnd(attempt, snapshotDayItemsForRepairTrace(repairedDays, currentTripFrame));
     }
   }
 
   const finalFallbackPlan = finalizeArrivalDepartureContent(lastPlan ?? fallback, payload, profile, dayCount, arrivalDepartureWindow, currentTripFrame, areaAnchors, mobilityProfile);
+  // Round 8 spec §12 — a failed generation is preferable to a useless
+  // itinerary pretending to be complete. Deliberately conservative (see
+  // assertRealActivityCoverage's own docstring): only throws on an
+  // unambiguous majority-synthetic shape with a non-trivial candidate pool,
+  // which is exactly the reported "38/44 lighter days" shape. Genuine
+  // destination scarcity (a small/empty recommendation pool) degrades
+  // silently instead, as it always has. Round 9.3.6.1 §12 — same shared
+  // assertFinalRealActivityCoverage boundary as every other successful
+  // exit above, not a separately-maintained duplicate.
+  assertFinalRealActivityCoverage(finalFallbackPlan.days);
+  // Round 9.4.3 §J — same final duplicate firewall as the in-loop success
+  // exit above.
+  assertNoRealPlaceDuplicatesRemain(finalFallbackPlan.days, currentTripFrame);
   return {
     ...finalFallbackPlan,
     summary: buildGenerationSummary(finalFallbackPlan, profile),
@@ -7864,6 +10862,49 @@ export function passesValidation(diagnostics: ReturnType<typeof collectPlanDiagn
     diagnostics.airportBaseMismatches === 0 &&
     diagnostics.impossibleStayTransitions === 0 &&
     (diagnostics.normalDayTravelOutliers ?? 0) === 0
+  );
+}
+
+/**
+ * Round 9.4.2 §C/§E — "PLAN STRUCTURE INVALID" vs "REAL PLACE SUPPLY
+ * INVALID": a NARROWER gate than passesValidation, checking only fields
+ * that indicate genuine structural/geographic/temporal/data-integrity
+ * corruption — never a mere quality/pacing signal. Proven root cause
+ * (traceId gen-mu7ihdq8-545bii8p): the composed plan failed ONLY
+ * missingMeals/overloadedDays/longTravelDays (none of which corrupt the
+ * 100+ real places already scheduled) and was discarded wholesale to a
+ * legacy free-text Gemini path and then a StayActivityPool-unaware
+ * deterministic template — losing every real place in the process. This
+ * function is what lets generateCountryItineraryPlan tell "this plan's
+ * REAL CONTENT is fine, it just isn't perfectly paced" apart from "this
+ * plan is genuinely broken" — used ONLY to decide whether the composed
+ * plan may be kept as a recovery checkpoint instead of discarded;
+ * passesValidation itself is UNCHANGED and still governs the normal
+ * success path exactly as before.
+ *
+ * Deliberately EXCLUDES (soft/pacing/preference signals, never real-place
+ * corruption): missingMeals, overloadedDays, missingAccommodation,
+ * missingTransport, missingMustVisitKeywords, longTravelDays,
+ * longMealDetours, overSoftBudget, excessFoodStopsDays,
+ * mealSpacingViolations, normalDayTravelOutliers.
+ */
+export function passesHardInvariantsForFallbackRecovery(diagnostics: ReturnType<typeof collectPlanDiagnostics>): boolean {
+  return (
+    diagnostics.duplicatePlaces === 0 &&
+    diagnostics.duplicateWarnings === 0 &&
+    diagnostics.avoidConflicts === 0 &&
+    diagnostics.invalidCoordinates === 0 &&
+    diagnostics.crossCityDays === 0 &&
+    diagnostics.missingAnchorDays === 0 &&
+    diagnostics.baseMismatchDays === 0 &&
+    !diagnostics.outOfBudget &&
+    diagnostics.arrivalDepartureWindowViolations === 0 &&
+    diagnostics.timeOverlaps === 0 &&
+    diagnostics.openingHoursViolations === 0 &&
+    diagnostics.duplicateRestaurants === 0 &&
+    diagnostics.invalidFlightLegs === 0 &&
+    diagnostics.airportBaseMismatches === 0 &&
+    diagnostics.impossibleStayTransitions === 0
   );
 }
 
@@ -7959,10 +11000,1010 @@ function toRawGeneratedPlan(plan: AiItineraryResponse): RawGeneratedPlan {
   };
 }
 
+/**
+ * Round 9 — a PRE-generation, per-stay day-type estimate (no Gemini output
+ * exists yet, so day_trip can never be known this early — every non-
+ * arrival/departure/transfer day is conservatively treated as "normal",
+ * which is the right default for SIZING a candidate pool: a day_trip day
+ * still wants real candidates). Used ONLY to size/target the refill pass
+ * below; the real, item-aware deriveDayType is used everywhere once actual
+ * days exist (finalizeArrivalDepartureContent and everything after it).
+ */
+export function estimatePreGenerationDayTypesByStay(
+  tripFrame: TripFrame,
+  dayCount: number,
+  arrivalDepartureWindow: ArrivalDepartureWindow
+): Map<string, StayDayCapacityInput[]> {
+  const byStay = new Map<string, StayDayCapacityInput[]>();
+  for (const phase of tripFrame.phases) byStay.set(phase.id, []);
+
+  for (let dayNumber = 1; dayNumber <= dayCount; dayNumber += 1) {
+    const phase = findFramePhaseForDay(tripFrame, dayNumber);
+    if (!phase) continue;
+    const previousPhase = dayNumber > 1 ? findFramePhaseForDay(tripFrame, dayNumber - 1) : null;
+
+    let dayType: DerivedDayType = "normal";
+    let usableHours: number | null = null;
+    if (dayNumber === 1 && arrivalDepartureWindow.earliestUsableTimeOnArrivalDay) {
+      dayType = "arrival";
+      const startMinutes = clockToMinutes(arrivalDepartureWindow.earliestUsableTimeOnArrivalDay.time);
+      usableHours = startMinutes != null ? Math.max(0, (22 * 60 - startMinutes) / 60) : null;
+    } else if (dayNumber === dayCount && arrivalDepartureWindow.latestUsableTimeOnDepartureDay) {
+      dayType = "departure";
+      const endMinutes = clockToMinutes(arrivalDepartureWindow.latestUsableTimeOnDepartureDay.time);
+      usableHours = endMinutes != null ? Math.max(0, (endMinutes - 9 * 60) / 60) : null;
+    } else if (previousPhase && previousPhase.id !== phase.id) {
+      dayType = "transfer";
+    }
+
+    byStay.get(phase.id)!.push({ dayNumber, dayType, hasExplicitRestWindow: false, usableHours });
+  }
+  return byStay;
+}
+
+/**
+ * Round 9 §4 — the ONE pre-generation entry point for real provider refill.
+ * Builds a pool per stay from whatever candidates discovery already loaded
+ * (payload.recommendations), and for any stay below its own
+ * desiredCandidateCount, runs a bounded, stay-scoped, geography-bounded
+ * Overpass refill (refillStayActivityPool) BEFORE Gemini ever sees the
+ * pool — spec's own required order ("discover a LARGE real candidate pool
+ * for that stay" happens before day construction, not mid-repair).
+ * Strictly additive: on any provider failure the original payload is
+ * returned unchanged, generation never blocks or fails because of this.
+ */
+/**
+ * Round 9.1 §7 — a tiny bounded-concurrency mapper. No dependency added:
+ * this is the entire "hard concurrency limit" the spec asks for. Runs
+ * `worker` over `items`, never more than `limit` in flight at once. A
+ * single item's rejection never aborts the others — callers are expected
+ * to have already wrapped `worker` in its own try/catch when a failure
+ * should degrade rather than propagate (refillTripRecommendationPool below
+ * always does).
+ */
+async function mapWithConcurrencyLimit<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  async function runOne(): Promise<void> {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runOne()));
+  return results;
+}
+
+/** Round 9.1 §6/§7 — centralized, not scattered: how many stays refill concurrently, and the total wall-clock budget the WHOLE refill pass (every stay combined) may spend on the provider before stopping. Deliberately NOT the per-request Overpass timeout (fetchOverpass's own REQUEST_TIMEOUT_MS is untouched, per the round's own "do not increase timeouts") — this is an outer, cross-stay budget that stops issuing NEW rounds once exceeded, which is what actually bounds a many-stay trip's total refill time.
+ *
+ * Round 9.3.3 — raised from the original 12_000. Live-traced Overpass
+ * round-trips against the real public API from this environment measured
+ * 8_818-34_141ms for a SINGLE combined round-0 query (see the round's QA
+ * trace). At 12s, any stay queued behind the first REFILL_CONCURRENCY_LIMIT
+ * concurrent stays had its deadline already expired before it could even
+ * start its one real provider attempt — real Chicago-anchor discovery in a
+ * live replay ended with 0 candidates and ~50s spent, entirely consistent
+ * with this. 60s keeps a real cross-stay ceiling (this is still the exact
+ * mechanism that fixed the Round 9.1 11-minute/PLAN_NOT_FEASIBLE
+ * regression — it must never go back to unbounded) while giving realistic
+ * headroom, at the high end of measured latency, for multiple stays to
+ * each get at least one real round-0 attempt through the shared
+ * concurrency pool instead of being starved by a budget smaller than a
+ * single query's own observed worst case. */
+const REFILL_CONCURRENCY_LIMIT = 3;
+const REFILL_GLOBAL_TIME_BUDGET_MS = 60_000;
+
+export interface StayRefillOutcome {
+  pool: StayActivityPool;
+  addedCount: number;
+}
+
+/**
+ * Round 9 §4, rebuilt in Round 9.1 to fix a real production regression: a
+ * live 44-day/multi-stay US generation took ~11.2 minutes and ended in
+ * PLAN_NOT_FEASIBLE, with real Overpass timeouts/ECONNREFUSED observed
+ * during the SAME request. Root cause traced to this exact function: it
+ * ran refillStayActivityPool SEQUENTIALLY, one stay at a time, with NO
+ * overall time budget — a multi-stay trip where several stays' Overpass
+ * calls are slow/failing waits out EVERY one of them in series (up to
+ * ~2 rounds × ~50s worst-case per stay × N stays). Fixed here with (a) a
+ * bounded-concurrency batch runner (never more than
+ * REFILL_CONCURRENCY_LIMIT stays refilling at once) and (b) one GLOBAL
+ * deadline shared by every stay's refillStayActivityPool call — once
+ * passed, no stay starts a new round; whatever it already collected is
+ * kept and its pool is marked `supplyDegraded`. Still additive/failure-
+ * tolerant: any single stay's own throw is caught and never blocks the
+ * others or the caller.
+ */
+/** Round 9.3.4 §3/§5 — one unit of GROUPED discovery work: either one stay's one activity query group, or one stay's meal-venue group. Flattening (stay × group) into a single array is what lets ONE shared mapWithConcurrencyLimit pool bound concurrency across stays AND groups together, rather than nesting a per-stay limiter inside a per-group limiter (which would multiply, not share, the ceiling). */
+type DiscoveryWorkItem =
+  | { kind: "activity"; phaseId: string; group: ActivityQueryGroupDefinition }
+  | { kind: "meal"; phaseId: string };
+
+interface PhaseDiscoveryState {
+  pool: StayActivityPool;
+  seenActivityKeys: Set<string>;
+  seenMealKeys: Set<string>;
+  groupResults: QueryGroupResult[];
+  addedRecommendations: TripRecommendation[];
+  addedMealRecommendations: TripRecommendation[];
+}
+
+/** Round 9.3.4 §2/§8 — uniform per-group fetch, whether the caller injected a simple test override or this is the real Overpass-backed path; both report the SAME QueryGroupResult shape so diagnostics never differ by code path. */
+async function fetchDiscoveryGroupRaw(
+  categories: RecommendationCategory[],
+  anchor: { lat: number; lon: number },
+  perCategoryLimit: number,
+  fetchCandidatesOverride?: RefillOptions["fetchCandidates"]
+): Promise<{
+  results: OverpassGroupCandidate[];
+  providerFailed: boolean;
+  failureReason: string | null;
+  rawElementCount: number;
+  selectorCount: number;
+  queryLength: number;
+  elapsedMs: number;
+  endpoint: string | null;
+}> {
+  if (fetchCandidatesOverride) {
+    const startedAt = Date.now();
+    try {
+      const results = await fetchCandidatesOverride(anchor, ACTIVITY_DISCOVERY_RADIUS_CAP_KM, categories, perCategoryLimit);
+      return { results, providerFailed: false, failureReason: null, rawElementCount: results.length, selectorCount: 0, queryLength: 0, elapsedMs: Date.now() - startedAt, endpoint: null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error && error.name === "AbortError" ? "timeout" : message;
+      return { results: [], providerFailed: true, failureReason: reason, rawElementCount: 0, selectorCount: 0, queryLength: 0, elapsedMs: Date.now() - startedAt, endpoint: null };
+    }
+  }
+  return queryNearbyRecommendationsDetailed(anchor.lat, anchor.lon, ACTIVITY_DISCOVERY_RADIUS_CAP_KM * 1000, categories, perCategoryLimit);
+}
+
+/**
+ * Round 9.3.5 — the one activity-group work item body, extracted so both
+ * the INITIAL grouped discovery pass (refillTripRecommendationPool) and
+ * the NEW bounded final-supply refill (refillDeficientStaysAfterReallocation,
+ * below) apply the EXACT same early-stop / shared-deadline / partial-
+ * success / cross-group-dedupe rules — never two subtly different
+ * discovery implementations to keep in sync.
+ */
+async function runActivityGroupWorkItem(
+  state: PhaseDiscoveryState,
+  group: ActivityQueryGroupDefinition,
+  anchor: { lat: number; lon: number },
+  mobilityProfile: DestinationMobilityProfile,
+  dailyCapacityMinutes: number,
+  mustVisitKeywords: string[],
+  deadline: number,
+  fetchCandidatesOverride?: RefillOptions["fetchCandidates"]
+): Promise<void> {
+  // §14 EARLY STOP — re-checked at dequeue time, not just at enqueue time,
+  // since an earlier group for this SAME stay may have already satisfied
+  // it while this item was queued behind the concurrency limit.
+  if (state.pool.candidates.length >= state.pool.desiredCandidateCount) {
+    state.groupResults.push(emptyGroupResult(group.groupId, "SKIPPED_ENOUGH_SUPPLY"));
+    return;
+  }
+  // §6 SHARED DEADLINE — checked before starting, never mid-flight.
+  if (Date.now() >= deadline) {
+    state.groupResults.push(emptyGroupResult(group.groupId, "SKIPPED_DEADLINE"));
+    state.pool = { ...state.pool, diagnostics: { ...state.pool.diagnostics, supplyDegraded: true } };
+    return;
+  }
+  const detail = await fetchDiscoveryGroupRaw(group.categories, anchor, 8, fetchCandidatesOverride);
+  const outcome = classifyQueryGroupOutcome(detail);
+  const diagnostics = { ...state.pool.diagnostics };
+  diagnostics.refillAttempts += 1;
+  diagnostics.providerElapsedMs += detail.elapsedMs;
+  let acceptedCount = 0;
+  if (detail.providerFailed) {
+    diagnostics.providerFailures += 1;
+    if (outcome === "TIMEOUT") diagnostics.providerTimeouts += 1;
+  } else if (detail.results.length > 0) {
+    // §7 PARTIAL SUCCESS IS SUCCESSFUL SUPPLY — this group's own accepted
+    // candidates are merged in regardless of any OTHER group's outcome;
+    // §9 cross-group dedupe is the shared seenActivityKeys set every group
+    // for this stay writes into.
+    const candidates = [...state.pool.candidates];
+    const result = acceptRawCandidatesIntoPool(
+      detail.results,
+      { candidates, seenKeys: state.seenActivityKeys, diagnostics },
+      { anchor, mobilityProfile, dailyCapacityMinutes, mustVisitKeywords, desiredCandidateCount: state.pool.desiredCandidateCount }
+    );
+    acceptedCount = result.acceptedCount;
+    state.addedRecommendations.push(...result.addedRecommendations);
+    state.pool = { ...state.pool, candidates, categorySupply: diagnostics.classificationBreakdown };
+  }
+  state.pool = { ...state.pool, diagnostics };
+  state.groupResults.push({
+    groupId: group.groupId,
+    selectorCount: detail.selectorCount,
+    queryLength: detail.queryLength,
+    attempts: 1,
+    endpointResults: [detail.endpoint ?? "none"],
+    rawElementCount: detail.rawElementCount,
+    normalizedCandidateCount: detail.results.length,
+    acceptedCandidateCount: acceptedCount,
+    elapsedMs: detail.elapsedMs,
+    outcome,
+  });
+}
+
+export async function refillTripRecommendationPool(
+  payload: AiItineraryRequest,
+  tripFrame: TripFrame,
+  dayCount: number,
+  arrivalDepartureWindow: ArrivalDepartureWindow,
+  profile: TripPreferenceProfile,
+  /** Injectable — tests pass a fake to avoid any real network call; production omits this and gets the real Overpass-backed default. */
+  fetchCandidatesOverride?: RefillOptions["fetchCandidates"],
+  /** Injectable — tests pass a short budget to exercise degradation without a real 12s wait; production omits this and gets REFILL_GLOBAL_TIME_BUDGET_MS. */
+  globalTimeBudgetMsOverride?: number,
+  /** Round 9.3.3 §22 — called once per stay, right when that stay's OWN real discovery attempt has actually finished (success, skip, or failure) — never on a timer, never before the stay's own pool is settled. */
+  onStayDiscovered?: (completed: number, total: number) => void
+): Promise<{ payload: AiItineraryRequest; poolsByStay: Map<string, StayActivityPool> }> {
+  if (tripFrame.phases.length === 0) return { payload, poolsByStay: new Map() };
+
+  const areaAnchors = resolveAreaAnchorsForFrame(tripFrame, computeAreaAnchors(payload));
+  const mobilityProfile = computeDestinationMobilityProfile([...payload.recommendations, ...payload.selectedPlaces]);
+  const dailyCapacityMinutes = profile.dailyCapacityMinutes;
+  const dayTypesByStay = estimatePreGenerationDayTypesByStay(tripFrame, dayCount, arrivalDepartureWindow);
+  const ownershipByStay = assignCandidatesToStays(
+    payload.recommendations,
+    tripFrame,
+    areaAnchors,
+    normalizeAreaLabel,
+    resolveTextualAreaMatch
+  );
+
+  const deadline = Date.now() + (globalTimeBudgetMsOverride ?? REFILL_GLOBAL_TIME_BUDGET_MS);
+  const poolsByStay = new Map<string, StayActivityPool>();
+  const totalStays = tripFrame.phases.length;
+
+  // --- Build every stay's initial pool + discovery state up front (cheap, sync). ---
+  const stateByPhaseId = new Map<string, PhaseDiscoveryState>();
+  for (const phase of tripFrame.phases) {
+    const capacity = computeStayCapacity(dayTypesByStay.get(phase.id) ?? []);
+    const anchor = areaAnchors.get(phase.areaLabel) ?? null;
+    const pool = buildStayActivityPool(
+      phase,
+      ownershipByStay.get(phase.id) ?? [],
+      anchor,
+      mobilityProfile,
+      capacity,
+      profile.mustVisitKeywords,
+      dailyCapacityMinutes
+    );
+    stateByPhaseId.set(phase.id, {
+      pool,
+      seenActivityKeys: new Set(pool.candidates.map((c) => c.recommendationId)),
+      seenMealKeys: new Set(),
+      groupResults: [],
+      addedRecommendations: [],
+      addedMealRecommendations: [],
+    });
+  }
+
+  // --- Round 9.3.4 §3/§4 — flatten (stay × query group) into ONE priority-ordered queue. ---
+  const orderedGroups = orderActivityQueryGroupsByPreference([...profile.strongPreferences, ...profile.softPreferences]);
+  const needsActivityDiscovery = (phase: TripFramePhase) => {
+    const state = stateByPhaseId.get(phase.id)!;
+    return state.pool.anchor != null && state.pool.candidates.length < state.pool.desiredCandidateCount;
+  };
+  const workItems: DiscoveryWorkItem[] = [];
+  for (const [groupIndex, group] of orderedGroups.entries()) {
+    for (const phase of tripFrame.phases) {
+      if (needsActivityDiscovery(phase)) workItems.push({ kind: "activity", phaseId: phase.id, group });
+    }
+    // Round 9.3.4 continuation — meal discovery interleaved right after the
+    // FIRST (highest-priority) activity group's items, not appended after
+    // ALL activity groups. Measured, not assumed: with meal appended last,
+    // a single-stay trip's 3 concurrent activity groups (concurrency limit
+    // 3) filled every slot immediately, so the meal work item never started
+    // until the FIRST activity group finished — a real recorded 15s delay
+    // in this environment before the meal query even began, on top of its
+    // own multi-second latency, made it far more likely to miss the shared
+    // deadline or get squeezed into whatever budget remained than an
+    // isolated call ever would. Interleaving it here gives it a fair,
+    // early concurrency slot instead of being queued dead-last.
+    if (groupIndex === 0) {
+      for (const phase of tripFrame.phases) {
+        if (areaAnchors.get(phase.areaLabel) != null) workItems.push({ kind: "meal", phaseId: phase.id });
+      }
+    }
+  }
+
+  await mapWithConcurrencyLimit(workItems, REFILL_CONCURRENCY_LIMIT, async (item) => {
+    const state = stateByPhaseId.get(item.phaseId)!;
+    const anchor = state.pool.anchor;
+    if (!anchor) return;
+
+    if (item.kind === "activity") {
+      await runActivityGroupWorkItem(state, item.group, anchor, mobilityProfile, dailyCapacityMinutes, profile.mustVisitKeywords, deadline, fetchCandidatesOverride);
+      return;
+    }
+
+    // item.kind === "meal"
+    if (Date.now() >= deadline) return; // §6 — same shared deadline governs the meal group too
+    const detail = await fetchDiscoveryGroupRaw(MEAL_QUERY_GROUP.categories, anchor, 8, fetchCandidatesOverride);
+    if (!detail.providerFailed && detail.results.length > 0) {
+      const result = acceptRawMealCandidates(detail.results, state.seenMealKeys, { anchor, mobilityProfile, dailyCapacityMinutes });
+      state.addedMealRecommendations.push(...result.addedRecommendations);
+    }
+  });
+
+  // --- Round 1+ single-most-undersupplied-category top-up (unchanged, existing, already-small mechanism) for any stay STILL below its desired count. ---
+  const stillNeedingPhases = tripFrame.phases.filter((phase) => needsActivityDiscovery(phase));
+  await mapWithConcurrencyLimit(stillNeedingPhases, REFILL_CONCURRENCY_LIMIT, async (phase) => {
+    const state = stateByPhaseId.get(phase.id)!;
+    if (Date.now() >= deadline) {
+      state.pool = { ...state.pool, diagnostics: { ...state.pool.diagnostics, supplyDegraded: true } };
+      return;
+    }
+    const { pool: refilledPool, addedRecommendations: added } = await refillStayActivityPool(
+      state.pool,
+      mobilityProfile,
+      dailyCapacityMinutes,
+      profile.mustVisitKeywords,
+      { ...(fetchCandidatesOverride ? { fetchCandidates: fetchCandidatesOverride } : {}), deadline, skipRound0: true, maxRounds: 2 }
+    ).catch(() => ({ pool: { ...state.pool, diagnostics: { ...state.pool.diagnostics, supplyDegraded: true } }, addedRecommendations: [] as TripRecommendation[] }));
+    state.pool = refilledPool;
+    state.addedRecommendations.push(...added);
+  });
+
+  const allAddedRecommendations: TripRecommendation[] = [];
+  let discoveredCount = 0;
+  for (const phase of tripFrame.phases) {
+    const state = stateByPhaseId.get(phase.id)!;
+    const finalPool: StayActivityPool = {
+      ...state.pool,
+      diagnostics: {
+        ...state.pool.diagnostics,
+        resolvedCandidateCount: state.pool.candidates.length,
+        legalCandidateCount: state.pool.candidates.length,
+        supplyDegraded: state.pool.diagnostics.supplyDegraded || state.pool.candidates.length < state.pool.desiredCandidateCount,
+        groupResults: state.groupResults,
+      },
+    };
+    poolsByStay.set(phase.id, finalPool);
+    allAddedRecommendations.push(...state.addedRecommendations, ...state.addedMealRecommendations);
+    if (isPlannerQaTraceEnabled()) logStayActivityPoolQA(finalPool);
+    discoveredCount += 1;
+    onStayDiscovered?.(discoveredCount, totalStays);
+  }
+
+  const nextPayload = allAddedRecommendations.length === 0 ? payload : { ...payload, recommendations: [...payload.recommendations, ...allAddedRecommendations] };
+  return { payload: nextPayload, poolsByStay };
+}
+
+/** Round 9.3.5 — bounded, separate from the initial 60s discovery pass: this only tops up stays that ALREADY discovered something but whose FINAL (post-reallocation) requirement grew past it, so a much shorter budget is appropriate (it is never doing first-time discovery for a stay with zero anchor). */
+const FINAL_SUPPLY_REFILL_BUDGET_MS = 25_000;
+
+export interface FinalSupplyRefillResult {
+  payload: AiItineraryRequest;
+  poolsByStay: Map<string, StayActivityPool>;
+  /** Round 9.3.5 §17 — which stays were actually found deficient and refilled, for the failure diagnostic and QA trace; empty when every stay's existing pool already met its FINAL requirement. */
+  refilledStayIds: string[];
+}
+
+/**
+ * Round 9.3.5 — THE root-cause fix for "real candidates exist but don't
+ * reach enough days": night reallocation/reserve promotion can change a
+ * stay's FINAL duration well after its OWN discovery pass already
+ * early-stopped against the SMALLER preliminary target (measured and
+ * confirmed this round — a stay whose nights grow from 3 to 9 needs ~3x
+ * the real anchors its own pre-reallocation desiredCandidateCount ever
+ * aimed for, and nothing before this function ever revisited that pool).
+ *
+ * Called ONCE, after tripFrame is truly FINAL (post-reallocation, post
+ * reserve-promotion), against dayTypesByStay computed from that SAME final
+ * frame. For every phase, the pool's OWN target fields
+ * (requiredRealActivityTarget/desiredCandidateCount/minimumViableCandidateCount)
+ * are first resized to reflect the final requirement — regardless of
+ * whether a refill actually runs, so nothing downstream ever compares
+ * against a stale target again. Only phases that are STILL short of their
+ * (possibly now-larger) minimum-viable floor get a real, bounded, grouped,
+ * concurrency-limited, early-stop-respecting refill — reusing
+ * runActivityGroupWorkItem unchanged (§5/§6/§7/§9/§14 all apply exactly as
+ * they do in the initial pass). A healthy stay is never re-queried.
+ */
+export async function refillDeficientStaysAfterReallocation(
+  payload: AiItineraryRequest,
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  profile: TripPreferenceProfile,
+  poolsByStay: Map<string, StayActivityPool>,
+  finalDayTypesByStay: Map<string, StayDayCapacityInput[]>,
+  /** Injectable — tests pass a fake to avoid any real network call; production omits this and gets the real Overpass-backed default. */
+  fetchCandidatesOverride?: RefillOptions["fetchCandidates"],
+  /** Injectable — tests pass a short budget for deterministic timing. */
+  globalTimeBudgetMsOverride?: number
+): Promise<FinalSupplyRefillResult> {
+  const dailyCapacityMinutes = profile.dailyCapacityMinutes;
+  const deadline = Date.now() + (globalTimeBudgetMsOverride ?? FINAL_SUPPLY_REFILL_BUDGET_MS);
+  const resizedPoolsByStay = new Map(poolsByStay);
+  const stateByPhaseId = new Map<string, PhaseDiscoveryState>();
+  const deficientPhases: TripFramePhase[] = [];
+
+  for (const phase of tripFrame.phases) {
+    const existingPool = resizedPoolsByStay.get(phase.id);
+    if (!existingPool) continue;
+    const finalCapacity = computeStayCapacity(finalDayTypesByStay.get(phase.id) ?? []);
+    const finalRequiredTarget = finalCapacity.requiredRealActivityTarget;
+    const resizedPool: StayActivityPool = {
+      ...existingPool,
+      requiredRealActivityTarget: finalRequiredTarget,
+      desiredCandidateCount: computeDesiredCandidateCount(finalRequiredTarget),
+      minimumViableCandidateCount: computeMinimumViableCandidateCount(finalRequiredTarget),
+    };
+    resizedPoolsByStay.set(phase.id, resizedPool);
+    if (!resizedPool.anchor) continue; // no anchor — nothing a refill could ever search around
+    if (resizedPool.candidates.length < resizedPool.minimumViableCandidateCount) {
+      deficientPhases.push(phase);
+      stateByPhaseId.set(phase.id, {
+        pool: resizedPool,
+        seenActivityKeys: new Set(resizedPool.candidates.map((c) => c.recommendationId)),
+        seenMealKeys: new Set(),
+        groupResults: [...(resizedPool.diagnostics.groupResults ?? [])],
+        addedRecommendations: [],
+        addedMealRecommendations: [],
+      });
+    }
+  }
+
+  if (deficientPhases.length === 0) {
+    return { payload, poolsByStay: resizedPoolsByStay, refilledStayIds: [] };
+  }
+
+  logGenerationStage("[StaySupplyQA] final-duration supply deficit detected — bounded refill", {
+    deficientStays: deficientPhases.map((p) => ({ stayId: p.id, owner: p.areaLabel, nights: p.nights })),
+  });
+
+  const orderedGroups = orderActivityQueryGroupsByPreference([...profile.strongPreferences, ...profile.softPreferences]);
+  const needsMore = (phase: TripFramePhase) => {
+    const state = stateByPhaseId.get(phase.id)!;
+    return state.pool.candidates.length < state.pool.desiredCandidateCount;
+  };
+  const workItems: DiscoveryWorkItem[] = [];
+  for (const group of orderedGroups) {
+    for (const phase of deficientPhases) {
+      if (needsMore(phase)) workItems.push({ kind: "activity", phaseId: phase.id, group });
+    }
+  }
+
+  await mapWithConcurrencyLimit(workItems, REFILL_CONCURRENCY_LIMIT, async (item) => {
+    const state = stateByPhaseId.get(item.phaseId)!;
+    const anchor = state.pool.anchor;
+    if (!anchor || item.kind !== "activity") return;
+    await runActivityGroupWorkItem(state, item.group, anchor, mobilityProfile, dailyCapacityMinutes, profile.mustVisitKeywords, deadline, fetchCandidatesOverride);
+  });
+
+  const allAdded: TripRecommendation[] = [];
+  const refilledStayIds: string[] = [];
+  for (const phase of deficientPhases) {
+    const state = stateByPhaseId.get(phase.id)!;
+    const finalPool: StayActivityPool = {
+      ...state.pool,
+      diagnostics: {
+        ...state.pool.diagnostics,
+        resolvedCandidateCount: state.pool.candidates.length,
+        legalCandidateCount: state.pool.candidates.length,
+        supplyDegraded: state.pool.diagnostics.supplyDegraded || state.pool.candidates.length < state.pool.desiredCandidateCount,
+        groupResults: state.groupResults,
+      },
+    };
+    resizedPoolsByStay.set(phase.id, finalPool);
+    allAdded.push(...state.addedRecommendations);
+    refilledStayIds.push(phase.id);
+    if (isPlannerQaTraceEnabled()) logStayActivityPoolQA(finalPool);
+  }
+
+  const nextPayload = allAdded.length === 0 ? payload : { ...payload, recommendations: [...payload.recommendations, ...allAdded] };
+  return { payload: nextPayload, poolsByStay: resizedPoolsByStay, refilledStayIds };
+}
+
+function emptyGroupResult(groupId: string, outcome: QueryGroupOutcome): QueryGroupResult {
+  return {
+    groupId,
+    selectorCount: 0,
+    queryLength: 0,
+    attempts: 0,
+    endpointResults: [],
+    rawElementCount: 0,
+    normalizedCandidateCount: 0,
+    acceptedCandidateCount: 0,
+    elapsedMs: 0,
+    outcome,
+  };
+}
+
+/** Spec §37 [StayActivityPoolQA] — QA-gated only, never spams normal production logs. */
+function logStayActivityPoolQA(pool: StayActivityPool): void {
+  logGenerationStage("[StayActivityPoolQA]", {
+    stayId: pool.stayId,
+    owner: pool.ownerArea,
+    usableDays: pool.usableDayCapacity,
+    requiredRealActivities: pool.requiredRealActivityTarget,
+    desiredCandidateCount: pool.desiredCandidateCount,
+    initialCandidates: pool.diagnostics.initialCandidateCount,
+    refillCandidates: pool.diagnostics.refillCandidateCount,
+    finalLegalCandidates: pool.diagnostics.legalCandidateCount,
+    categorySupply: pool.categorySupply,
+    providerFailures: pool.diagnostics.providerFailures,
+    dedupeRejected: pool.diagnostics.dedupeRejected,
+    geographyRejected: pool.diagnostics.geographyRejected,
+  });
+}
+
+export interface PlanFailureClassification {
+  code: "PLAN_NOT_FEASIBLE" | "BUDGET_NOT_FEASIBLE" | "INSUFFICIENT_REAL_ACTIVITY_SUPPLY" | "REAL_PLACE_DISCOVERY_UNAVAILABLE";
+  primaryFailure: "budget" | "provider_supply" | "duplicates" | "geography";
+  secondaryFailures: string[];
+  stayFailures: StayFailureDetail[];
+}
+
+function buildStayFailureDetails(poolsByStay: Map<string, StayActivityPool>): StayFailureDetail[] {
+  return [...poolsByStay.values()].map((pool) => {
+    const belowMinimum = pool.requiredRealActivityTarget > 0 && pool.diagnostics.legalCandidateCount < pool.minimumViableCandidateCount;
+    return {
+      stayId: pool.stayId,
+      owner: pool.ownerArea,
+      requiredRealActivities: pool.requiredRealActivityTarget,
+      desiredCandidates: pool.desiredCandidateCount,
+      legalCandidates: pool.diagnostics.legalCandidateCount,
+      providerRequests: pool.diagnostics.refillAttempts,
+      providerFailures: pool.diagnostics.providerFailures,
+      supplyDegraded: pool.diagnostics.supplyDegraded,
+      belowMinimum,
+      supplyState: classifyStaySupplyState({ belowMinimum, providerFailures: pool.diagnostics.providerFailures }),
+    };
+  });
+}
+
+/**
+ * Round 9.3.3 continuation §7 — a stay counts as CATASTROPHICALLY
+ * discovery-unavailable only when ALL of: it genuinely needed real content
+ * (requiredRealActivities > 0), it ended up with literally zero legal real
+ * candidates, and at least one real provider outage/timeout actually
+ * happened. A stay with SOME real candidates (even if below its minimum)
+ * is a partial failure, not catastrophic — spec's own "partial provider
+ * failure must NOT automatically fail generation if enough verified real
+ * supply was successfully collected" (judged trip-wide by the existing
+ * classifyPlanFailure/fallback-validation flow, unchanged).
+ */
+function isCatastrophicallyDiscoveryUnavailable(stay: StayFailureDetail): boolean {
+  return stay.requiredRealActivities > 0 && stay.legalCandidates === 0 && stay.providerFailures > 0;
+}
+
+/**
+ * Round 9.3.7 — the trip-level analogue of StaySupplyState/supplyState:
+ * whether the WHOLE trip's real-place discovery is viable, not whether any
+ * one stay individually is. The old decision (`classifyPlanFailure`/the
+ * unconditional fallback-template check) treated ANY single catastrophic
+ * stay as fatal for the entire generation — a real 43-day/7-stay US trip
+ * with a genuine 3/3-provider-outage on ONE stay (New York) was thrown
+ * away after ~4 minutes of otherwise-healthy work on the other 6 stays.
+ * HEALTHY: no stay is catastrophically discovery-unavailable. CATASTROPHIC:
+ * the trip genuinely cannot produce a minimally meaningful real-place
+ * itinerary — a single-stay trip whose only stay failed, every stay
+ * failing, or failed stays collectively owning a MAJORITY of the trip's
+ * normal days (reusing assertRealActivityCoverage's own established >50%
+ * "majority" bar, never a new invented threshold). Anything else with at
+ * least one catastrophic stay is PARTIALLY_DEGRADED — the trip continues,
+ * and the EXISTING per-day/per-stay coverage machinery
+ * (assertRealActivityCoverage, extended below) is what actually decides
+ * whether the final result is honestly acceptable.
+ */
+export type TripDiscoveryHealthState = "HEALTHY" | "PARTIALLY_DEGRADED" | "CATASTROPHIC_PROVIDER_FAILURE";
+
+export interface TripDiscoveryHealthAssessment {
+  tripSupplyState: TripDiscoveryHealthState;
+  totalStays: number;
+  healthyStays: number;
+  providerFailedStays: number;
+  totalNormalDays: number;
+  failedNormalDays: number;
+  totalRealActivityCandidates: number;
+  recoverableFailedStays: number;
+  unrecoverableFailedStays: number;
+  stayFailures: StayFailureDetail[];
+}
+
+/**
+ * Round 9.3.7 §B — a pure function so the trip-level decision itself is
+ * directly unit-testable, same discipline as classifyPlanFailure. Reads
+ * `recoveredStayIds` (populated by attemptBoundedRecoveryForFailedStays)
+ * only to report recoverable-vs-unrecoverable counts truthfully — it
+ * never changes a stay's own supplyState/providerFailures (see
+ * attemptBoundedStayRecovery's own docstring: recovery must never lie
+ * about provider health).
+ */
+export function assessTripDiscoveryHealth(
+  poolsByStay: Map<string, StayActivityPool>,
+  tripFrame: TripFrame,
+  startDate: string,
+  arrivalDepartureWindow: ArrivalDepartureWindow,
+  recoveredStayIds: ReadonlySet<string> = new Set()
+): TripDiscoveryHealthAssessment {
+  const stayFailures = buildStayFailureDetails(poolsByStay);
+  const totalStays = stayFailures.length;
+  const catastrophicStays = stayFailures.filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay));
+  const catastrophicStayIds = new Set(catastrophicStays.map((stay) => stay.stayId));
+  const healthyStays = stayFailures.filter((stay) => !stay.belowMinimum).length;
+  const totalRealActivityCandidates = stayFailures.reduce((sum, stay) => sum + stay.legalCandidates, 0);
+
+  let totalNormalDays = 0;
+  let failedNormalDays = 0;
+  for (const phase of tripFrame.phases) {
+    const isPhaseCatastrophic = catastrophicStayIds.has(phase.id);
+    for (let dayNumber = phase.startDayNumber; dayNumber <= phase.endDayNumber; dayNumber += 1) {
+      const date = dateForDayNumber(startDate, dayNumber) || startDate;
+      const dayType = deriveDayType({ dayNumber, date, items: [] }, tripFrame, arrivalDepartureWindow);
+      if (dayType !== "normal") continue;
+      totalNormalDays += 1;
+      if (isPhaseCatastrophic) failedNormalDays += 1;
+    }
+  }
+
+  const recoverableFailedStays = catastrophicStays.filter((stay) => recoveredStayIds.has(stay.stayId)).length;
+  const unrecoverableFailedStays = catastrophicStays.length - recoverableFailedStays;
+
+  const isSingleStayTrip = totalStays <= 1;
+  const allStaysCatastrophic = catastrophicStays.length > 0 && catastrophicStays.length === totalStays;
+  const failedDayRatio = totalNormalDays > 0 ? failedNormalDays / totalNormalDays : 0;
+  const majorityDaysFailed = failedDayRatio > 0.5;
+
+  const tripSupplyState: TripDiscoveryHealthState =
+    catastrophicStays.length === 0
+      ? "HEALTHY"
+      : isSingleStayTrip || allStaysCatastrophic || majorityDaysFailed
+        ? "CATASTROPHIC_PROVIDER_FAILURE"
+        : "PARTIALLY_DEGRADED";
+
+  return {
+    tripSupplyState,
+    totalStays,
+    healthyStays,
+    providerFailedStays: catastrophicStays.length,
+    totalNormalDays,
+    failedNormalDays,
+    totalRealActivityCandidates,
+    recoverableFailedStays,
+    unrecoverableFailedStays,
+    stayFailures,
+  };
+}
+
+/**
+ * Round 9.3.7 §C — bounded recovery for ONE catastrophically-discovery-
+ * unavailable stay, using ONLY data already loaded in this generation.
+ * `assignCandidatesToStays` (the ownership assignment every activity pool
+ * already goes through) is called with `payload.recommendations`
+ * EVERYWHERE in this pipeline — `payload.selectedPlaces` (a user's own
+ * explicitly chosen/must-visit real places) is never assigned to any
+ * stay's pool at all. That is a genuine, previously-unused recovery
+ * source, not a duplicate of what discovery already tried: reusing it
+ * here requires no new network request, no new provider budget, and can
+ * never borrow another stay's candidates (ownership is the SAME
+ * nearest-anchor/text-match rule every other candidate uses). The stay's
+ * pool is rebuilt via buildStayActivityPool — the same function every
+ * other pool in this pipeline is built with, so legality/classification/
+ * meal-venue exclusion are identical, never a relaxed or parallel rule.
+ */
+export function attemptBoundedStayRecovery(
+  phase: TripFramePhase,
+  payload: AiItineraryRequest,
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  profile: TripPreferenceProfile,
+  existingPool: StayActivityPool,
+  dayTypesByStay: Map<string, StayDayCapacityInput[]>
+): { pool: StayActivityPool; recovered: boolean; recoveredRecommendations: TripRecommendation[] } {
+  const alreadyOwnedIds = new Set(payload.recommendations.map((rec) => rec.id));
+  const unownedSelectedPlaces = payload.selectedPlaces.filter((place) => !alreadyOwnedIds.has(place.id));
+  if (unownedSelectedPlaces.length === 0) {
+    return { pool: existingPool, recovered: false, recoveredRecommendations: [] };
+  }
+
+  const selectedPlaceOwnership = assignCandidatesToStays(unownedSelectedPlaces, tripFrame, areaAnchors, normalizeAreaLabel, resolveTextualAreaMatch);
+  const recoveredForThisStay = selectedPlaceOwnership.get(phase.id) ?? [];
+  if (recoveredForThisStay.length === 0) {
+    return { pool: existingPool, recovered: false, recoveredRecommendations: [] };
+  }
+
+  const recommendationOwnership = assignCandidatesToStays(payload.recommendations, tripFrame, areaAnchors, normalizeAreaLabel, resolveTextualAreaMatch);
+  const alreadyOwnedForThisStay = recommendationOwnership.get(phase.id) ?? [];
+
+  const capacity = computeStayCapacity(dayTypesByStay.get(phase.id) ?? []);
+  const rebuiltPool = buildStayActivityPool(
+    phase,
+    [...alreadyOwnedForThisStay, ...recoveredForThisStay],
+    existingPool.anchor,
+    mobilityProfile,
+    capacity,
+    profile.mustVisitKeywords,
+    profile.dailyCapacityMinutes
+  );
+
+  // Recovery found candidates ATTRIBUTED to this stay's area, but none
+  // survived legality (evaluateScheduledPlaceLegality, the same gate
+  // every other candidate must pass) — never claim recovery succeeded
+  // when nothing legally usable came of it.
+  if (rebuiltPool.candidates.length === 0) {
+    return { pool: existingPool, recovered: false, recoveredRecommendations: [] };
+  }
+
+  const recoveredPool: StayActivityPool = {
+    ...rebuiltPool,
+    diagnostics: {
+      ...rebuiltPool.diagnostics,
+      // Round 9.3.7 §G/§D — a successful bounded recovery must never erase
+      // the fact that a real provider outage genuinely happened: the
+      // ORIGINAL provider telemetry survives unchanged even though the
+      // stay may now continue with real (non-Overpass-sourced) content.
+      refillAttempts: existingPool.diagnostics.refillAttempts,
+      providerFailures: existingPool.diagnostics.providerFailures,
+      providerElapsedMs: existingPool.diagnostics.providerElapsedMs,
+      providerTimeouts: existingPool.diagnostics.providerTimeouts,
+    },
+  };
+
+  return { pool: recoveredPool, recovered: true, recoveredRecommendations: recoveredForThisStay };
+}
+
+/**
+ * Round 9.3.7 §C — runs attemptBoundedStayRecovery for every
+ * catastrophically-discovery-unavailable stay in the trip. Never touches a
+ * healthy stay (spec §H — "healthy stays are never re-queried by
+ * recovery"; there is no query here at all, but the SAME no-touch
+ * guarantee applies to the reuse-existing-data path). Never adds a
+ * network request, never extends a budget/deadline.
+ */
+export function attemptBoundedRecoveryForFailedStays(
+  payload: AiItineraryRequest,
+  tripFrame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  mobilityProfile: DestinationMobilityProfile,
+  profile: TripPreferenceProfile,
+  poolsByStay: Map<string, StayActivityPool>,
+  dayTypesByStay: Map<string, StayDayCapacityInput[]>
+): { payload: AiItineraryRequest; poolsByStay: Map<string, StayActivityPool>; recoveredStayIds: string[] } {
+  const stayFailures = buildStayFailureDetails(poolsByStay);
+  const catastrophicStayIds = new Set(
+    stayFailures.filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay)).map((stay) => stay.stayId)
+  );
+  if (catastrophicStayIds.size === 0) {
+    return { payload, poolsByStay, recoveredStayIds: [] };
+  }
+
+  const updatedPools = new Map(poolsByStay);
+  let updatedPayload = payload;
+  const recoveredStayIds: string[] = [];
+  for (const phase of tripFrame.phases) {
+    if (!catastrophicStayIds.has(phase.id)) continue;
+    const existingPool = updatedPools.get(phase.id);
+    if (!existingPool) continue;
+    const result = attemptBoundedStayRecovery(phase, updatedPayload, tripFrame, areaAnchors, mobilityProfile, profile, existingPool, dayTypesByStay);
+    if (!result.recovered) continue;
+    updatedPools.set(phase.id, result.pool);
+    if (result.recoveredRecommendations.length > 0) {
+      updatedPayload = { ...updatedPayload, recommendations: [...updatedPayload.recommendations, ...result.recoveredRecommendations] };
+    }
+    recoveredStayIds.push(phase.id);
+  }
+  if (recoveredStayIds.length > 0) {
+    logGenerationStage("[StaySupplyQA] bounded recovery from existing data (selectedPlaces) for provider-failed stays", { recoveredStayIds });
+  }
+  return { payload: updatedPayload, poolsByStay: updatedPools, recoveredStayIds };
+}
+
+/**
+ * Round 9.1 §16/§17 — THE decision point between a genuine SUPPLY failure
+ * (a stay's own legal candidate pool never reached its minimum-viable
+ * floor, even after bounded refill) and a PLANNER/QUALITY failure (a
+ * healthy supply existed but the deterministic fallback still couldn't
+ * produce a valid plan — budget, duplicates, or geography). A pure
+ * function so the decision itself — not just its consequences — is
+ * directly unit-testable without exercising the full 8000-line pipeline.
+ */
+export function classifyPlanFailure(
+  poolsByStay: Map<string, StayActivityPool>,
+  fallbackDiagnostics: Pick<PlanDiagnostics, "outOfBudget" | "duplicatePlaces">
+): PlanFailureClassification {
+  const stayFailures = buildStayFailureDetails(poolsByStay);
+  const supplyFailedStays = stayFailures.filter((stay) => stay.belowMinimum);
+  const catastrophicStays = stayFailures.filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay));
+
+  // Round 9.3.3 continuation §7 / Round 9.3.7 §B — checked FIRST: a genuine
+  // provider-infrastructure catastrophe is a more fundamental, more
+  // actionable diagnosis than any downstream budget/duplicate/geography
+  // symptom it might also happen to trigger — never disguised as one of
+  // those. This function has no TripFrame/day-count context (a deliberate,
+  // pre-existing, separately-tested pure-function boundary), so it uses the
+  // narrower trip-level signals it CAN compute without one: a single-stay
+  // trip whose only stay is catastrophic, or every stay being catastrophic,
+  // is still trip-wide catastrophic; one catastrophic stay out of several
+  // healthy ones is NOT (Round 9.3.7's own fix — the real 43-day/7-stay US
+  // trip's ONE provider-failed New York stay must never disguise an
+  // unrelated budget/duplicate/geography problem on this path, nor abort a
+  // trip whose other stays are healthy). The full day-ratio-aware
+  // assessment (assessTripDiscoveryHealth) already gates this function's
+  // one real call site earlier, with the TripFrame it needs; this is a
+  // lighter, context-free consistency backstop for this function alone.
+  const isTripWideCatastrophic = catastrophicStays.length > 0 && (stayFailures.length <= 1 || catastrophicStays.length === stayFailures.length);
+  if (isTripWideCatastrophic) {
+    return {
+      code: "REAL_PLACE_DISCOVERY_UNAVAILABLE",
+      primaryFailure: "provider_supply",
+      secondaryFailures: fallbackDiagnostics.duplicatePlaces > 0 ? ["duplicates"] : [],
+      stayFailures,
+    };
+  }
+  if (fallbackDiagnostics.outOfBudget) {
+    return { code: "BUDGET_NOT_FEASIBLE", primaryFailure: "budget", secondaryFailures: [], stayFailures };
+  }
+  if (supplyFailedStays.length > 0) {
+    return {
+      code: "INSUFFICIENT_REAL_ACTIVITY_SUPPLY",
+      primaryFailure: "provider_supply",
+      secondaryFailures: fallbackDiagnostics.duplicatePlaces > 0 ? ["duplicates"] : [],
+      stayFailures,
+    };
+  }
+  if (fallbackDiagnostics.duplicatePlaces > 0) {
+    return { code: "PLAN_NOT_FEASIBLE", primaryFailure: "duplicates", secondaryFailures: [], stayFailures };
+  }
+  return { code: "PLAN_NOT_FEASIBLE", primaryFailure: "geography", secondaryFailures: [], stayFailures };
+}
+
+/**
+ * Round 9.2 — the decision between the NEW portfolio-first composition
+ * path (spec "THE STAY ACTIVITY PORTFOLIO MUST BECOME THE AUTHORITATIVE
+ * INPUT FOR INITIAL DAY CONSTRUCTION") and the OLD Gemini-first free-text
+ * path. Healthy (every real-activity-needing stay reached its own
+ * minimumViableCandidateCount) → compose deterministically, Gemini only
+ * ever refines via candidate IDs (never required, spec §5). Thin/degraded
+ * supply → the old Gemini-first path remains — the SAME honest "supply
+ * limitation, not a planning failure" distinction Round 8 already
+ * established (a destination with genuinely few real candidates still
+ * needs Gemini's own knowledge to produce ANY content, real or not).
+ */
+export function isSupplyHealthyForComposition(poolsByStay: Map<string, StayActivityPool>): boolean {
+  if (poolsByStay.size === 0) return false;
+  return buildStayFailureDetails(poolsByStay).every((stay) => !stay.belowMinimum);
+}
+
+/**
+ * Round 9.3.2 §2-6/§13-15 — THE reserve-stay competition orchestrator.
+ * Bounded to AT MOST ONE promotion per generation (a deliberate scope
+ * limit, disclosed in the round's own final report) — never a full
+ * iterative depth-vs-breadth optimizer, which would risk far more of the
+ * pipeline than this round's stated goal warrants.
+ *
+ * Stage A (cheap, no network): rankReserveStaysForPromotion ranks every
+ * preserved reserve by a skeleton-signal-only estimate.
+ * Stage B (bounded, ONE stay only): builds a REAL StayActivityPool/
+ * StayMealVenuePool for just the top-ranked reserve (a short refill
+ * budget, spec §5 "keep provider budgets bounded") and re-decides with
+ * real data via decideReservePromotion.
+ *
+ * Existing active-stay pools are never rediscovered (spec §15 — no NEW
+ * provider call for an already-active stay). The promoted reserve's own
+ * real candidates (Stage B's `addedRecommendations`) are handed back to
+ * the caller to merge into payload.recommendations — the SAME
+ * assignCandidatesToStays/buildTripActivityPortfolios/
+ * buildTripMealVenuePools pass the caller already runs unconditionally
+ * right after this (present or not) then naturally attributes them to the
+ * new phase by real geography, with zero additional network cost either
+ * way — never a second, hand-maintained pool-map merge here.
+ */
+export async function attemptReservePromotion(
+  tripFrame: TripFrame,
+  dayCount: number,
+  reserveStays: ResolvedStay[],
+  activeStays: ResolvedStay[],
+  poolsByStay: Map<string, StayActivityPool>,
+  mealPoolsByStay: Map<string, StayMealVenuePool>,
+  mobilityProfile: DestinationMobilityProfile,
+  profile: TripPreferenceProfile,
+  arrivalAnchor: { lat: number; lon: number } | null,
+  departureAnchor: { lat: number; lon: number } | null,
+  /** Injectable — tests pass a fake to avoid any real network call; production omits this and gets the real Overpass-backed default. */
+  fetchCandidatesOverride?: RefillOptions["fetchCandidates"]
+): Promise<{
+  tripFrame: TripFrame;
+  addedRecommendations: TripRecommendation[];
+  /** The promoted reserve's own freshly-built pools — set only when promoted:true, so the caller can seed its own poolsByStay/mealPoolsByStay maps for the isSupplyHealthyForComposition check that immediately follows, without waiting for a later full rebuild. */
+  reservePool: StayActivityPool | null;
+  reserveMealPool: StayMealVenuePool | null;
+  reserveStayId: string | null;
+  promoted: boolean;
+}> {
+  const unchanged = { tripFrame, addedRecommendations: [], reservePool: null, reserveMealPool: null, reserveStayId: null, promoted: false };
+  if (reserveStays.length === 0 || tripFrame.phases.length === 0) return unchanged;
+
+  // Stage A — cheap ranking, no network call at all.
+  const ranked = rankReserveStaysForPromotion(reserveStays, activeStays);
+  const top = ranked[0];
+  if (!top || top.netStageAScore <= 0) return unchanged;
+
+  // Fresh allocationDetails for the CURRENT (already-reallocated) active
+  // stays — the same computeStayValueProfile/allocateNightsByMarginalValue
+  // pair reallocateNightsAfterDiscovery itself uses, recomputed here only
+  // because that function's own return type stays TripFrame-only (spec
+  // §18: never redesign the existing marginal-value system).
+  const activeProfiles = tripFrame.phases.map((phase) => computeStayValueProfile(phase.id, phase.areaLabel, poolsByStay.get(phase.id), mealPoolsByStay.get(phase.id), [], false));
+  const currentAllocation = allocateNightsByMarginalValue(activeProfiles, dayCount);
+
+  // Stage B — bounded, single-stay real discovery for the top reserve only.
+  const reservePhase: TripFramePhase = {
+    id: top.reserve.stayId,
+    areaLabel: top.reserve.areaLabel,
+    nights: 1,
+    startDayNumber: 0,
+    endDayNumber: 0,
+    intent: "mixed",
+    anchor: { lat: top.reserve.lat, lon: top.reserve.lon },
+  };
+  const reserveCapacity = computeStayCapacity([{ dayNumber: 1, dayType: "normal", hasExplicitRestWindow: false }]);
+  const basePool = buildStayActivityPool(reservePhase, [], reservePhase.anchor!, mobilityProfile, reserveCapacity, profile.mustVisitKeywords, profile.dailyCapacityMinutes);
+  const { pool: reservePool, addedRecommendations } = await refillStayActivityPool(basePool, mobilityProfile, profile.dailyCapacityMinutes, profile.mustVisitKeywords, {
+    fetchCandidates: fetchCandidatesOverride,
+    maxRounds: 1,
+    deadline: Date.now() + 6_000,
+  }).catch(() => ({ pool: basePool, addedRecommendations: [] as TripRecommendation[] }));
+  const reserveMealPool = buildStayMealVenuePool(reservePhase, addedRecommendations, reservePhase.anchor!, mobilityProfile, profile.dailyCapacityMinutes);
+
+  const reserveProfile = computeStayValueProfile(top.reserve.stayId, top.reserve.areaLabel, reservePool, reserveMealPool, top.reserve.reasons, false);
+  const decision = decideReservePromotion(top.reserve, reserveProfile, top.transferCostKm, currentAllocation);
+
+  logGenerationStage("[StaySupplyQA] reserve promotion evaluated", {
+    reserve: top.reserve.areaLabel,
+    stageAScore: top.netStageAScore,
+    transferCostKm: top.transferCostKm,
+    realActivityCandidates: reservePool.candidates.length,
+    decision: decision.reason,
+    promoted: decision.promote,
+  });
+
+  if (!decision.promote || !decision.demoteFromStayId) return unchanged;
+
+  const newFrame = applyReservePromotion(tripFrame, top.reserve, decision.demoteFromStayId, arrivalAnchor, departureAnchor);
+  if (newFrame === tripFrame) return unchanged; // refused (demote-from stay already at its own minimum)
+
+  return { tripFrame: newFrame, addedRecommendations, reservePool, reserveMealPool, reserveStayId: top.reserve.stayId, promoted: true };
+}
+
 export async function generateCountryItineraryPlan(
   payload: AiItineraryRequest,
-  knowledge?: CountryAiRecommendation | null
+  knowledge?: CountryAiRecommendation | null,
+  /** Round 9.3.3 §22 — purely observational: called at real, already-completed pipeline checkpoints. Never awaited for planner decisions, never changes what gets generated. */
+  onProgress?: GenerationProgressReporter
 ): Promise<GeneratedCountryItineraryPlan> {
+  const generationStartedAt = Date.now();
+  // Round 9.4 §R — lightweight stage timing, reusing the EXISTING
+  // onProgress stage-transition calls (Round 9.3.3 §22) rather than
+  // rewriting the pipeline to wrap each stage individually: every one of
+  // the ~15 onProgress call sites already marks a real stage boundary, so
+  // wrapping the callback ONCE here reports elapsed time between
+  // consecutive stage transitions with zero changes to any call site and
+  // zero effect on what onProgress itself reports to the caller.
+  if (isPlannerQaTraceEnabled()) {
+    const originalOnProgress = onProgress;
+    let lastStageAt = generationStartedAt;
+    let lastStage = "INITIALIZING";
+    onProgress = (event) => {
+      const now = Date.now();
+      logRealPlaceQA("Timing", { stage: lastStage, elapsedMs: now - lastStageAt });
+      lastStageAt = now;
+      lastStage = event.stage;
+      originalOnProgress?.(event);
+    };
+  }
   const dayCount = getTripDayCount(payload.preferences.startDate, payload.preferences.endDate, 0);
   if (!payload.countryId || !payload.countryName || !payload.isoA2) {
     throw new Error("countryId, countryName and isoA2 are required");
@@ -7981,7 +12022,7 @@ export async function generateCountryItineraryPlan(
 
   const exchangeRateContext = await loadExchangeRateContext(payload.isoA2);
   logGenerationStage("flight data: parsed", { hasFlights: Boolean(payload.preferences.flights?.outbound || payload.preferences.flights?.return) });
-  const normalizedPayload = normalizePayloadPrices(payload, exchangeRateContext);
+  let normalizedPayload = normalizePayloadPrices(payload, exchangeRateContext);
   logGenerationStage("airport data: normalized", { recommendations: normalizedPayload.recommendations.length });
   const profile = buildTripPreferenceProfile(
     normalizedPayload.preferences,
@@ -7989,11 +12030,234 @@ export async function generateCountryItineraryPlan(
     dayCount
   );
   logGenerationStage("dietary preferences: parsed", { hasDietaryPreferences: Boolean(normalizedPayload.preferences.dietaryPreferences?.trim()) });
-  const tripFrame = await buildTripFrame(normalizedPayload, dayCount, knowledge);
+  onProgress?.({ stage: "INITIALIZING", message: "אוספים את נתוני הטיול" });
+  const tripFrameResult = await buildTripFrame(normalizedPayload, dayCount, knowledge);
+  let tripFrame = tripFrameResult.frame;
+  const skeletonReserveStays = tripFrameResult.reserveStays;
   const arrivalDepartureWindow = computeArrivalDepartureWindow(
     normalizedPayload.preferences.flights,
     normalizedPayload.isoA2
   );
+  onProgress?.({ stage: "TRIP_FRAME", message: "בונים את מבנה המסלול", completedUnits: tripFrame.phases.length, totalUnits: tripFrame.phases.length });
+  // Stay resolution (which real areas/anchors this trip visits) is already
+  // decided as part of buildTripFrame's own output (each phase's anchor,
+  // including Round 9.3.1's stay-anchor fix) — there is no separate later
+  // async step to observe, so this reports real, already-true state rather
+  // than waiting on work that doesn't exist as a distinct stage here.
+  onProgress?.({ stage: "STAY_RESOLUTION", message: "מאתרים יעדים ואזורי לינה" });
+
+  // Round 9 §4 / Round 9.1 §6-§9 — real, stay-scoped, bounded-concurrency,
+  // time-budgeted provider refill BEFORE Gemini ever sees the candidate
+  // pool. Strictly additive and failure-tolerant — on any provider trouble
+  // this returns the original payload unchanged. `poolsByStay` is kept for
+  // the failure-code decision below (§16/§17) and the failure summary.
+  const beforeRefillCount = normalizedPayload.recommendations.length;
+  const refillOutcome = await refillTripRecommendationPool(
+    normalizedPayload,
+    tripFrame,
+    dayCount,
+    arrivalDepartureWindow,
+    profile,
+    undefined,
+    undefined,
+    (completed, total) =>
+      onProgress?.({
+        stage: "PLACE_DISCOVERY",
+        message: `מחפשים מקומות ואטרקציות — ${completed} מתוך ${total} אזורים`,
+        completedUnits: completed,
+        totalUnits: total,
+      })
+  ).catch(() => ({ payload: normalizedPayload, poolsByStay: new Map<string, StayActivityPool>() }));
+  normalizedPayload = refillOutcome.payload;
+  const preGenerationPoolsByStay = refillOutcome.poolsByStay;
+  if (normalizedPayload.recommendations.length !== beforeRefillCount) {
+    logGenerationStage("stay activity pool: refilled", {
+      before: beforeRefillCount,
+      after: normalizedPayload.recommendations.length,
+      added: normalizedPayload.recommendations.length - beforeRefillCount,
+    });
+  }
+  // Round 9.3.3 §22 — a real completion tick even for a single-stay trip
+  // (onStayDiscovered fires per-stay above; this guarantees PLACE_DISCOVERY
+  // reaches its own range's end once discovery is fully done, even if the
+  // catch() above skipped every per-stay tick entirely).
+  onProgress?.({ stage: "PLACE_DISCOVERY", message: "מחפשים מקומות ואטרקציות אמיתיים", completedUnits: tripFrame.phases.length, totalUnits: Math.max(tripFrame.phases.length, 1) });
+
+  // Round 9.3.1 §4/§9 — "separate stay selection from night allocation":
+  // buildTripFrame's own night counts (skeleton-proposed or POI-cluster
+  // proportional) are a PRELIMINARY estimate only, needed to give
+  // refillTripRecommendationPool day ranges to discover against. Now that
+  // real per-stay supply exists (preGenerationPoolsByStay, built above),
+  // the deterministic planner recomputes FINAL durations via joint
+  // marginal-value allocation (spec §5/§6) — never a bucket, never equal
+  // share. Candidate OWNERSHIP is untouched (still keyed by the same
+  // stable phase.id/anchor), so this never re-triggers discovery.
+  const preGenerationAreaAnchors = resolveAreaAnchorsForFrame(tripFrame, computeAreaAnchors(normalizedPayload));
+  const preGenerationMobilityProfile = computeDestinationMobilityProfile([
+    ...normalizedPayload.recommendations,
+    ...normalizedPayload.selectedPlaces,
+  ]);
+  if (tripFrame.phases.length > 1) {
+    const preGenerationMealPoolsByStay = buildTripMealVenuePools(
+      tripFrame,
+      preGenerationAreaAnchors,
+      preGenerationMobilityProfile,
+      normalizedPayload.recommendations,
+      profile.dailyCapacityMinutes,
+      normalizeAreaLabel,
+      resolveTextualAreaMatch
+    );
+    onProgress?.({ stage: "POOL_CONSTRUCTION", message: "אוספים את המקומות שנמצאו" });
+    const reallocationArrivalAirport = normalizedPayload.preferences.flights?.outbound?.arrivalAirport || null;
+    const reallocationArrivalAnchor = reallocationArrivalAirport ? findAirportByIata(reallocationArrivalAirport) : null;
+    const reallocationDepartureAirport = normalizedPayload.preferences.flights?.return?.departureAirport || null;
+    const reallocationDepartureAnchor = reallocationDepartureAirport ? findAirportByIata(reallocationDepartureAirport) : null;
+    const beforeNights = tripFrame.phases.map((p) => ({ area: p.areaLabel, nights: p.nights }));
+    // Round 9.3.2 §7 — the SAME pre-generation day-type/usableHours
+    // estimator the rest of the pipeline already relies on, computed
+    // against the CURRENT (pre-reallocation) frame so arrival/departure/
+    // transfer classification reflects real phase boundaries.
+    const preReallocationDayTypesByStay = estimatePreGenerationDayTypesByStay(tripFrame, dayCount, arrivalDepartureWindow);
+    tripFrame = reallocateNightsAfterDiscovery(
+      tripFrame,
+      dayCount,
+      preGenerationPoolsByStay,
+      preGenerationMealPoolsByStay,
+      profile.mustVisitKeywords,
+      reallocationArrivalAnchor,
+      reallocationDepartureAnchor,
+      preReallocationDayTypesByStay
+    );
+    logGenerationStage("[StaySupplyQA] night reallocation after real discovery", {
+      before: beforeNights,
+      after: tripFrame.phases.map((p) => ({ area: p.areaLabel, nights: p.nights })),
+    });
+    onProgress?.({ stage: "NIGHT_ALLOCATION", message: "מחלקים את הימים בין היעדים" });
+
+    // Round 9.3.2 §2-6/§13 — reserve stays the skeleton resolved but did not
+    // select may still compete for a trip day against the weakest active
+    // stay's own next unallocated day. Bounded to at most one promotion.
+    if (skeletonReserveStays.length > 0) {
+      const activeStaysForRanking: ResolvedStay[] = tripFrame.phases.map((p) => ({
+        stayId: p.id,
+        proposedId: null,
+        areaLabel: p.areaLabel,
+        lat: p.anchor?.lat ?? preGenerationAreaAnchors.get(p.areaLabel)?.lat ?? 0,
+        lon: p.anchor?.lon ?? preGenerationAreaAnchors.get(p.areaLabel)?.lon ?? 0,
+        nights: p.nights,
+        reasons: [],
+        source: "gemini_resolved",
+        confidence: "high",
+        countryIso: normalizedPayload.isoA2,
+      }));
+      const promotionResult = await attemptReservePromotion(
+        tripFrame,
+        dayCount,
+        skeletonReserveStays,
+        activeStaysForRanking,
+        preGenerationPoolsByStay,
+        preGenerationMealPoolsByStay,
+        preGenerationMobilityProfile,
+        profile,
+        reallocationArrivalAnchor,
+        reallocationDepartureAnchor
+      ).catch(() => ({ tripFrame, addedRecommendations: [] as TripRecommendation[], reservePool: null, reserveMealPool: null, reserveStayId: null, promoted: false }));
+      if (promotionResult.promoted) {
+        tripFrame = promotionResult.tripFrame;
+        // The reserve's own real candidates join the trip's pool exactly
+        // like any other refill result (spec §14: no stale state) — every
+        // later rebuild (portfolios, meal pools) sees them through the
+        // SAME normalizedPayload.recommendations list every other stay's
+        // candidates already flow through, never a separate code path.
+        normalizedPayload = { ...normalizedPayload, recommendations: [...normalizedPayload.recommendations, ...promotionResult.addedRecommendations] };
+        if (promotionResult.reserveStayId && promotionResult.reservePool) preGenerationPoolsByStay.set(promotionResult.reserveStayId, promotionResult.reservePool);
+        logGenerationStage("[StaySupplyQA] reserve promoted", {
+          finalStays: tripFrame.phases.map((p) => ({ area: p.areaLabel, nights: p.nights })),
+        });
+      }
+      onProgress?.({ stage: "RESERVE_EVALUATION", message: "בודקים יעדים נוספים אפשריים" });
+    } else {
+      onProgress?.({ stage: "RESERVE_EVALUATION", message: "בודקים יעדים נוספים אפשריים" });
+    }
+  } else {
+    // A single-stay trip has no reallocation/reserve-competition work to
+    // do (both are inherently multi-stay concepts) — report both stages as
+    // genuinely complete (there was nothing to do) rather than stalling
+    // progress waiting for a step that will never run for this trip shape.
+    onProgress?.({ stage: "POOL_CONSTRUCTION", message: "אוספים את המקומות שנמצאו" });
+    onProgress?.({ stage: "NIGHT_ALLOCATION", message: "מחלקים את הימים בין היעדים" });
+    onProgress?.({ stage: "RESERVE_EVALUATION", message: "בודקים יעדים נוספים אפשריים" });
+  }
+
+  // Round 9.3.5 — tripFrame is now truly FINAL (post night-reallocation,
+  // post reserve-promotion). A stay's real duration can have grown well
+  // past what its OWN pre-reallocation discovery pass ever targeted
+  // (measured and confirmed this round: early-stop correctly closes the
+  // book against the SMALLER preliminary target, and nothing before this
+  // point ever revisits that pool once nights change) — recompute every
+  // stay's real anchor/day-type/target against the FINAL frame and run a
+  // bounded, grouped refill ONLY for stays that are still genuinely short,
+  // never re-discovering an already-healthy one.
+  const finalAreaAnchors = resolveAreaAnchorsForFrame(tripFrame, computeAreaAnchors(normalizedPayload));
+  const finalDayTypesByStay = estimatePreGenerationDayTypesByStay(tripFrame, dayCount, arrivalDepartureWindow);
+  const finalMobilityProfile = computeDestinationMobilityProfile([...normalizedPayload.recommendations, ...normalizedPayload.selectedPlaces]);
+  const finalSupplyRefill = await refillDeficientStaysAfterReallocation(
+    normalizedPayload,
+    tripFrame,
+    finalAreaAnchors,
+    finalMobilityProfile,
+    profile,
+    preGenerationPoolsByStay,
+    finalDayTypesByStay
+  ).catch(() => ({ payload: normalizedPayload, poolsByStay: preGenerationPoolsByStay, refilledStayIds: [] as string[] }));
+  normalizedPayload = finalSupplyRefill.payload;
+  for (const [stayId, pool] of finalSupplyRefill.poolsByStay) preGenerationPoolsByStay.set(stayId, pool);
+  if (finalSupplyRefill.refilledStayIds.length > 0) {
+    logGenerationStage("[StaySupplyQA] final-duration supply refill complete", {
+      refilledStayIds: finalSupplyRefill.refilledStayIds,
+      finalPoolSizes: finalSupplyRefill.refilledStayIds.map((id) => ({ stayId: id, size: preGenerationPoolsByStay.get(id)?.candidates.length ?? 0 })),
+    });
+  }
+
+  // Round 9.3.7 §A/§H — the earliest point every stay's FINAL pool shape
+  // is known (post-initial-discovery, post-reallocation-refill, before any
+  // Gemini/composed-path/routing/finalization work begins) is also the
+  // earliest point a genuinely catastrophic trip-wide provider failure is
+  // deterministically knowable. The OLD unconditional check further below
+  // (fallback-template stage) only ever ran AFTER the full Gemini-first
+  // pipeline had already been attempted — the real 43-day US trip spent
+  // ~233-240s of work before ever reaching it. Bounded, no-new-network-
+  // call recovery (existing selectedPlaces/must-visit data, never another
+  // stay's candidates, never a fabricated place) runs first so a stay is
+  // never given up on before data ALREADY in this generation is tried.
+  const boundedRecovery = attemptBoundedRecoveryForFailedStays(
+    normalizedPayload,
+    tripFrame,
+    finalAreaAnchors,
+    finalMobilityProfile,
+    profile,
+    preGenerationPoolsByStay,
+    finalDayTypesByStay
+  );
+  normalizedPayload = boundedRecovery.payload;
+  for (const [stayId, pool] of boundedRecovery.poolsByStay) preGenerationPoolsByStay.set(stayId, pool);
+
+  const tripDiscoveryHealth = assessTripDiscoveryHealth(
+    preGenerationPoolsByStay,
+    tripFrame,
+    normalizedPayload.preferences.startDate,
+    arrivalDepartureWindow,
+    new Set(boundedRecovery.recoveredStayIds)
+  );
+  if (tripDiscoveryHealth.tripSupplyState !== "HEALTHY") {
+    logGenerationStage("[TripDiscoveryHealthQA]", { ...tripDiscoveryHealth, stayFailures: undefined });
+  }
+  if (tripDiscoveryHealth.tripSupplyState === "CATASTROPHIC_PROVIDER_FAILURE") {
+    throw new RealPlaceDiscoveryUnavailableError(
+      "לא הצלחנו לאתר מקומות אמיתיים בטיול הזה בגלל תקלת ספק זמנית — לא בגלל מיעוט אמיתי של מקומות ביעד. כדאי לנסות שוב בעוד כמה דקות.",
+      tripDiscoveryHealth.stayFailures.filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay))
+    );
+  }
 
   logGenerationStage("AI generation started", {
     isoA2: normalizedPayload.isoA2,
@@ -8001,6 +12265,356 @@ export async function generateCountryItineraryPlan(
     candidateRecommendations: normalizedPayload.recommendations.length,
     selectedPlaces: normalizedPayload.selectedPlaces.length,
   });
+
+  // Round 9.2 — "THE STAY ACTIVITY PORTFOLIO MUST BECOME THE AUTHORITATIVE
+  // INPUT FOR INITIAL DAY CONSTRUCTION." Portfolios are built HERE, before
+  // Gemini is ever consulted. When every stay that actually needs real
+  // content reached its own minimum-viable supply (isSupplyHealthyForComposition),
+  // the deterministic composer — not Gemini, not backfill — decides the
+  // itinerary's real content. Gemini participates only as an OPTIONAL,
+  // ID-only refinement on top of an already-complete, already-valid plan.
+  // A thin/degraded supply (genuine destination scarcity, Round 8's own
+  // established distinction) falls through to the existing Gemini-first
+  // free-text path below — Gemini's own world knowledge is the only
+  // reasonable source of ANY content in that case.
+  if (isSupplyHealthyForComposition(preGenerationPoolsByStay)) {
+    // Round 9.3.5 — final*, not preGeneration*: tripFrame's day ranges (and,
+    // for a promoted reserve, its very phase) may have just been rebuilt by
+    // night reallocation/reserve promotion above — always the FINAL frame's
+    // own anchors/mobility/day-types, never the preliminary ones refill
+    // discovery used (a promoted reserve is never in preGenerationAreaAnchors
+    // at all, since that map predates its phase existing).
+    const { poolsByStay: composedPoolsByStay, portfoliosByStay } = buildTripActivityPortfolios(
+      tripFrame,
+      finalAreaAnchors,
+      finalMobilityProfile,
+      normalizedPayload.recommendations,
+      finalDayTypesByStay,
+      profile.mustVisitKeywords,
+      [...profile.strongPreferences, ...profile.softPreferences],
+      profile.dailyCapacityMinutes,
+      normalizeAreaLabel,
+      resolveTextualAreaMatch
+    );
+    onProgress?.({ stage: "PORTFOLIO_CONSTRUCTION", message: "בוחרים את המקומות המתאימים ביותר" });
+    // Round 9.3 §10/§11 — the composer's own literal StayMealVenuePool per
+    // stay, built the SAME call-shape as the activity portfolios just
+    // above (same ownership pass, same anchors/mobility profile) — never a
+    // second country-wide or inline pseudo-pool.
+    const mealPoolsByStay = buildTripMealVenuePools(
+      tripFrame,
+      finalAreaAnchors,
+      finalMobilityProfile,
+      normalizedPayload.recommendations,
+      profile.dailyCapacityMinutes,
+      normalizeAreaLabel,
+      resolveTextualAreaMatch
+    );
+    logGenerationStage("[StaySupplyQA]", {
+      stays: tripFrame.phases.map((phase) => ({
+        stayId: phase.id,
+        owner: phase.areaLabel,
+        nights: phase.nights,
+        activityCandidates: composedPoolsByStay.get(phase.id)?.candidates.length ?? 0,
+        mealCandidates: mealPoolsByStay.get(phase.id)?.venues.length ?? 0,
+      })),
+    });
+    const composed = composeDaysFromStayPortfolios(
+      tripFrame,
+      dayCount,
+      arrivalDepartureWindow,
+      composedPoolsByStay,
+      portfoliosByStay,
+      normalizedPayload,
+      profile,
+      mealPoolsByStay
+    );
+    logGenerationStage("portfolio-first composition", { initialRealActivitiesScheduled: composed.initialRealActivitiesScheduled });
+    onProgress?.({ stage: "DAY_COMPOSITION", message: "בונים את תוכנית הימים", completedUnits: dayCount, totalUnits: dayCount });
+
+    const composedRepaired = repairPlan(toRawGeneratedPlan(composed.plan), normalizedPayload, profile, tripFrame, exchangeRateContext, arrivalDepartureWindow, null);
+    // Round 9.4 §M — repairPlan is a single opaque call from here (its own
+    // ~20 internal repair steps are not individually instrumented this
+    // round — a real scope limit, disclosed in the report, not a per-
+    // substep trace); this is the before/after identity diff across the
+    // WHOLE repair pass, which is what previous rounds' evidence actually
+    // needed ("did repair as a whole remove real content"). No invented
+    // reason: repairPlan has no single attributable cause for a removal at
+    // this granularity, so `reason` is honestly "UNKNOWN" per spec §M.
+    if (isPlannerQaTraceEnabled()) {
+      const repairDelta = diffRealActivitySnapshots(snapshotRealActivities(composed.plan.days), snapshotRealActivities(composedRepaired.days));
+      logRealPlaceQA("RepairDelta", {
+        repairStage: "repairPlan (composed path)",
+        beforeRealActivityCount: repairDelta.beforeCount,
+        afterRealActivityCount: repairDelta.afterCount,
+        addedRealActivityIds: repairDelta.addedIds,
+        removedRealActivityIds: repairDelta.removedIds,
+        removed: repairDelta.removed.map((entry) => ({ ...entry, stayId: findFramePhaseForDay(tripFrame, entry.dayNumber)?.id, reason: "UNKNOWN" })),
+      });
+    }
+    const composedDiagnostics = collectPlanDiagnostics(composedRepaired, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
+    onProgress?.({ stage: "REPAIR_VALIDATION", message: "בודקים את המסלול ומתקנים התנגשויות" });
+
+    if (isPlanComplete(toRawGeneratedPlan(composed.plan), normalizedPayload) && passesValidation(composedDiagnostics)) {
+      logGenerationStage("portfolio-first composition passed validation");
+      const refinement = await refineComposedPlanWithGemini(composedRepaired, tripFrame, portfoliosByStay, normalizedPayload, profile).catch(
+        () => ({ plan: composedRepaired, refinementApplied: false, unknownCandidateIds: 0, crossStayCandidateIds: 0 })
+      );
+      onProgress?.({ stage: "AI_REFINEMENT", message: "מתאימים מסעדות וארוחות" });
+      let finalCandidatePlan = composedRepaired;
+      if (refinement.refinementApplied) {
+        // Same discipline as every other repair step: re-repair and
+        // re-validate what Gemini touched — never trust it silently.
+        const reRepaired = repairPlan(toRawGeneratedPlan(refinement.plan), normalizedPayload, profile, tripFrame, exchangeRateContext, arrivalDepartureWindow, null);
+        const reDiagnostics = collectPlanDiagnostics(reRepaired, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
+        if (passesValidation(reDiagnostics)) {
+          finalCandidatePlan = reRepaired;
+          logGenerationStage("Gemini portfolio refinement applied and re-validated");
+        } else {
+          logGenerationStage("Gemini portfolio refinement broke validation — discarded, keeping the deterministic composition");
+        }
+      }
+      if (refinement.unknownCandidateIds > 0 || refinement.crossStayCandidateIds > 0) {
+        logGenerationStage("Gemini portfolio refinement contract violations rejected", {
+          unknownGeminiCandidateIds: refinement.unknownCandidateIds,
+          crossStayGeminiCandidateIds: refinement.crossStayCandidateIds,
+        });
+      }
+
+      const validated = await applyBestEffortRoutingValidation(finalCandidatePlan, normalizedPayload, profile).catch(() => finalCandidatePlan);
+      onProgress?.({ stage: "ROUTING", message: "מחשבים זמני נסיעה ומעברים" });
+      // Round 9.4 §N — before finalization (which itself contains
+      // finalizeArrivalDepartureContent's own real-before-freetime backfill
+      // AND every settle-pass it runs), so a later "AfterFinalization" diff
+      // reveals whether finalization is a net destroyer or net restorer of
+      // real content — never assumed either way.
+      if (isPlannerQaTraceEnabled()) {
+        const before = snapshotRealActivities(validated.days);
+        logRealPlaceQA("BeforeFinalization", {
+          realActivities: before.length,
+          realMeals: validated.days.reduce((sum, d) => sum + d.items.filter((i) => isScheduledRealPlace(i) && (i.category === "restaurant" || i.category === "cafe")).length, 0),
+          freeTime: validated.days.reduce((sum, d) => sum + d.items.filter((i) => isSyntheticScheduleItem(i) && !isGenericMealOpportunity(i)).length, 0),
+          mealOpportunities: validated.days.reduce((sum, d) => sum + d.items.filter((i) => isGenericMealOpportunity(i)).length, 0),
+        });
+      }
+      let backfilledRealActivities = 0;
+      const finalPlan = finalizeArrivalDepartureContent(
+        validated,
+        normalizedPayload,
+        profile,
+        dayCount,
+        arrivalDepartureWindow,
+        tripFrame,
+        finalAreaAnchors,
+        finalMobilityProfile,
+        (insertions) => {
+          backfilledRealActivities = insertions;
+        }
+      );
+      if (isPlannerQaTraceEnabled()) {
+        const finalizationDelta = diffRealActivitySnapshots(snapshotRealActivities(validated.days), snapshotRealActivities(finalPlan.days));
+        logRealPlaceQA("AfterFinalization", {
+          realActivities: finalizationDelta.afterCount,
+          realMeals: finalPlan.days.reduce((sum, d) => sum + d.items.filter((i) => isScheduledRealPlace(i) && (i.category === "restaurant" || i.category === "cafe")).length, 0),
+          freeTime: finalPlan.days.reduce((sum, d) => sum + d.items.filter((i) => isSyntheticScheduleItem(i) && !isGenericMealOpportunity(i)).length, 0),
+          mealOpportunities: finalPlan.days.reduce((sum, d) => sum + d.items.filter((i) => isGenericMealOpportunity(i)).length, 0),
+          addedRealActivityIds: finalizationDelta.addedIds,
+          removedRealActivityIds: finalizationDelta.removedIds,
+        });
+      }
+      // Round 9.2 §12 — the headline observability signal for this whole
+      // round: for a healthy-supply trip, initialRealActivitiesScheduled
+      // (from the deterministic composer, BEFORE Gemini or backfill ever
+      // ran) should dwarf backfilledRealActivities (this finalization
+      // pass's own EXCEPTIONAL last-resort repair). If backfill regularly
+      // matches or exceeds the initial count, that's a supply or pacing
+      // regression to investigate — never a reason to relax validation.
+      logGenerationStage("portfolio-composed generation: initial vs backfilled real activities", {
+        initialRealActivitiesScheduled: composed.initialRealActivitiesScheduled,
+        backfilledRealActivities,
+        unknownGeminiCandidateIds: refinement.unknownCandidateIds,
+        crossStayGeminiCandidateIds: refinement.crossStayCandidateIds,
+      });
+      // Round 9.3.6 §13 — a bounded conservation log for the exact question
+      // this round's real production evidence made unanswerable at a
+      // glance: of the real activity candidates the trip actually
+      // collected, how many made it into a final per-stay pool, how many
+      // survived into a portfolio (selected vs. reserve), and how many
+      // were actually scheduled? Reuses existing counts already computed
+      // for this same call (composedPoolsByStay/portfoliosByStay/
+      // countRecommendationsByPlanningRole) — no new tracking state, no
+      // second observability system (spec item 10).
+      {
+        const { realActivityRecommendations: totalRealActivityRecommendations } = countRecommendationsByPlanningRole(
+          normalizedPayload.recommendations
+        );
+        let inFinalPools = 0;
+        let portfolioSelected = 0;
+        let portfolioReserve = 0;
+        for (const phase of tripFrame.phases) {
+          inFinalPools += composedPoolsByStay.get(phase.id)?.candidates.length ?? 0;
+          portfolioSelected += portfoliosByStay.get(phase.id)?.selected.length ?? 0;
+          portfolioReserve += portfoliosByStay.get(phase.id)?.optional.length ?? 0;
+        }
+        const scheduled = finalPlan.days.reduce(
+          (sum, day) => sum + day.items.filter((item) => isScheduledRealPlace(item) && item.category !== "restaurant" && item.category !== "cafe").length,
+          0
+        );
+        logGenerationStage("[FinalActivityCandidateAccounting]", {
+          totalRealActivityRecommendations,
+          inFinalPools,
+          portfolioSelected,
+          portfolioReserve,
+          scheduled,
+        });
+
+        // Round 9.4 §L — "the single most important diagnostic": one
+        // compact per-stay conservation record, discovered through every
+        // stage a real candidate could be lost at. Every number here comes
+        // from state already computed above/earlier in this same call
+        // (preGenerationPoolsByStay, composedPoolsByStay, portfoliosByStay,
+        // composed.plan.days, composedRepaired.days, finalPlan.days) —
+        // never a second parallel tracking system.
+        const countRealForStay = (dayList: AiGeneratedDay[], stayId: string) =>
+          dayList.reduce((sum, day) => {
+            const phase = findFramePhaseForDay(tripFrame, day.dayNumber);
+            if (phase?.id !== stayId) return sum;
+            return sum + day.items.filter((item) => isScheduledRealPlace(item) && item.category !== "restaurant" && item.category !== "cafe").length;
+          }, 0);
+        for (const phase of tripFrame.phases) {
+          const discoveryPool = preGenerationPoolsByStay.get(phase.id);
+          const finalPool = composedPoolsByStay.get(phase.id);
+          const portfolio = portfoliosByStay.get(phase.id);
+          logRealPlaceQA("CandidateConservation", {
+            stayId: phase.id,
+            owner: phase.areaLabel,
+            discovered: discoveryPool?.diagnostics.initialCandidateCount ?? 0,
+            geographicallyLegal: discoveryPool?.diagnostics.legalCandidateCount ?? 0,
+            activityPool: finalPool?.candidates.length ?? 0,
+            portfolioSelected: portfolio?.selected.length ?? 0,
+            portfolioReserve: portfolio?.optional.length ?? 0,
+            initiallyScheduled: countRealForStay(composed.plan.days, phase.id),
+            afterRepair: countRealForStay(composedRepaired.days, phase.id),
+            finalScheduled: countRealForStay(finalPlan.days, phase.id),
+          });
+        }
+      }
+      // Round 9.3 §16 — same catastrophic-quality ceiling as the Gemini-
+      // first/fallback paths below; defense in depth even though a healthy
+      // portfolio composition should never actually reach this shape once
+      // the stay skeleton itself is real.
+      assertRealActivityCoverage(
+        validateItineraryQuality(finalPlan.days, tripFrame, arrivalDepartureWindow),
+        normalizedPayload,
+        { tripFrame, countryName: normalizedPayload.countryName },
+        buildStaySupplyDiagnosticsMap(tripFrame, composedPoolsByStay, portfoliosByStay)
+      );
+      // Round 9.4 §P — the per-stay FinalResult, from INSIDE the pipeline
+      // where pool/portfolio sizes are still in scope (country-itineraries.ts
+      // logs the trip-wide, PERSISTED analogue of this once the itinerary
+      // is actually saved — this is the planner's own view, before that).
+      if (isPlannerQaTraceEnabled()) {
+        const finalQuality = validateItineraryQuality(finalPlan.days, tripFrame, arrivalDepartureWindow);
+        const normalDaysReport = finalQuality.perDay.filter((d) => d.dayType === "normal");
+        const totalRealActivities = finalQuality.perDay.reduce((sum, d) => sum + d.meaningfulRealActivityCount, 0);
+        logRealPlaceQA("FinalResult", {
+          totalDays: dayCount,
+          stays: tripFrame.phases.length,
+          realActivities: totalRealActivities,
+          normalDays: normalDaysReport.length,
+          normalDaysWithRealActivity: normalDaysReport.filter((d) => d.meaningfulRealActivityCount > 0).length,
+          zeroRealActivityDays: normalDaysReport.filter((d) => d.meaningfulRealActivityCount === 0).length,
+          perStay: tripFrame.phases.map((phase) => {
+            const stayNormalDays = normalDaysReport.filter((d) => findFramePhaseForDay(tripFrame, d.dayNumber)?.id === phase.id);
+            return {
+              stayId: phase.id,
+              name: phase.areaLabel,
+              normalDays: stayNormalDays.length,
+              poolSize: composedPoolsByStay.get(phase.id)?.candidates.length ?? 0,
+              portfolioSize: portfoliosByStay.get(phase.id)?.selected.length ?? 0,
+              finalRealActivities: stayNormalDays.reduce((sum, d) => sum + d.meaningfulRealActivityCount, 0),
+              zeroRealDays: stayNormalDays.filter((d) => d.meaningfulRealActivityCount === 0).length,
+            };
+          }),
+        });
+        if (totalRealActivities === 0) logRealPlaceQACompact("ZERO_REAL_ACTIVITY_SUCCESS", { totalDays: dayCount, stays: tripFrame.phases.length, generationSource: "portfolio_composed" });
+      }
+      return {
+        ...finalPlan,
+        summary: buildGenerationSummary(finalPlan, profile),
+        model: ITINERARY_MODEL,
+        usedFallback: false,
+        generationSource: "portfolio_composed",
+        candidateProviderStatus: resolveCandidateProviderStatus(normalizedPayload),
+      };
+    }
+    // Round 9.4.2 §C/§D/§E/§F — PROVEN root cause of a real 41-day/7-stay
+    // production trip persisting with 0 real activities/0 real meals
+    // (traceId gen-mu7ihdq8-545bii8p): composedRepaired already had 100+
+    // real places (missingMeals/overloadedDays/longTravelDays are pacing
+    // diagnostics, never real-content corruption), but failing
+    // passesValidation here discarded it WHOLESALE — falling through to a
+    // free-text Gemini loop (which can fail independently) and ultimately
+    // buildFallbackAiItinerary, a StayActivityPool/portfolio-UNAWARE
+    // legacy candidate-selection mechanism that produced near-zero real
+    // content for a complex multi-stay trip. This is the fix: when the
+    // ONLY failures are soft/pacing diagnostics (passesHardInvariantsForFallbackRecovery
+    // still holds — no duplicate/geographic/temporal/legal corruption),
+    // keep composedRepaired as a real-place-preserving checkpoint and
+    // finalize+validate it through the EXACT SAME gate
+    // (assertRealActivityCoverage) the healthy-success path above already
+    // uses, instead of discarding it. Never reruns discovery, never makes
+    // a new provider call — reuses composedPoolsByStay/portfoliosByStay/
+    // mealPoolsByStay already computed above. If ANYTHING about this
+    // checkpoint attempt fails (hard invariants unmet, or the coverage
+    // gate itself throws), execution falls through to the EXISTING
+    // Gemini-first + deterministic-template path completely unchanged —
+    // this is a strict ADDITION, never a replacement, of the prior safety
+    // net.
+    if (passesHardInvariantsForFallbackRecovery(composedDiagnostics)) {
+      try {
+        const checkpointFinalPlan = finalizeArrivalDepartureContent(
+          composedRepaired,
+          normalizedPayload,
+          profile,
+          dayCount,
+          arrivalDepartureWindow,
+          tripFrame,
+          finalAreaAnchors,
+          finalMobilityProfile
+        );
+        assertRealActivityCoverage(
+          validateItineraryQuality(checkpointFinalPlan.days, tripFrame, arrivalDepartureWindow),
+          normalizedPayload,
+          { tripFrame, countryName: normalizedPayload.countryName },
+          buildStaySupplyDiagnosticsMap(tripFrame, composedPoolsByStay, portfoliosByStay),
+          false
+        );
+        logGenerationStage("portfolio-first composition failed ONLY soft/pacing validation — kept as a real-place-preserving checkpoint instead of discarding", {
+          failingDiagnostics: describeFailingDiagnostics(composedDiagnostics),
+        });
+        return {
+          ...checkpointFinalPlan,
+          summary: buildGenerationSummary(checkpointFinalPlan, profile),
+          model: ITINERARY_MODEL,
+          usedFallback: false,
+          generationSource: "portfolio_composed_soft_checkpoint",
+          candidateProviderStatus: resolveCandidateProviderStatus(normalizedPayload),
+        };
+      } catch (checkpointError) {
+        logGenerationStage("real-place-preserving checkpoint attempt failed — falling back to Gemini-first path", {
+          message: checkpointError instanceof Error ? checkpointError.message : String(checkpointError),
+        });
+      }
+    }
+    // The composed plan itself failed validation (rare — a healthy pool
+    // does not guarantee a healthy SCHEDULE, e.g. a genuine budget
+    // conflict) — fall through to the existing Gemini-first path as a
+    // safety net rather than ever returning an invalid plan.
+    logGenerationStage("portfolio-first composition failed validation — falling back to Gemini-first path", {
+      failingDiagnostics: describeFailingDiagnostics(composedDiagnostics),
+    });
+  }
 
   let attempts = 0;
   while (attempts < 2) {
@@ -8015,6 +12629,7 @@ export async function generateCountryItineraryPlan(
         knowledge
       );
       logGenerationStage(`AI response parsing: received (attempt ${attempts})`);
+      onProgress?.({ stage: "DAY_COMPOSITION", message: "בונים את תוכנית הימים", completedUnits: dayCount, totalUnits: dayCount });
       const repaired = repairPlan(
         raw,
         normalizedPayload,
@@ -8025,12 +12640,14 @@ export async function generateCountryItineraryPlan(
         attempts === 1 ? 1 : 2
       );
       const diagnostics = collectPlanDiagnostics(repaired, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
+      onProgress?.({ stage: "REPAIR_VALIDATION", message: "בודקים את המסלול ומתקנים התנגשויות" });
       if (isPlanComplete(raw, normalizedPayload) && passesValidation(diagnostics)) {
         logGenerationStage(`schema validation: passed (attempt ${attempts})`);
         logGenerationStage(`AI generation parsed and validated (attempt ${attempts})`);
         const validated = await applyBestEffortRoutingValidation(repaired, normalizedPayload, profile).catch(
           () => repaired
         );
+        onProgress?.({ stage: "ROUTING", message: "מחשבים זמני נסיעה ומעברים" });
         return {
           ...validated,
           model: ITINERARY_MODEL,
@@ -8053,6 +12670,29 @@ export async function generateCountryItineraryPlan(
 
   logGenerationStage("both Gemini attempts failed validation — falling back to deterministic template");
 
+  // Round 9.4.1 §G — the exact question: does the fallback template
+  // receive a trip that STILL genuinely has real supply (meaning the
+  // composed/Gemini paths failed for reasons unrelated to real content,
+  // and fallback itself is what goes on to build a synthetic-heavy plan),
+  // or was real supply already gone by this point (meaning something
+  // upstream already destroyed it and fallback is just inheriting the
+  // damage)? Uses payload.recommendations (the supply) and
+  // preGenerationPoolsByStay (already computed earlier in this same
+  // call) — never a fresh discovery/pool rebuild just for this log.
+  if (isPlannerQaTraceEnabled()) {
+    const { realActivityRecommendations, realMealVenueRecommendations } = countRecommendationsByPlanningRole(normalizedPayload.recommendations);
+    let activityPoolCandidates = 0;
+    for (const pool of preGenerationPoolsByStay.values()) activityPoolCandidates += pool.candidates.length;
+    logRealPlaceQA("FallbackEntry", {
+      realActivities: realActivityRecommendations,
+      realMeals: realMealVenueRecommendations,
+      availableRecommendationCount: normalizedPayload.recommendations.length,
+      activityPoolCandidates,
+      reasonForFallback: "both Gemini attempts failed validation",
+    });
+  }
+
+  onProgress?.({ stage: "DAY_COMPOSITION", message: "בונים את תוכנית הימים", completedUnits: dayCount, totalUnits: dayCount });
   const fallback = repairPlan(
     toRawGeneratedPlan(buildFallbackAiItinerary(normalizedPayload)),
     normalizedPayload,
@@ -8061,7 +12701,45 @@ export async function generateCountryItineraryPlan(
     exchangeRateContext,
     arrivalDepartureWindow
   );
+  if (isPlannerQaTraceEnabled()) {
+    const fallbackSnapshot = snapshotDayItemsForRepairTrace(fallback.days, tripFrame);
+    const fallbackCounts = {
+      realActivities: fallbackSnapshot.filter((i) => i.kind === "real_activity").length,
+      realMeals: fallbackSnapshot.filter((i) => i.kind === "real_meal").length,
+      freeTime: fallbackSnapshot.filter((i) => i.kind === "synthetic_activity").length,
+      mealOpportunities: fallbackSnapshot.filter((i) => i.kind === "meal_opportunity").length,
+    };
+    logRealPlaceQA("FallbackOutput", fallbackCounts);
+  }
   const fallbackDiagnostics = collectPlanDiagnostics(fallback, profile, tripFrame, arrivalDepartureWindow, normalizedPayload.preferences.flights);
+  onProgress?.({ stage: "REPAIR_VALIDATION", message: "בודקים את המסלול ומתקנים התנגשויות" });
+
+  // Round 9.3.3 continuation §7 / Round 9.3.7 §E — checked UNCONDITIONALLY,
+  // never only as a side effect of the fallback template ALSO failing
+  // budget/duplicates/cross-city: a deterministic template built from an
+  // empty pool can be "clean" by every one of those measures (it has
+  // nothing real to violate them with) while still being a catastrophic,
+  // all-synthetic result of a genuine provider outage — that must never
+  // reach the caller disguised as a normal successful itinerary just
+  // because it happens not to also trip an unrelated diagnostic. Uses the
+  // SAME trip-level assessment as the early gate above (never "any single
+  // stay catastrophic") for consistency — a 1-of-7-stays provider failure
+  // reaching this fallback-of-last-resort for an UNRELATED reason (e.g. a
+  // genuine budget/duplicate problem) must still be diagnosed as THAT
+  // problem, not disguised as a trip-wide discovery catastrophe.
+  const fallbackStageTripHealth = assessTripDiscoveryHealth(
+    preGenerationPoolsByStay,
+    tripFrame,
+    normalizedPayload.preferences.startDate,
+    arrivalDepartureWindow
+  );
+  if (fallbackStageTripHealth.tripSupplyState === "CATASTROPHIC_PROVIDER_FAILURE") {
+    throw new RealPlaceDiscoveryUnavailableError(
+      "לא הצלחנו לאתר מקומות אמיתיים באזור אחד או יותר של הטיול בגלל תקלת ספק זמנית — לא בגלל מיעוט אמיתי של מקומות ביעד. כדאי לנסות שוב בעוד כמה דקות.",
+      fallbackStageTripHealth.stayFailures.filter((stay) => isCatastrophicallyDiscoveryUnavailable(stay))
+    );
+  }
+
   if (fallbackDiagnostics.outOfBudget || fallbackDiagnostics.duplicatePlaces > 0 || fallbackDiagnostics.crossCityDays > 0) {
     // The deterministic template is budget-driven by construction, so this
     // should be unreachable in practice — but per spec, a severely broken
@@ -8081,12 +12759,20 @@ export async function generateCountryItineraryPlan(
       failingDiagnostics: describeFailingDiagnostics(fallbackDiagnostics),
     });
 
+    // Round 9.1 §16/§17 — the decision between a genuine SUPPLY failure and
+    // a PLANNER/QUALITY failure, using the SAME pool diagnostics the
+    // failure summary below reports (never inferred from the HTTP status
+    // alone). Computed unconditionally (not just under the QA flag) since
+    // it decides WHICH error class is thrown further down.
+    const failureClassification = classifyPlanFailure(preGenerationPoolsByStay, fallbackDiagnostics);
+
     // Spec "FINAL FAILURE SUMMARY" — one compact block right before the
-    // PLAN_NOT_FEASIBLE/BUDGET_NOT_FEASIBLE throw, aggregating every trace
-    // signal this pass added so the NEXT real replay explains itself
-    // causally instead of only showing the final diagnostic counts.
-    // QA-gated like every other trace output in this pass — never runs in
-    // production, never changes which error is thrown.
+    // PLAN_NOT_FEASIBLE/BUDGET_NOT_FEASIBLE/INSUFFICIENT_REAL_ACTIVITY_SUPPLY
+    // throw, aggregating every trace signal this pass added so the NEXT
+    // real replay explains itself causally instead of only showing the
+    // final diagnostic counts. QA-gated like every other trace output in
+    // this pass — never runs in production, never changes which error is
+    // thrown (that decision is made above, unconditionally).
     if (isPlannerQaTraceEnabled()) {
       const identityCounts = new Map<string, number>();
       const identitySources = new Map<string, Set<string>>();
@@ -8143,14 +12829,31 @@ export async function generateCountryItineraryPlan(
         "[PlannerFailureSummary]",
         JSON.stringify(
           {
+            code: failureClassification.code,
+            primaryFailure: failureClassification.primaryFailure,
+            secondaryFailures: failureClassification.secondaryFailures,
+            elapsedMs: Date.now() - generationStartedAt,
+            stays: failureClassification.stayFailures.map((stay) => ({
+              stayId: stay.stayId,
+              owner: stay.owner,
+              requiredRealActivities: stay.requiredRealActivities,
+              desiredCandidates: stay.desiredCandidates,
+              legalCandidates: stay.legalCandidates,
+              providerRequests: stay.providerRequests,
+              providerFailures: stay.providerFailures,
+              scheduledRealActivities: null, // no finalized days exist at this failure point (both Gemini attempts + the fallback template all failed before finalization)
+              qualityFailure: stay.belowMinimum ? "supply" : null,
+            })),
+            duplicatePlaces: fallbackDiagnostics.duplicatePlaces,
+            illegalScheduledRealPlaces: geoSummary.illegalScheduledRealPlaces,
+            openingHoursViolations: fallbackDiagnostics.openingHoursViolations,
+            syntheticOnlyNormalDays: null, // quality validation runs post-finalization; unreachable at this failure point
             stage: "fallback-template",
             failingDiagnostics: describeFailingDiagnostics(fallbackDiagnostics),
-            duplicateCount: fallbackDiagnostics.duplicatePlaces,
             duplicateCanonicalIdentities,
             duplicateSources,
             ownerAnchorMissingDays: geoSummary.ownerGeometryMissingDays,
             realItemsWithNullLegGeometry: geoSummary.realItemsWithNullLegGeometry,
-            illegalScheduledRealPlaces: geoSummary.illegalScheduledRealPlaces,
             dayTypeMismatchDays,
             legalPoolExhaustionCount,
             legalPoolExhaustionReasons,
@@ -8162,8 +12865,39 @@ export async function generateCountryItineraryPlan(
       );
     }
 
+    if (failureClassification.code === "REAL_PLACE_DISCOVERY_UNAVAILABLE") {
+      throw new RealPlaceDiscoveryUnavailableError(
+        "לא הצלחנו לאתר מקומות אמיתיים באזור אחד או יותר של הטיול בגלל תקלת ספק זמנית — לא בגלל מיעוט אמיתי של מקומות ביעד. כדאי לנסות שוב בעוד כמה דקות.",
+        failureClassification.stayFailures
+      );
+    }
+    if (failureClassification.code === "INSUFFICIENT_REAL_ACTIVITY_SUPPLY") {
+      throw new InsufficientRealActivitySupplyError(
+        "הספק האמיתי של פעילויות באזור אחד או יותר של הטיול היה נמוך מדי כדי לבנות מסלול שימושי, גם אחרי ניסיון השלמה.",
+        failureClassification.stayFailures
+      );
+    }
+    // Round 9.4.3 §J — the same "do not return generic PLAN_NOT_FEASIBLE
+    // when exact real-place duplicate identity is known" rule as
+    // repairPlan's own firewall, applied here too since `fallback` was
+    // already fully repaired (including resolveExactIdDuplicates every
+    // attempt) and repairPlan's own internal firewall would already have
+    // thrown a precise error if it detected a survivor — this is a second,
+    // independent computation directly off `fallback.days` in case that
+    // internal firewall's own duplicate view (built from `repairedDays`
+    // mid-loop) ever diverges from `fallbackDiagnostics.duplicatePlaces`
+    // (built from the fully finalized `fallback`).
+    if (fallbackDiagnostics.duplicatePlaces > 0) {
+      const duplicates = computeRealPlaceDuplicateGroups(fallback.days, tripFrame);
+      if (duplicates.length > 0) {
+        throw new RealPlaceDuplicatesRemainError(
+          `${duplicates.length} real place(s) are scheduled more than once across the itinerary: ${duplicates.map((group) => group.name).join(", ")}.`,
+          { duplicateCount: duplicates.length, duplicates }
+        );
+      }
+    }
     throw new ItineraryGenerationInfeasibleError(
-      fallbackDiagnostics.outOfBudget ? "BUDGET_NOT_FEASIBLE" : "PLAN_NOT_FEASIBLE",
+      failureClassification.code === "BUDGET_NOT_FEASIBLE" ? "BUDGET_NOT_FEASIBLE" : "PLAN_NOT_FEASIBLE",
       fallbackDiagnostics.outOfBudget
         ? "לא הצלחנו לבנות מסלול בטווח התקציב שהוגדר, גם אחרי תיקון אוטומטי."
         : fallbackDiagnostics.duplicatePlaces > 0

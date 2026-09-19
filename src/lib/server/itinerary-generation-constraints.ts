@@ -14,8 +14,10 @@ import {
   isFuzzyDuplicatePlace,
   normalizePlaceNameSlug,
   deriveDailyCapacityMinutes,
+  isMealOpportunityMarker,
   type FuzzyPlaceRecord,
 } from "../trip-workspace";
+import { classifyActivity, determinePlanningRole } from "./activity-taxonomy";
 import {
   violatesArrivalDepartureWindow,
   detectInvalidFlightLegs,
@@ -25,7 +27,13 @@ import {
   type AirportBaseMismatchDiagnostic,
 } from "../flight-planning";
 import type { TripFlights } from "@/lib/trip-workspace";
-import { violatesOpeningHours } from "./opening-hours";
+import {
+  parseOpeningHours,
+  evaluateOpeningHoursLegality,
+  isKnownHoursViolation,
+  parseOpeningHoursWindow,
+  resolveLastEntryMinutes,
+} from "./opening-hours";
 import { isPlannerQaTraceEnabled, buildDuplicateTraceReports, formatDuplicateTraceReport } from "@/lib/planner-qa-trace";
 import { findFixedTimeConflicts, type FixedTimeConflict } from "./itinerary-scheduler";
 import { isImplausiblyFastTravelTime, resolveTransportModeFromLabel } from "../transport-mode";
@@ -1668,6 +1676,34 @@ function countArrivalDepartureWindowViolations(
   return violations;
 }
 
+/**
+ * Round 7 — interval + weekday aware opening-hours check for the attempt-loop
+ * acceptance gate (`openingHoursViolations`). Judges the whole activity
+ * interval `[start … start + effectiveDuration]` against the structured
+ * opening intervals for `dayDate`'s local weekday. Unknown/garbled hours
+ * are never a violation. Mirrors the pure final validator's own check so
+ * the loop drives toward the same definition of "legal" the final gate
+ * enforces.
+ */
+function itemViolatesOpeningHoursOnDay(item: AiGeneratedItem, dayDate: string): boolean {
+  const parsed = parseOpeningHours(item.openingHours);
+  if (parsed.kind === "unknown") return false;
+  const startMatch = /^(\d{1,2}):(\d{2})/.exec((item.plannedStartTime ?? "").trim());
+  if (!startMatch) return false;
+  const startMinutes = Number(startMatch[1]) * 60 + Number(startMatch[2]);
+  if (Number.isNaN(startMinutes)) return false;
+  const legacyWindow = parseOpeningHoursWindow(item.openingHours);
+  const lastEntry = legacyWindow ? resolveLastEntryMinutes(item, legacyWindow) : null;
+  const { status } = evaluateOpeningHoursLegality({
+    localDate: dayDate,
+    startMinutes,
+    durationMinutes: resolveVisitDurationMinutes(item, classifyVisitScale(item)),
+    parsed,
+    lastEntryMinutes: lastEntry != null && legacyWindow && lastEntry < legacyWindow.closesMinutes ? lastEntry : null,
+  });
+  return isKnownHoursViolation(status);
+}
+
 export function collectPlanDiagnostics(
   plan: AiItineraryResponse,
   profile: TripPreferenceProfile,
@@ -2001,7 +2037,7 @@ export function collectPlanDiagnostics(
         avoidConflicts += 1;
       }
 
-      if (violatesOpeningHours(item)) {
+      if (itemViolatesOpeningHoursOnDay(item, day.date)) {
         openingHoursViolations += 1;
       }
 
@@ -2162,26 +2198,77 @@ function countUniqueRegions(days: AiGeneratedDay[]) {
   ).size;
 }
 
-function countActivities(days: AiGeneratedDay[]) {
-  return days.reduce(
-    (sum, day) =>
-      sum +
-      day.items.filter(
-        (item) => item.category !== "restaurant" && item.category !== "cafe"
-      ).length,
-    0
-  );
+/**
+ * Round 9.3.3 continuation §5 — "FIX TRUTHFUL SUMMARY METRICS": the
+ * previous countActivities/countFoodStops counted ANY non-food/food
+ * category respectively, with no regard for whether the item was a real
+ * scheduled place or a synthetic filler — a FreeTime replacement item
+ * KEEPS its original real-looking category (buildFreeExplorationReplacement
+ * never changes it except for museum/transportation), and a
+ * MealOpportunity placeholder always uses category "restaurant"/"cafe"
+ * (buildFallbackMealPlaceholder) — so both were silently counted as if
+ * real, inflating the user-facing summary (and every reader of it, e.g.
+ * the PDF export) with synthetic content presented as real. This uses the
+ * SAME structural signal already established everywhere else in the
+ * codebase (isMealOpportunityMarker's own real/synthetic distinction —
+ * category + missing coordinates + missing recommendationId — combined
+ * with the itemRole tag every synthetic item is built with) plus the
+ * shared activity-taxonomy classifier to split a real item into a genuine
+ * meal venue vs. a food-experience activity vs. an ordinary activity.
+ */
+export interface TruthfulScheduleMetrics {
+  /** Real, scheduled, non-meal-venue activities — INCLUDES food-experience activities (matches the existing minimumMeaningfulRealActivities/isMeaningfulRealActivity convention elsewhere in generation), reported separately below too. */
+  meaningfulRealActivities: number;
+  /** The subset of meaningfulRealActivities that are specifically a real food EXPERIENCE (tour/class/tasting), never an ordinary restaurant/cafe. */
+  foodExperienceActivities: number;
+  /** A synthetic FreeTime filler — never counted as a real activity. */
+  syntheticFreeTimeBlocks: number;
+  /** A real, named restaurant/cafe the user can actually go to. */
+  realNamedMealVenues: number;
+  /** A synthetic "recommended meal time" placeholder — never counted as a real meal venue. */
+  syntheticMealOpportunities: number;
+  /** Every scheduled item, real or synthetic — useful as an honest total, never presented as "X real things to do". */
+  totalScheduleBlocks: number;
 }
 
-function countFoodStops(days: AiGeneratedDay[]) {
-  return days.reduce(
-    (sum, day) =>
-      sum +
-      day.items.filter(
-        (item) => item.category === "restaurant" || item.category === "cafe"
-      ).length,
-    0
-  );
+export function computeTruthfulScheduleMetrics(days: AiGeneratedDay[]): TruthfulScheduleMetrics {
+  const metrics: TruthfulScheduleMetrics = {
+    meaningfulRealActivities: 0,
+    foodExperienceActivities: 0,
+    syntheticFreeTimeBlocks: 0,
+    realNamedMealVenues: 0,
+    syntheticMealOpportunities: 0,
+    totalScheduleBlocks: 0,
+  };
+  for (const day of days) {
+    for (const item of day.items) {
+      metrics.totalScheduleBlocks += 1;
+      if (item.itemRole === "meal_opportunity" || isMealOpportunityMarker(item)) {
+        metrics.syntheticMealOpportunities += 1;
+        continue;
+      }
+      if (item.itemRole === "free_time") {
+        metrics.syntheticFreeTimeBlocks += 1;
+        continue;
+      }
+      if (item.category === "transportation" || item.category === "practical" || item.category === "hotel") continue;
+      const classification = classifyActivity({
+        category: item.category,
+        name: item.name,
+        shortDescription: item.shortDescription,
+        reservationRequired: item.reservationRequired,
+        approximatePrice: item.approximatePrice,
+      });
+      const role = determinePlanningRole(item.category, classification);
+      if (role === "MEAL_VENUE") {
+        metrics.realNamedMealVenues += 1;
+      } else {
+        metrics.meaningfulRealActivities += 1;
+        if (classification.subtype === "food_experience") metrics.foodExperienceActivities += 1;
+      }
+    }
+  }
+  return metrics;
 }
 
 function countDayTrips(days: AiGeneratedDay[]) {
@@ -2215,7 +2302,8 @@ export function buildGenerationSummary(
         ? `בסך מוערך של ₪${totalCost}`
         : "עם אומדן עלות מתוקן";
 
-  return `נוצר מסלול של ${plan.days.length} ימים ${withinBudgetLabel}, עם ${countUniqueRegions(plan.days)} אזורים, ${countActivities(plan.days)} פעילויות, ${countFoodStops(plan.days)} עצירות אוכל, ${countDayTrips(plan.days)} טיולי יום ו-${countLighterDays(plan.days, profile)} ימים קלים יותר.`;
+  const truthful = computeTruthfulScheduleMetrics(plan.days);
+  return `נוצר מסלול של ${plan.days.length} ימים ${withinBudgetLabel}, עם ${countUniqueRegions(plan.days)} אזורים, ${truthful.meaningfulRealActivities} פעילויות, ${truthful.realNamedMealVenues} עצירות אוכל, ${countDayTrips(plan.days)} טיולי יום ו-${countLighterDays(plan.days, profile)} ימים קלים יותר.`;
 }
 
 export function getBudgetCapForItem(

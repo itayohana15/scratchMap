@@ -13,6 +13,7 @@ import type {
   CountryTripWorkspaceState,
   DayOptimizeMode,
 } from "@/lib/trip-workspace";
+import type { GenerationProgressEvent, GenerationProgressReporter } from "@/lib/server/generation-progress";
 
 // Matches `tripHubKeys.all` from "@/lib/queries/trip-hub" — inlined as a
 // literal (rather than imported) since that module already imports
@@ -45,16 +46,28 @@ function upsertItineraryList(
 
 /** Carries the full parsed error body (status/code/message/any extra fields) so callers can log or branch on it, not just the human-readable message. */
 export class ApiRequestError extends Error {
+  /** The APPLICATION-level status this error represents (e.g. 422/500 from a streamed generation error frame) — NOT necessarily the real HTTP transport status; see `httpStatus`. */
   status: number;
   code?: string;
   body: unknown;
+  /**
+   * Round 9.3.5 §18 — the REAL wire-level HTTP status of the response.
+   * For a plain (non-streamed) request this always equals `status`. For a
+   * streamed generation response, headers commit to 200 before the
+   * application-level outcome is known (see readGenerationStream), so a
+   * failed generation can carry `httpStatus: 200` alongside a real
+   * `status`/`code` describing the APPLICATION failure — these are never
+   * the same thing and must never be logged as if they were.
+   */
+  httpStatus: number;
 
-  constructor(message: string, status: number, code: string | undefined, body: unknown) {
+  constructor(message: string, status: number, code: string | undefined, body: unknown, httpStatus?: number) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
     this.code = code;
     this.body = body;
+    this.httpStatus = httpStatus ?? status;
   }
 }
 
@@ -117,11 +130,83 @@ export function useCountryItineraryVersions(
   });
 }
 
+/**
+ * Round 9.3.3 §22 — the generation endpoint's response body is NDJSON: zero
+ * or more `{"type":"progress",...}` lines (real server stage completions,
+ * as they genuinely happen), followed by exactly one final
+ * `{"type":"result",...}` or `{"type":"error",...}` line. This reads that
+ * stream incrementally (no polling — the browser delivers chunks as they
+ * arrive) and never buffers/replays a stream for any OTHER call to this
+ * function, so one generation's events can't reach another's caller.
+ */
+export async function readGenerationStream(
+  response: Response,
+  onProgress?: GenerationProgressReporter
+): Promise<GenerateCountryItineraryResult> {
+  // A non-200 response is one of the route's EARLY, pre-generation
+  // validation failures (bad payload/country not found/flight mismatch) —
+  // those are still a single plain JSON error body, never the NDJSON
+  // stream, since generation itself never started. Only a 200 response
+  // means generateAndStoreCountryItinerary actually ran and streamed.
+  if (!response.ok || !response.body) {
+    return parseJson<GenerateCountryItineraryResult>(response);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: GenerateCountryItineraryResult | null = null;
+  let errorFrame: { status: number; code?: string; message: string; details?: unknown } | null = null;
+
+  function handleLine(line: string) {
+    if (!line.trim()) return;
+    const frame = JSON.parse(line) as
+      | { type: "progress"; event: GenerationProgressEvent }
+      | { type: "result"; data: GenerateCountryItineraryResult }
+      | { type: "error"; status: number; code?: string; message: string; details?: unknown };
+    if (frame.type === "progress") {
+      onProgress?.(frame.event);
+    } else if (frame.type === "result") {
+      result = frame.data;
+    } else {
+      errorFrame = { status: frame.status, code: frame.code, message: frame.message, details: frame.details };
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) handleLine(line);
+  }
+  if (buffer.trim()) handleLine(buffer);
+
+  if (errorFrame) {
+    const frame: { status: number; code?: string; message: string; details?: unknown } = errorFrame;
+    // Round 9.3.5 §18 — `response.status` (the real wire-level HTTP status,
+    // 200 here — headers were already committed before this application-
+    // level error was even known) is deliberately passed as `httpStatus`,
+    // kept distinct from `frame.status` (the APPLICATION status the server
+    // decided this generation failure represents, e.g. 422/500). Callers
+    // must never conflate the two.
+    throw new ApiRequestError(frame.message, frame.status, frame.code, frame.details, response.status);
+  }
+  if (!result) {
+    throw new ApiRequestError("Generation stream ended without a result", 500, "GENERATION_FAILED", null);
+  }
+  return result;
+}
+
 export function useGenerateCountryItinerary(iso: string) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async ({ signal, ...payload }: AiItineraryRequest & { signal?: AbortSignal }) => {
+    mutationFn: async ({
+      signal,
+      onProgress,
+      ...payload
+    }: AiItineraryRequest & { signal?: AbortSignal; onProgress?: GenerationProgressReporter }) => {
       if (isClientDebugEnabled()) {
         console.log("[Itinerary] request payload", {
           isoA2: iso.toUpperCase(),
@@ -139,15 +224,13 @@ export function useGenerateCountryItinerary(iso: string) {
           selectedPlacesCount: payload.selectedPlaces.length,
         });
       }
-      const data = await parseJson<GenerateCountryItineraryResult>(
-        await fetch(`/api/countries/${iso.toLowerCase()}/itineraries`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-          signal,
-        })
-      );
-      return data;
+      const response = await fetch(`/api/countries/${iso.toLowerCase()}/itineraries`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal,
+      });
+      return readGenerationStream(response, onProgress);
     },
     // A 422 (or any 4xx) is a client/business-validation rejection, not a
     // transient failure — retrying the identical payload would just fail
@@ -156,7 +239,11 @@ export function useGenerateCountryItinerary(iso: string) {
     onError: (error) => {
       if (process.env.NODE_ENV === "production") return;
       if (error instanceof ApiRequestError) {
-        console.error(`[Itinerary ${error.status}]`, { code: error.code, body: error.body });
+        // Round 9.3.5 §18 — never label this with a fabricated HTTP status:
+        // a streamed generation failure genuinely has httpStatus 200 (the
+        // transport succeeded) alongside an application-level status/code
+        // describing what actually went wrong. Both are logged, distinctly.
+        console.error("[Itinerary generation error]", { httpStatus: error.httpStatus, status: error.status, code: error.code, body: error.body });
       } else {
         console.error("[Itinerary] request failed", error);
       }

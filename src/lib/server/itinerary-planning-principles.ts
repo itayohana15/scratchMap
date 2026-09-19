@@ -136,6 +136,21 @@ export interface TripFramePhase {
   startDayNumber: number;
   endDayNumber: number;
   intent: "city" | "nature" | "coast" | "historic" | "mixed";
+  /**
+   * Round 9.3.1 — the AUTHORITATIVE resolved coordinates for this stay when
+   * known directly (the stay-skeleton's own real geocoded lat/lon, spec
+   * Round 9.3 §6). A real bug found via this round's own live replay:
+   * without this, every anchor-dependent consumer (refillTripRecommendationPool's
+   * per-stay Overpass discovery chief among them) fell back to
+   * computeAreaAnchors(payload), which derives an anchor ONLY from
+   * payload.recommendations/selectedPlaces coordinates — always empty for
+   * a skeleton-driven trip (zero candidates exist before discovery ever
+   * runs), so refill's own anchor was silently null and Overpass was never
+   * even queried. Optional so every pre-9.3.1 caller (the POI-clustering
+   * path, which never set this) is unaffected — those still resolve their
+   * anchor via computeAreaAnchors exactly as before.
+   */
+  anchor?: { lat: number; lon: number } | null;
 }
 
 /**

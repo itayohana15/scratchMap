@@ -57,6 +57,15 @@
     "src/lib/provider-status.ts",
     "src/lib/stay-routing.ts",
     "src/lib/server/route-optimization.ts",
+    "src/lib/server/activity-taxonomy.ts",
+    "src/lib/server/stay-activity-pool.ts",
+    "src/lib/server/meal-cuisine-taxonomy.ts",
+    "src/lib/server/stay-meal-venue-pool.ts",
+    "src/lib/server/trip-stay-skeleton.ts",
+    "src/lib/server/generation-progress.ts",
+    "src/lib/queries/country-itineraries.ts",
+    "src/lib/places/nominatim.ts",
+    "src/lib/city-normalization.ts",
     "scripts/qa-generate-trip.ts",
     "tests/next-fetch-shim.d.ts",
     "tests/itinerary-generation-constraints.test.ts",
@@ -99,7 +108,14 @@
     "tests/fixture-capture.test.ts",
     "tests/client-debug.test.ts",
     "tests/route-sequencing.test.ts",
-    "tests/scheduled-place-legality.test.ts"
+    "tests/scheduled-place-legality.test.ts",
+    "tests/activity-taxonomy.test.ts",
+    "tests/stay-activity-pool.test.ts",
+    "tests/meal-cuisine-taxonomy.test.ts",
+    "tests/stay-meal-venue-pool.test.ts",
+    "tests/trip-stay-skeleton.test.ts",
+    "tests/generation-progress.test.ts",
+    "tests/generation-stream.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }

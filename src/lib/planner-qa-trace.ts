@@ -47,6 +47,7 @@ export type PlaceInsertionSource =
   | "meal_repair"
   | "day_fill"
   | "transfer_repair"
+  | "quality_backfill"
   | "other_existing_path";
 
 export type SyntheticInsertionSource = "free_time" | "meal_opportunity" | "practical_block";

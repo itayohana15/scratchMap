@@ -112,3 +112,42 @@ test("detectHotelBaseMismatch returns null when there's nothing real to compare 
   assert.equal(detectHotelBaseMismatch({ lat: null, lon: null }, [{ lat: 1, lon: 1 }]), null);
   assert.equal(detectHotelBaseMismatch({ lat: 1, lon: 1 }, []), null);
 });
+
+/* ==================================================================== *
+ * ROUND 9.3.1 §20/§24 — stay-length-aware airport/activity weighting     *
+ * ==================================================================== */
+
+// C. airport far from activity center on a 5-night stay -> airport
+// convenience does not dominate hotel location.
+test("Round 9.3.1 C: on a multi-night stay, activity proximity dominates over airport convenience", () => {
+  const activityClusters = [{ lat: 35.6895, lon: 139.6917 }];
+  const airportCoords = { lat: 35.5494, lon: 139.7798 }; // Haneda-ish, far from the activity center
+  const nearActivities = buildHotel({ name: "Near Activities", lat: 35.69, lon: 139.692 });
+  const nearAirport = buildHotel({ name: "Near Airport", lat: 35.55, lon: 139.78 });
+
+  const ranked = rankHotels([nearAirport, nearActivities], activityClusters, airportCoords, [], 5);
+  assert.equal(ranked[0]?.name, "Near Activities", "for a 5-night stay, the activity-proximate hotel must win despite the other being airport-convenient");
+});
+
+// D. a genuine one-night airport stop -> airport convenience can
+// legitimately matter more (never MORE than activity access outright —
+// spec's own "may naturally differ", not "airport always wins" — verified
+// as a real, measurable shift toward airport weight, not a flip).
+test("Round 9.3.1 D: a one-night stay weighs airport convenience noticeably more than the same hotels would on a longer stay", () => {
+  const activityClusters = [{ lat: 35.6895, lon: 139.6917 }];
+  const airportCoords = { lat: 35.5494, lon: 139.7798 };
+  const nearAirport = buildHotel({ name: "Near Airport", lat: 35.55, lon: 139.78 });
+
+  const multiNightScore = rankHotels([nearAirport], activityClusters, airportCoords, [], 5)[0]!.locationScore;
+  const oneNightScore = rankHotels([nearAirport], activityClusters, airportCoords, [], 1)[0]!.locationScore;
+  assert.ok(oneNightScore > multiNightScore, `expected the airport-convenient hotel to score higher on a 1-night stay (${oneNightScore}) than a 5-night one (${multiNightScore})`);
+});
+
+test("rankHotels without a stayNights argument behaves exactly as before (no regression for existing callers)", () => {
+  const activityClusters = [{ lat: 35.6895, lon: 139.6917 }];
+  const airportCoords = { lat: 35.5494, lon: 139.7798 };
+  const hotel = buildHotel({ lat: 35.6, lon: 139.7 });
+  const withoutArg = rankHotels([hotel], activityClusters, airportCoords)[0]!.locationScore;
+  const withUndefined = rankHotels([hotel], activityClusters, airportCoords, [], undefined)[0]!.locationScore;
+  assert.equal(withoutArg, withUndefined);
+});

@@ -19,6 +19,7 @@ import {
   buildMapLink,
   DAY_PART_LABELS,
   haversineKm,
+  shouldResolveAsRealPlace,
   type TripItineraryDay,
   type TripItineraryItem,
 } from "@/lib/trip-workspace";
@@ -350,6 +351,13 @@ function buildPendingDayTargets(day: TripItineraryDay) {
 
   for (const item of day.items) {
     if (item.lat != null && item.lon != null) continue;
+    // Round 9.3.3 — a synthetic item (FreeTime/MealOpportunity/transit/
+    // practical placeholder) has no real place behind its display text;
+    // sending that text to the place resolver just geocodes a random
+    // match for a phrase like "discover local corners" and reports it as
+    // a resolved location. Gated structurally (recommendationId/category),
+    // never by matching the display text itself.
+    if (!shouldResolveAsRealPlace(item)) continue;
     const query = trimToQuery([item.name, item.location, day.cityRegion]);
     if (!query) continue;
     targets.push({

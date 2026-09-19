@@ -16,7 +16,17 @@ import {
   applyDeterministicReplacement,
   generateCountryItineraryPlan,
   ItineraryGenerationInfeasibleError,
+  InsufficientRealActivitySupplyError,
+  InsufficientRealActivityCoverageError,
+  RealPlaceDiscoveryUnavailableError,
 } from "@/lib/server/country-itinerary-generation";
+import {
+  beginRealPlaceTrace,
+  endRealPlaceTrace,
+  generateRealPlaceTraceId,
+  logRealPlaceQACompact,
+} from "@/lib/server/real-place-qa";
+import type { GenerationProgressReporter } from "@/lib/server/generation-progress";
 import { buildTripPreferenceProfile } from "@/lib/server/itinerary-generation-constraints";
 import {
   mergeLiveReplanResult,
@@ -30,8 +40,11 @@ import {
   createDefaultWorkspace,
   createId,
   estimateTravelMinutes,
+  getTripDayCount,
+  isMealOpportunityMarker,
   normalizeWorkspace,
   optimizeDayItemOrder,
+  shouldResolveAsRealPlace,
   type AiItineraryRequest,
   type CountryTripWorkspaceState,
   type DayOptimizeMode,
@@ -342,7 +355,23 @@ async function runGenerationStage<T>(
     devLog(`${stage}: complete`, details);
     return value;
   } catch (error) {
-    if (error instanceof ItineraryGenerationInfeasibleError || error instanceof ItineraryGenerationPipelineError) {
+    if (
+      error instanceof ItineraryGenerationInfeasibleError ||
+      error instanceof ItineraryGenerationPipelineError ||
+      error instanceof InsufficientRealActivitySupplyError ||
+      // Round 9.3.5 §17 — these two were missing from this list: without
+      // this, BOTH got silently re-wrapped into a generic
+      // ItineraryGenerationPipelineError("itinerary AI request", message)
+      // right here, losing their own typed code AND rich diagnostics
+      // (InsufficientRealActivityCoverageError's per-stay breakdown,
+      // RealPlaceDiscoveryUnavailableError's stayFailures) before either
+      // ever reached the API route's dedicated handling for them — the
+      // exact "GENERATION_FAILED / stage: itinerary AI request" shape this
+      // round's own production evidence showed for what was actually a
+      // coverage failure.
+      error instanceof InsufficientRealActivityCoverageError ||
+      error instanceof RealPlaceDiscoveryUnavailableError
+    ) {
       throw error;
     }
     const message = error instanceof Error ? error.message : "Unknown generation failure";
@@ -355,7 +384,9 @@ export async function generateAndStoreCountryItinerary(
   supabase: DbClient,
   country: Tables<"countries">,
   payload: AiItineraryRequest,
-  guide: CountryAiRecommendation | null
+  guide: CountryAiRecommendation | null,
+  /** Round 9.3.3 §22 — purely observational; see generateCountryItineraryPlan's own onProgress doc. */
+  onProgress?: GenerationProgressReporter
 ) {
   // Duplicate-generation protection (E7): checked before doing any AI work
   // at all, so a repeat request with the same wizard-minted id never
@@ -369,17 +400,110 @@ export async function generateAndStoreCountryItinerary(
         clientRequestId: payload.clientRequestId,
         itineraryId: existing.id,
       });
+      onProgress?.({ stage: "FINALIZATION", message: "עושים בדיקות אחרונות" });
       return existing;
     }
   }
 
-  const personalizationSummary = await loadPersonalizationSummary(supabase);
-  devLog("profile loaded", { hasPersonalizationSummary: personalizationSummary != null });
-  const generated = await runGenerationStage("itinerary AI request", () =>
-    generateCountryItineraryPlan({ ...payload, personalizationSummary }, guide),
-    { isoA2: country.iso_a2 }
-  );
-  devLog("AI generation complete", { days: generated.days.length, usedFallback: generated.usedFallback });
+  // Round 9.4 §A — ONE generation-scoped traceId, created at the real
+  // itinerary API entry point (this function is what the route handler
+  // calls into to actually produce and persist a trip), so every
+  // RealPlaceQA log this generation emits anywhere in the pipeline
+  // (country-itinerary-generation.ts, stay-activity-pool.ts,
+  // stay-meal-venue-pool.ts) can be correlated by grepping one string.
+  // Never active unless the existing QA/debug flag is already on (spec
+  // §S.3) — a module-level context, not a new function parameter, so it
+  // requires no signature change anywhere else in the pipeline.
+  const realPlaceTraceId = generateRealPlaceTraceId();
+  beginRealPlaceTrace({
+    traceId: realPlaceTraceId,
+    countryIso: country.iso_a2,
+    tripDays: getTripDayCount(payload.preferences.startDate, payload.preferences.endDate),
+    travelerCount: payload.preferences.travelers,
+  });
+
+  try {
+    const personalizationSummary = await loadPersonalizationSummary(supabase);
+    devLog("profile loaded", { hasPersonalizationSummary: personalizationSummary != null });
+    let generated: Awaited<ReturnType<typeof generateCountryItineraryPlan>>;
+    try {
+      generated = await runGenerationStage("itinerary AI request", () =>
+        generateCountryItineraryPlan({ ...payload, personalizationSummary }, guide, onProgress),
+        { isoA2: country.iso_a2 }
+      );
+    } catch (error) {
+      // Round 9.4 §Q — a compact, self-contained failure record: another
+      // REAL_PLACE_DISCOVERY_UNAVAILABLE (or any other typed generation
+      // failure) must be diagnosable from ONE log line, using whatever
+      // per-stay diagnostics the thrown error itself already carries
+      // (never fabricated here) — no opening twenty unrelated logs.
+      const stayFailures =
+        error instanceof RealPlaceDiscoveryUnavailableError || error instanceof InsufficientRealActivitySupplyError
+          ? error.stayFailures
+          : error instanceof InsufficientRealActivityCoverageError
+            ? error.diagnostics.stays
+            : undefined;
+      logRealPlaceQACompact("GenerationFailure", {
+        errorCode: error instanceof Error && "code" in error ? (error as { code: unknown }).code : undefined,
+        errorName: error instanceof Error ? error.name : typeof error,
+        stage: "itinerary AI request",
+        perStay: stayFailures,
+      });
+      throw error;
+    }
+    devLog("AI generation complete", { days: generated.days.length, usedFallback: generated.usedFallback });
+    return await finishStoringGeneratedItinerary(supabase, country, payload, generated, onProgress);
+  } finally {
+    endRealPlaceTrace();
+  }
+}
+
+/**
+ * Round 9.4 §O/§P — one shared, reused count summary for both
+ * PersistenceBoundary (pre-write) and PersistedResult (post-write, read
+ * back from the SAME `.insert().select().single()` this code path already
+ * performs — never an extra DB request added solely for logging, spec §S.9).
+ * Reuses the SAME structural real-vs-synthetic signals
+ * (shouldResolveAsRealPlace/isMealOpportunityMarker) trip-workspace.ts
+ * already exports for this exact purpose elsewhere in the codebase, never
+ * a second, drifting definition of "real."
+ */
+function summarizeRealPlaceCounts(days: Pick<TripItineraryDay, "items">[]) {
+  let realActivities = 0;
+  let realMeals = 0;
+  let freeTime = 0;
+  let mealOpportunities = 0;
+  const realActivityIds: string[] = [];
+  const realActivityNames: string[] = [];
+  for (const day of days) {
+    for (const item of day.items) {
+      if (shouldResolveAsRealPlace(item)) {
+        if (item.category === "restaurant" || item.category === "cafe") {
+          realMeals += 1;
+        } else {
+          realActivities += 1;
+          if (item.recommendationId) realActivityIds.push(item.recommendationId);
+          realActivityNames.push(item.name);
+        }
+        continue;
+      }
+      if (isMealOpportunityMarker(item)) {
+        mealOpportunities += 1;
+        continue;
+      }
+      if (item.category !== "transportation" && item.category !== "hotel") freeTime += 1;
+    }
+  }
+  return { realActivities, realMeals, freeTime, mealOpportunities, realActivityIds, realActivityNames };
+}
+
+async function finishStoringGeneratedItinerary(
+  supabase: DbClient,
+  country: Tables<"countries">,
+  payload: AiItineraryRequest,
+  generated: Awaited<ReturnType<typeof generateCountryItineraryPlan>>,
+  onProgress?: GenerationProgressReporter
+) {
   const initialWorkspace = buildInitialWorkspace(country.name, payload);
   const generatedWorkspaceRaw = applyAiPlanToWorkspace(initialWorkspace, generated);
   // Normalize before aggregation (spec §A2): merge "Tbilisi"/"טביליסי"-style
@@ -411,6 +535,20 @@ export async function generateAndStoreCountryItinerary(
   );
 
   devLog("database save started");
+  // Round 9.4 §O — rules out "planner has real places but the API/DB/
+  // client loses them" as a distinct failure mode from "the planner never
+  // had them" (Phase 0 for that question, not a fix): the exact days about
+  // to be persisted, counted the same way FinalResult below counts them.
+  const persistenceBoundaryCounts = summarizeRealPlaceCounts(generatedWorkspace.itineraryDays);
+  logRealPlaceQACompact("PersistenceBoundary", {
+    days: generatedWorkspace.itineraryDays.length,
+    realActivities: persistenceBoundaryCounts.realActivities,
+    realMeals: persistenceBoundaryCounts.realMeals,
+    freeTime: persistenceBoundaryCounts.freeTime,
+    mealOpportunities: persistenceBoundaryCounts.mealOpportunities,
+    realActivityIdSample: persistenceBoundaryCounts.realActivityIds.slice(0, 10),
+    realActivityNameSample: persistenceBoundaryCounts.realActivityNames.slice(0, 10),
+  });
   const { data, error } = await runGenerationStage("DB save", async () =>
     await supabase.from("country_itineraries").insert({
       country_id: country.id,
@@ -445,6 +583,7 @@ export async function generateAndStoreCountryItinerary(
       const winner = await findCountryItineraryByClientRequestId(supabase, payload.clientRequestId);
       if (winner) {
         devLog("duplicate insert race — returning the winning itinerary", { itineraryId: winner.id });
+        onProgress?.({ stage: "FINALIZATION", message: "עושים בדיקות אחרונות" });
         return winner;
       }
     }
@@ -454,9 +593,49 @@ export async function generateAndStoreCountryItinerary(
   }
 
   const itinerary = normalizeCountryItineraryRow(data);
+  // Round 9.4 §O — read back from the SAME row `.select("*").single()`
+  // already returned (no extra DB request), counted identically to
+  // PersistenceBoundary above: if these two disagree, the write path
+  // itself is where content is lost; if they match but FinalResult below
+  // still shows zero, the planner never had it to begin with.
+  const persistedCounts = summarizeRealPlaceCounts(itinerary.itineraryDays);
+  logRealPlaceQACompact("PersistedResult", {
+    itineraryId: itinerary.id,
+    days: itinerary.itineraryDays.length,
+    realActivities: persistedCounts.realActivities,
+    realMeals: persistedCounts.realMeals,
+    freeTime: persistedCounts.freeTime,
+    mealOpportunities: persistedCounts.mealOpportunities,
+  });
   await runGenerationStage("DB save", () => insertVersion(supabase, itinerary, "ai", "initial generation"), {
     itineraryId: itinerary.id,
   });
+
+  // Round 9.4 §P — the trip-wide analogue of the per-stay FinalResult log
+  // generateCountryItineraryPlan emits from inside the pipeline (where
+  // pool/portfolio sizes are in scope): this is the LAST-mile, persisted-
+  // truth check, so a successful response is never silently zero-content
+  // without a loud signal.
+  const zeroRealActivityDays = itinerary.itineraryDays.filter(
+    (day) => !day.items.some((item) => shouldResolveAsRealPlace(item) && item.category !== "restaurant" && item.category !== "cafe")
+  ).length;
+  logRealPlaceQACompact("FinalResult", {
+    totalDays: itinerary.itineraryDays.length,
+    realActivities: persistedCounts.realActivities,
+    uniqueRealActivities: new Set(persistedCounts.realActivityIds).size,
+    realMeals: persistedCounts.realMeals,
+    freeTimeBlocks: persistedCounts.freeTime,
+    mealOpportunities: persistedCounts.mealOpportunities,
+    zeroRealActivityDays,
+  });
+  if (persistedCounts.realActivities === 0) {
+    logRealPlaceQACompact("ZERO_REAL_ACTIVITY_SUCCESS", { itineraryId: itinerary.id, days: itinerary.itineraryDays.length });
+  }
+  if (persistedCounts.realMeals === 0) {
+    logRealPlaceQACompact("ZERO_REAL_MEAL_SUCCESS", { itineraryId: itinerary.id, days: itinerary.itineraryDays.length });
+  }
+
+  onProgress?.({ stage: "FINALIZATION", message: "עושים בדיקות אחרונות" });
   return itinerary;
 }
 

@@ -5,6 +5,7 @@ import {
   analyzeDayGeography,
   buildBudgetAllocation,
   buildGenerationSummary,
+  computeTruthfulScheduleMetrics,
   buildTripPreferenceProfile,
   calculateDayLoadMinutes,
   collectPlanDiagnostics,
@@ -89,6 +90,7 @@ function buildItem(overrides: Partial<AiGeneratedItem> = {}): AiGeneratedItem {
   return {
     name: overrides.name ?? "Sample Stop",
     category: overrides.category ?? "attraction",
+    itemRole: overrides.itemRole,
     location: overrides.location ?? "Tokyo",
     shortDescription: overrides.shortDescription ?? "Sample stop",
     slot: overrides.slot ?? "morning",
@@ -1051,6 +1053,60 @@ test("buildGenerationSummary highlights budget success and key trip counts", () 
   assert.match(summary, /2 ימים/);
   assert.match(summary, /2 אזורים/);
   assert.match(summary, /2 עצירות אוכל/);
+});
+
+// Round 9.3.3 continuation §5/15C/15D/15E — "FIX TRUTHFUL SUMMARY METRICS":
+// a synthetic FreeTime/MealOpportunity item must never inflate the
+// user-facing "real activity"/"real meal" counts, and a genuine real item
+// must still be counted.
+test("Round 9.3.3 §5 C: a synthetic FreeTime item is excluded from meaningfulRealActivities", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    items: [
+      buildItem({ name: "Real Museum", category: "attraction", recommendationId: "rec-1" }),
+      buildItem({ name: "שיטוט חופשי", category: "attraction", itemRole: "free_time", lat: null, lon: null, recommendationId: null }),
+    ],
+  });
+  const metrics = computeTruthfulScheduleMetrics([day]);
+  assert.equal(metrics.meaningfulRealActivities, 1, "only the real museum counts, never the free_time filler");
+  assert.equal(metrics.syntheticFreeTimeBlocks, 1);
+  assert.equal(metrics.totalScheduleBlocks, 2, "the total still honestly reflects every scheduled block");
+});
+
+test("Round 9.3.3 §5 D: a synthetic MealOpportunity is excluded from realNamedMealVenues", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "🍽 זמן מומלץ לארוחת ערב", category: "restaurant", itemRole: "meal_opportunity", lat: null, lon: null, recommendationId: null })],
+  });
+  const metrics = computeTruthfulScheduleMetrics([day]);
+  assert.equal(metrics.realNamedMealVenues, 0);
+  assert.equal(metrics.syntheticMealOpportunities, 1);
+});
+
+test("Round 9.3.3 §5 E: a real, named restaurant is included in realNamedMealVenues", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    items: [buildItem({ name: "Real Named Bistro", category: "restaurant", recommendationId: "rec-2", lat: 35.0, lon: 139.0 })],
+  });
+  const metrics = computeTruthfulScheduleMetrics([day]);
+  assert.equal(metrics.realNamedMealVenues, 1);
+  assert.equal(metrics.syntheticMealOpportunities, 0);
+});
+
+test("Round 9.3.3 §5: transportation/practical/hotel items are excluded from every real/synthetic bucket, but still counted in totalScheduleBlocks", () => {
+  const day = buildDay({
+    dayNumber: 1,
+    items: [
+      buildItem({ name: "Taxi to Airport", category: "transportation" }),
+      buildItem({ name: "Check-in", category: "practical" }),
+    ],
+  });
+  const metrics = computeTruthfulScheduleMetrics([day]);
+  assert.equal(metrics.meaningfulRealActivities, 0);
+  assert.equal(metrics.realNamedMealVenues, 0);
+  assert.equal(metrics.syntheticFreeTimeBlocks, 0);
+  assert.equal(metrics.syntheticMealOpportunities, 0);
+  assert.equal(metrics.totalScheduleBlocks, 2);
 });
 
 test("normalizeCoordinatePair fixes obvious lat-lon swaps and rejects impossible pairs", () => {

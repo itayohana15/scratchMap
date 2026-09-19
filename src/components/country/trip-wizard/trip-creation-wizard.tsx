@@ -1,29 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { useProfileDerivedTripDefaults } from "@/components/country/trip-preferences-panel";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { findAirportByIata, findDefaultAirportForCountry, HOME_COUNTRY_ISO } from "@/lib/facts/airports-data";
-import {
-  buildGenerationStages,
-  useItineraryGenerationProgress,
-} from "@/lib/hooks/use-itinerary-generation-progress";
-import { fetchCategoryRecommendations } from "@/lib/places/country-places";
-import { aggregateOverpassStatus } from "@/lib/provider-status";
+import { useItineraryGenerationProgress } from "@/lib/hooks/use-itinerary-generation-progress";
 import {
   useGenerateCountryItinerary,
   type GenerateCountryItineraryResult,
 } from "@/lib/queries/country-itineraries";
 import type { Tables } from "@/lib/supabase/types";
 import {
-  RECOMMENDATION_CATEGORY_LABELS,
-  type RecommendationCategory,
   type TripFlightLeg,
   type TripPreferences,
-  type TripRecommendation,
 } from "@/lib/trip-workspace";
 
 import {
@@ -49,11 +41,6 @@ import { StepPlaces } from "@/components/country/trip-wizard/steps/step-places";
 import { StepProfile } from "@/components/country/trip-wizard/steps/step-profile";
 import { StepRequirements } from "@/components/country/trip-wizard/steps/step-requirements";
 import { StepReview } from "@/components/country/trip-wizard/steps/step-review";
-
-const AI_SOURCED_CATEGORIES = (Object.keys(RECOMMENDATION_CATEGORY_LABELS) as RecommendationCategory[]).filter(
-  (category) => category !== "practical"
-);
-const API_RECOMMENDATION_COUNT = 10;
 
 interface TripCreationWizardProps {
   iso: string;
@@ -164,8 +151,7 @@ export function TripCreationWizard({ iso, country, open, onOpenChange, onGenerat
     });
   }, [country.iso_a2, draft.preferences.flights]);
 
-  const generationStages = useMemo(() => buildGenerationStages(country.name), [country.name]);
-  const generationProgress = useItineraryGenerationProgress<GenerateCountryItineraryResult>(generationStages);
+  const generationProgress = useItineraryGenerationProgress<GenerateCountryItineraryResult>();
   const generateItinerary = useGenerateCountryItinerary(iso);
 
   function updatePreferences(patch: Partial<TripPreferences>) {
@@ -217,48 +203,24 @@ export function TripCreationWizard({ iso, country, open, onOpenChange, onGenerat
     setStep((current) => Math.max(1, current - 1));
   }
 
-  // Section B — the real per-category Overpass outcome, aggregated the
-  // same way the QA harness does (one shared rule, provider-status.ts),
-  // never inferred from how many recommendations ended up in the array.
-  async function fetchLiveRecommendations(): Promise<{
-    recommendations: TripRecommendation[];
-    overpassAvailable: ReturnType<typeof aggregateOverpassStatus>;
-  }> {
-    const results = await Promise.allSettled(
-      AI_SOURCED_CATEGORIES.map((category) =>
-        fetchCategoryRecommendations(
-          iso,
-          category,
-          API_RECOMMENDATION_COUNT,
-          draft.preferences.startDate || undefined,
-          draft.preferences.endDate || undefined
-        )
-      )
-    );
-    const recommendations = results.flatMap((result) => (result.status === "fulfilled" ? result.value.places : []));
-    const outcomes = results.map((result) =>
-      result.status === "fulfilled" ? result.value.meta.overpassSucceeded : false
-    );
-    return { recommendations, overpassAvailable: aggregateOverpassStatus(outcomes) };
-  }
-
   async function runGeneration() {
-    // generationProgress.start() captures generationStartedAt synchronously
-    // at its own top (before any await) — the recommendations fetch must
-    // happen *inside* the run callback it's given, not before calling it,
-    // or the elapsed timer would start late relative to the actual click
-    // (spec items 22/26: the timer must start the exact moment the request
-    // begins, not after some unrelated prep work finishes).
+    // Round 9.2 §1/§14 — the client no longer pre-fetches ~13 country-wide
+    // recommendation categories before submitting. That pool was never
+    // stay-scoped (it had no idea which cities the trip actually visits or
+    // how many days each stay needs) and Round 9.2 makes the server's own
+    // stay-scoped StayActivityPool/Portfolio discovery
+    // (buildTripFrame → refillTripRecommendationPool, inside
+    // generateCountryItineraryPlan) the ONLY authoritative candidate
+    // source for planning. `recommendations` is submitted empty; the
+    // server discovers and classifies real candidates itself, per stay.
+    // (The country page's own browsing view may still call the country-wide
+    // endpoint directly — that's unrelated to generation and untouched.)
+    // `overpassAvailable` is likewise omitted — resolveCandidateProviderStatus
+    // on the server now derives it from the server's own post-discovery
+    // candidate pool, which is the honest signal for what planning actually
+    // used, rather than a client-side fetch it never used.
     try {
-      const result = await generationProgress.start(async (signal) => {
-        // A failed fetch here is a genuine provider outage, not "unknown" —
-        // still explicitly reported as unavailable rather than falling
-        // through to the candidate-count heuristic (spec §B5: an outage
-        // must never by itself become PLAN_NOT_FEASIBLE; generation still
-        // proceeds with zero candidates, Gemini/fallback discovery intact).
-        const { recommendations, overpassAvailable } = await fetchLiveRecommendations().catch(
-          () => ({ recommendations: [] as TripRecommendation[], overpassAvailable: "unavailable" as const })
-        );
+      const result = await generationProgress.start(async (signal, onProgress) => {
         return generateItinerary.mutateAsync({
           countryId: country.id,
           countryName: country.name,
@@ -266,13 +228,13 @@ export function TripCreationWizard({ iso, country, open, onOpenChange, onGenerat
           tripStatus: "planning",
           preferences: draft.preferences,
           selectedPlaces: [],
-          recommendations,
+          recommendations: [],
           bookings: draft.bookings,
           existingDays: [],
           clientRequestId: clientRequestIdRef.current!,
           userProvidedTitle: draft.userProvidedTitle,
-          overpassAvailable,
           signal,
+          onProgress,
         });
       });
 

@@ -2077,6 +2077,31 @@ export function isMeaningfulStayActivityItem(item: {
   return item.category !== "transportation" && item.category !== "practical";
 }
 
+/**
+ * Round 9.3.3 — a coordinate-less item should only ever be sent to a real
+ * place-name resolver (e.g. /api/places/search) when it structurally
+ * represents a real, planner-discovered place, never based on its display
+ * text. Every synthetic item built server-side (buildFreeExplorationReplacement,
+ * buildFallbackMealPlaceholder, transit/practical placeholders) always sets
+ * `recommendationId: null` by construction — the same signal
+ * isMealOpportunityMarker already relies on — so a null recommendationId
+ * reliably means "not a real place," regardless of what display text was
+ * written for it (a free-time or meal-opportunity phrase, a generic
+ * "explore the area" line, etc.). A genuine real-place item that merely
+ * lacks lat/lon (e.g. a recommendation whose coordinates weren't populated
+ * yet) still carries a real recommendationId and may legitimately be
+ * resolved. transportation/practical items are excluded outright — they
+ * are never place lookups, real or synthetic, even in the (currently
+ * never-occurring) case one somehow carried a recommendationId.
+ */
+export function shouldResolveAsRealPlace(item: {
+  category: RecommendationCategory;
+  recommendationId: string | null;
+}): boolean {
+  if (item.category === "transportation" || item.category === "practical") return false;
+  return item.recommendationId != null;
+}
+
 export interface StayActivityCenterResult {
   /** A real point from the stay's own activities (a medoid, never a synthetic average) — null when there is nothing real to anchor on. */
   center: { lat: number; lon: number } | null;
