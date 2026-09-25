@@ -122,7 +122,14 @@ test("scheduleDayItems returns a free-time block only when the leftover window i
     "Tbilisi"
   );
   assert.ok(bigLeftover.freeTimeItem != null);
-  assert.equal(bigLeftover.freeTimeItem!.name, "זמן חופשי");
+  // Round 9.15.2 — the free-time block's own START minute (and so which
+  // rotating name it picks) shifted along with the new contextual pacing
+  // buffers; the rotation itself (buildFreeTimeItem) is unchanged and
+  // already covered by its own tests, so this only asserts a real name.
+  assert.ok(
+    ["זמן חופשי", "זמן פנוי", "הפסקה גמישה", "זמן לעצמכם"].includes(bigLeftover.freeTimeItem!.name),
+    `expected a real free-time phrase, got ${bigLeftover.freeTimeItem!.name}`
+  );
 
   const tightWindow = scheduleDayItems(
     [buildItem({ name: "Long stop", estimatedDurationMinutes: 165 })],
@@ -246,4 +253,108 @@ test("scheduleDayItems treats a fixedTime item with no parseable time as a norma
   const { items: scheduled } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
   assert.equal(scheduled.length, 1);
   assert.ok(clockToMinutes(scheduled[0].plannedStartTime) != null);
+});
+
+/* ==================================================================== *
+ * ROUND 9.15.2 §G/§H/§I/§J/§K/§L/§M — contextual pacing buffers.         *
+ * ==================================================================== */
+
+// A — the exact spec §K complaint: lunch 12:15-13:30 followed by a
+// flexible attraction must NOT start at 13:45 (the old flat 8-min buffer
+// + a few minutes' travel) — a real human lunch-pacing gap is now applied.
+test("Round 9.15.2 test: lunch is followed by a genuine pacing gap, not just a flat few-minute buffer", () => {
+  // A fixed-time lunch (a real reservation-style anchor at 12:15) so its
+  // OWN plannedStartTime is honored exactly, matching spec §K's own
+  // "12:15-13:30 lunch" example precisely — the flexible item AFTER it is
+  // what this test is actually about.
+  const items = [
+    buildItem({ name: "Lunch Spot", category: "restaurant", slot: "lunch", fixedTime: true, plannedStartTime: "12:15", estimatedDurationMinutes: 75 }),
+    buildItem({ name: "Next Attraction", category: "attraction", slot: "afternoon", travelMinutes: 7 }),
+  ];
+  const { items: scheduled } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  const lunch = scheduled.find((i) => i.name === "Lunch Spot")!;
+  const next = scheduled.find((i) => i.name === "Next Attraction")!;
+  assert.equal(lunch.endTime, "13:30");
+  const nextStartMinutes = clockToMinutes(next.plannedStartTime)!;
+  // 13:45 (13:30 + old flat 8min buffer + 7min travel) is exactly what
+  // spec §K says the user does NOT want — the new lunch-pacing buffer must
+  // push it meaningfully later than that.
+  assert.ok(nextStartMinutes > clockToMinutes("13:45")!, `expected a genuine pacing gap after lunch, got ${next.plannedStartTime}`);
+});
+
+// B — an ordinary attraction gets a smaller, but still real, pacing gap.
+test("Round 9.15.2 test: an ordinary attraction gets its own contextual pacing buffer, larger than the old flat 8 minutes", () => {
+  const items = [
+    buildItem({ name: "Gallery", category: "attraction", estimatedDurationMinutes: 60 }),
+    buildItem({ name: "Next Stop", category: "attraction", travelMinutes: 5 }),
+  ];
+  const { items: scheduled } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  const gallery = scheduled.find((i) => i.name === "Gallery")!;
+  const next = scheduled.find((i) => i.name === "Next Stop")!;
+  const gapMinutes = clockToMinutes(next.plannedStartTime)! - clockToMinutes(gallery.endTime!)!;
+  assert.ok(gapMinutes > 8, `expected more than the old flat 8-minute buffer, got ${gapMinutes}`);
+});
+
+// C — a physically demanding (half/full-day) activity gets substantially
+// more recovery pacing than an ordinary stop.
+test("Round 9.15.2 test: a physically demanding half/full-day activity gets a substantially larger recovery buffer", () => {
+  const demanding = buildItem({ name: "Grand National Park Trek", category: "nature", estimatedDurationMinutes: 480 });
+  const ordinary = buildItem({ name: "Ordinary Stop", category: "attraction", estimatedDurationMinutes: 60 });
+  const { items: afterDemanding } = scheduleDayItems([demanding, buildItem({ name: "Next", travelMinutes: 0 })], DEFAULT_DAY_WINDOW, "Tbilisi");
+  const { items: afterOrdinary } = scheduleDayItems([ordinary, buildItem({ name: "Next", travelMinutes: 0 })], DEFAULT_DAY_WINDOW, "Tbilisi");
+  const demandingGap = clockToMinutes(afterDemanding[1].plannedStartTime)! - clockToMinutes(afterDemanding[0].endTime!)!;
+  const ordinaryGap = clockToMinutes(afterOrdinary[1].plannedStartTime)! - clockToMinutes(afterOrdinary[0].endTime!)!;
+  assert.ok(demandingGap > ordinaryGap, `expected the demanding activity's recovery gap (${demandingGap}) to exceed the ordinary one (${ordinaryGap})`);
+});
+
+// D — travel time is never reduced by pacing logic.
+test("Round 9.15.2 test: real travel time is always fully preserved regardless of pacing buffer", () => {
+  const items = [
+    buildItem({ name: "Lunch Spot", category: "restaurant", slot: "lunch", estimatedDurationMinutes: 60 }),
+    buildItem({ name: "Far Attraction", category: "attraction", travelMinutes: 40 }),
+  ];
+  const { items: scheduled } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  const lunch = scheduled.find((i) => i.name === "Lunch Spot")!;
+  const next = scheduled.find((i) => i.name === "Far Attraction")!;
+  const totalGap = clockToMinutes(next.plannedStartTime)! - clockToMinutes(lunch.endTime!)!;
+  assert.ok(totalGap >= 40, `the 40-minute real travel must always be included in the gap, got ${totalGap}`);
+});
+
+// E — a fixed-time event may compress the OPTIONAL pacing but never the
+// mandatory operational buffer or real travel.
+test("Round 9.15.2 test: a fixed-time event compresses optional pacing but preserves travel and operational buffer", () => {
+  const items = [
+    buildItem({ name: "Lunch Spot", category: "restaurant", slot: "lunch", plannedStartTime: "12:15", estimatedDurationMinutes: 60 }),
+    buildItem({ name: "Fixed Museum Entry", category: "museum", fixedTime: true, plannedStartTime: "13:20", travelMinutes: 10 }),
+  ];
+  const { items: scheduled, fixedTimeConflicts } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  assert.equal(fixedTimeConflicts.length, 0, "a fixed event 45 minutes after lunch must be reachable once pacing compresses");
+  const fixed = scheduled.find((i) => i.name === "Fixed Museum Entry")!;
+  assert.equal(fixed.plannedStartTime, "13:20", "the fixed time itself is never moved");
+});
+
+test("Round 9.15.2 test: a fixed-time event that is genuinely too soon (even with pacing fully compressed) is still reported as a real conflict, never silently allowed", () => {
+  // Both fixed this time (findFixedTimeConflicts only ever compares
+  // fixed-time anchors against each other — a single fixed item next to a
+  // FLEXIBLE one is handled by scheduleDayItems' own overflow path
+  // instead, not this conflict check) — a fixed lunch ending 13:30 plus
+  // 30 real minutes of travel genuinely cannot reach a fixed 13:16 entry.
+  const items = [
+    buildItem({ name: "Lunch Spot", category: "restaurant", slot: "lunch", fixedTime: true, plannedStartTime: "12:15", estimatedDurationMinutes: 75 }),
+    buildItem({ name: "Fixed Museum Entry", category: "museum", fixedTime: true, plannedStartTime: "13:16", travelMinutes: 30 }),
+  ];
+  const { fixedTimeConflicts } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  assert.equal(fixedTimeConflicts.length, 1, "lunch ending 13:30 + 30min real travel cannot possibly reach a 13:16 fixed entry — must be a reported conflict, never silently fudged");
+});
+
+// F — internal pacing/operational spacing never creates a visible FreeTime
+// card — the day's own leftover-window free-time mechanism is untouched
+// and still only fires for a genuinely large leftover window.
+test("Round 9.15.2 test: ordinary pacing gaps between scheduled items never become a visible FreeTime card", () => {
+  const items = [
+    buildItem({ name: "Lunch Spot", category: "restaurant", slot: "lunch", estimatedDurationMinutes: 60 }),
+    buildItem({ name: "Next Attraction", category: "attraction", estimatedDurationMinutes: 60 }),
+  ];
+  const { items: scheduled } = scheduleDayItems(items, DEFAULT_DAY_WINDOW, "Tbilisi");
+  assert.equal(scheduled.length, 2, "the pacing gap between lunch and the next attraction is internal timeline spacing, never a third visible item");
 });

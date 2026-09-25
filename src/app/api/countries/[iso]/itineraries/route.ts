@@ -8,6 +8,10 @@ import {
   InsufficientRealActivitySupplyError,
   RealPlaceDiscoveryUnavailableError,
   InsufficientRealActivityCoverageError,
+  RealPlaceDuplicatesRemainError,
+  OpeningHoursViolationsRemainError,
+  TimeOfDaySemanticViolationsRemainError,
+  InsufficientStayRegionCoverageError,
 } from "@/lib/server/country-itinerary-generation";
 import {
   ItineraryGenerationPipelineError,
@@ -49,7 +53,39 @@ function buildGenerationErrorFrame(error: unknown): GenerationStreamFrame {
     return { type: "error", status: 422, code: error.code, message: error.message, details: error.diagnostics };
   }
   if (error instanceof ItineraryGenerationInfeasibleError) {
-    return { type: "error", status: 422, code: error.code, message: error.message };
+    // Round 9.15.6.1 §K — this used to be the only error branch here with
+    // no `details` at all, so a real PLAN_NOT_FEASIBLE failure always
+    // reached the client with `ApiRequestError.body === undefined`, even
+    // though a safe, structured diagnostic object now exists on the error
+    // itself (see ItineraryGenerationInfeasibleError's own docstring).
+    return { type: "error", status: 422, code: error.code, message: error.message, details: error.details };
+  }
+  if (error instanceof RealPlaceDuplicatesRemainError) {
+    // Round 9.6.4 §8 — the deterministic final cleanup pass (§7) should
+    // make this genuinely unreachable in practice; kept as its own
+    // precise, structured 422 (never an uncaught crash, never a generic
+    // 500) so a residual duplicate is still diagnosable by its exact
+    // identity if the invariant is ever somehow violated again.
+    return { type: "error", status: 422, code: error.code, message: error.message, details: error.diagnostics };
+  }
+  if (error instanceof OpeningHoursViolationsRemainError || error instanceof TimeOfDaySemanticViolationsRemainError) {
+    // Round 9.15.8 §M — the two new non-mutating final-legality assertions
+    // added to applyFinalPlanCleanup. Same shape as RealPlaceDuplicatesRemainError
+    // just above: the mutating repair immediately before each of these
+    // should make it genuinely unreachable in practice — kept as its own
+    // precise, structured 422 so a residual violation is still diagnosable
+    // by its exact identity if the invariant is ever somehow violated again.
+    return { type: "error", status: 422, code: error.code, message: error.message, details: error.diagnostics };
+  }
+  if (error instanceof InsufficientStayRegionCoverageError) {
+    // Round 9.16.2 §3/§4 — the stay-composition analogue of
+    // RealPlaceDuplicatesRemainError/OpeningHoursViolationsRemainError:
+    // 9.16.1's real trace proved an invalid stay composition (a stay over
+    // MAX_STAY_NIGHTS, or too few stays for the trip length) could reach
+    // persistence anyway. A failed, honest generation with this precise,
+    // structured 422 is preferable to that — never a silently-persisted
+    // invalid itinerary, never a generic 500.
+    return { type: "error", status: 422, code: error.code, message: error.message, details: error.diagnostics };
   }
   if (error instanceof ItineraryGenerationPipelineError) {
     const body = { code: "GENERATION_FAILED", stage: error.stage, message: error.message, details: error.details };
@@ -244,6 +280,14 @@ export async function POST(
           devLog("failed — insufficient real activity supply", { code: error.code, stayFailures: error.stayFailures });
         } else if (error instanceof ItineraryGenerationInfeasibleError) {
           devLog("failed — plan not feasible", { code: error.code, message: error.message });
+        } else if (error instanceof RealPlaceDuplicatesRemainError) {
+          devLog("failed — real-place duplicate(s) survived the final cleanup pass", { code: error.code, ...error.diagnostics });
+        } else if (error instanceof OpeningHoursViolationsRemainError) {
+          devLog("failed — opening-hours violation(s) survived the final legalization pass", { code: error.code, ...error.diagnostics });
+        } else if (error instanceof TimeOfDaySemanticViolationsRemainError) {
+          devLog("failed — time-of-day semantic violation(s) survived the final legalization pass", { code: error.code, ...error.diagnostics });
+        } else if (error instanceof InsufficientStayRegionCoverageError) {
+          devLog("failed — final stay composition insufficient (overlong stay, too few stays, or coverage gap)", { code: error.code, ...error.diagnostics });
         } else if (error instanceof ItineraryGenerationPipelineError) {
           devLog("generation failed", { code: "GENERATION_FAILED", stage: error.stage, message: error.message });
         } else {

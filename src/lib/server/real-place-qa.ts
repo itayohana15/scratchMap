@@ -138,7 +138,17 @@ export type ZeroPoolReason =
   | "ALL_CLASSIFIED_AS_MEALS"
   | "ALL_DUPLICATES"
   | "NO_COORDINATES"
-  | "UNKNOWN";
+  | "UNKNOWN"
+  /**
+   * Round 9.6.2 §7 — a stay whose anchor never resolved at all (the
+   * Round 9.6.1 root cause) must never be reported the same way as a stay
+   * that WAS queried and genuinely came back empty. "NO_DISCOVERY_RESULTS"
+   * means a provider was actually asked and had nothing; this means no
+   * provider was ever asked, because there was nothing to query with —
+   * a fundamentally different, upstream failure mode that needs a
+   * different fix (stay-skeleton/anchor resolution, not provider supply).
+   */
+  | "DISCOVERY_NOT_ATTEMPTED_MISSING_ANCHOR";
 
 export function classifyZeroPoolReason(diagnostics: {
   initialCandidateCount: number;
@@ -462,4 +472,73 @@ export function logRepairRoundTrip(boundaryName: string, before: RepairSnapshotI
     itemRoleChanges: boundSample(categoryChanges.filter((c) => c.beforeItemRole !== c.afterItemRole), 15),
     phaseIdChanges: boundSample(categoryChanges.filter((c) => c.beforePhaseId !== c.afterPhaseId), 15),
   });
+}
+
+/* ================================================================== *
+ * Round 9.6.4 §6 — MONOTONIC DUPLICATE-REPAIR INVARIANT.               *
+ * D(n) = number of illegal duplicate real-place occurrences after      *
+ * repair step n must never increase for a step intended to address     *
+ * duplicates/geography. A minimal, structurally-typed input (rather    *
+ * than importing RealPlaceDuplicateGroup, which lives in               *
+ * country-itinerary-generation.ts and already imports FROM this        *
+ * module — importing it back here would be circular) so any caller's   *
+ * own duplicate-group array satisfies this by structure alone.         *
+ * ================================================================== */
+
+export interface DuplicateRepairDeltaResult {
+  duplicatesBefore: number;
+  duplicatesAfter: number;
+  insertedIds: string[];
+  removedIds: string[];
+  nonMonotonic: boolean;
+}
+
+/**
+ * Pure — computes the delta and returns it; logging is a separate,
+ * explicit call (logDuplicateRepairDelta) so a caller that wants to
+ * branch on nonMonotonic (e.g. the final cleanup pass deciding whether to
+ * run at all) never has to parse its own log output to find out.
+ */
+export function computeDuplicateRepairDelta(
+  step: string,
+  before: Array<{ recommendationId: string }>,
+  after: Array<{ recommendationId: string }>
+): DuplicateRepairDeltaResult {
+  const beforeIds = new Set(before.map((g) => g.recommendationId));
+  const afterIds = new Set(after.map((g) => g.recommendationId));
+  return {
+    duplicatesBefore: before.length,
+    duplicatesAfter: after.length,
+    insertedIds: [...afterIds].filter((id) => !beforeIds.has(id)),
+    removedIds: [...beforeIds].filter((id) => !afterIds.has(id)),
+    nonMonotonic: after.length > before.length,
+  };
+}
+
+export function logDuplicateRepairDelta(
+  step: string,
+  attempt: number | null,
+  result: DuplicateRepairDeltaResult,
+  movedIds: string[] = [],
+  rejectedAlreadyUsedCandidateIds: string[] = []
+): void {
+  logRealPlaceQA("DuplicateRepairDelta", {
+    step,
+    attempt,
+    duplicatesBefore: result.duplicatesBefore,
+    duplicatesAfter: result.duplicatesAfter,
+    insertedIds: boundSample(result.insertedIds, 15),
+    removedIds: boundSample(result.removedIds, 15),
+    movedIds: boundSample(movedIds, 15),
+    rejectedAlreadyUsedCandidateIds: boundSample(rejectedAlreadyUsedCandidateIds, 15),
+  });
+  if (result.nonMonotonic) {
+    logRealPlaceQACompact("DUPLICATE_REPAIR_NON_MONOTONIC", {
+      step,
+      attempt,
+      duplicatesBefore: result.duplicatesBefore,
+      duplicatesAfter: result.duplicatesAfter,
+      newDuplicateIds: boundSample(result.insertedIds, 15),
+    });
+  }
 }

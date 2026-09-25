@@ -2,6 +2,7 @@
 
 import { ArrowLeft, Bus } from "lucide-react";
 
+import { IsolatedText } from "@/components/ui/isolated-text";
 import { formatCurrency, formatDate } from "@/lib/format";
 import type { TripItineraryDay } from "@/lib/trip-workspace";
 
@@ -62,9 +63,9 @@ export function TripTransportTab({ days }: { days: TripItineraryDay[] }) {
           legs.map((leg, index) => (
             <div key={index} className="section-card space-y-2 p-4">
               <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                <span>{leg.fromCity}</span>
+                <span><IsolatedText>{leg.fromCity}</IsolatedText></span>
                 <ArrowLeft className="size-4 text-muted-foreground" />
-                <span>{leg.toCity}</span>
+                <span><IsolatedText>{leg.toCity}</IsolatedText></span>
               </div>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 <span className="flex items-center gap-1">
@@ -89,9 +90,9 @@ export function TripTransportTab({ days }: { days: TripItineraryDay[] }) {
             {localTransportDays.map((day) => (
               <div key={day.id} className="section-card p-3 text-sm">
                 <p className="font-medium text-foreground">
-                  יום {day.dayNumber} · {day.cityRegion}
+                  יום {day.dayNumber} · <IsolatedText>{day.cityRegion}</IsolatedText>
                 </p>
-                <p className="text-xs text-muted-foreground">{day.transportation}</p>
+                <p className="text-xs text-muted-foreground"><IsolatedText>{day.transportation}</IsolatedText></p>
               </div>
             ))}
           </div>

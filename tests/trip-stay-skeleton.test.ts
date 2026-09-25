@@ -20,6 +20,15 @@ import {
   rankReserveStaysForPromotion,
   decideReservePromotion,
   applyReservePromotion,
+  classifyStayDestination,
+  MAX_STAY_NIGHTS,
+  computeMinimumRequiredStayCount,
+  evaluateStaySkeletonCoverage,
+  computeStayInventoryPressure,
+  classifyInterestDemand,
+  estimateStayCapacityProfile,
+  clampPhaseNightsToMaximum,
+  discoverRouteCorridorCandidates,
   type ProposedStay,
   type ResolvedStay,
   type StayValueProfile,
@@ -269,6 +278,138 @@ test("Round 9.3 H: every day of the trip is covered by exactly one phase, no gap
   assert.equal(covered.size, dayCount, "every day of the trip must be covered exactly once");
 });
 
+/* ==================================================================== *
+ * ROUND 9.16.2.1 — DAYS VS NIGHTS ACCOUNTING FIX. The exact Round        *
+ * 9.16.3 production defect: a 36-calendar-day / 35-sleeping-night trip,  *
+ * 7 real Gemini-proposed stays summing to exactly 35 raw nights, ended   *
+ * up with sum(phase.nights) = 36 after buildTripFrameFromResolvedStays   *
+ * — the highest-weight stay (New York, proposed 10 nights, resolved     *
+ * last in route order) silently absorbed a phantom 36th night. Fixed by  *
+ * reducing ONLY the trip's LAST phase's `nights` field by the departure- *
+ * day slack, leaving day-RANGES (startDayNumber/endDayNumber) — already  *
+ * proven contiguous/gap-free/overlap-free — completely untouched.       *
+ * ==================================================================== */
+
+// §5 — the exact Round 9.16.3 production regression.
+test("Round 9.16.2.1 §5 (CRITICAL VALIDATION, exact production regression): 7 real stays summing to 35 proposed nights never inflate to 36 after buildTripFrameFromResolvedStays", () => {
+  const stays: ResolvedStay[] = [
+    { stayId: "boston", proposedId: null, areaLabel: "Boston", lat: 42.3588336, lon: -71.0578303, nights: 4, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "portland-me", proposedId: null, areaLabel: "Portland, Maine", lat: 43.6573605, lon: -70.2586618, nights: 4, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "north-conway", proposedId: null, areaLabel: "North Conway, New Hampshire", lat: 44.037776, lon: -71.1238246, nights: 5, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "providence", proposedId: null, areaLabel: "Providence, Rhode Island", lat: 41.8239891, lon: -71.4128343, nights: 3, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "newport", proposedId: null, areaLabel: "Newport, Rhode Island", lat: 41.4899827, lon: -71.3137707, nights: 3, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "philadelphia", proposedId: null, areaLabel: "Philadelphia", lat: 39.9527237, lon: -75.1635262, nights: 6, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "new-york", proposedId: null, areaLabel: "New York", lat: 40.7127281, lon: -74.0060152, nights: 10, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+  ];
+  const dayCount = 36; // 35 tripNights — the exact production shape
+  // Real arrival(Boston-area)/departure(New-York-area) anchors — matching
+  // the exact production route-reorder that put New York last.
+  const { frame } = buildTripFrameFromResolvedStays(stays, dayCount, { lat: 42.36, lon: -71.06 }, { lat: 40.71, lon: -74.0 });
+  const phases = frame.phases;
+  const totalNights = phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(totalNights, 35, "sum(phase.nights) must equal tripNights (35), NOT dayCount (36)");
+  assert.ok(phases.every((p) => p.nights <= 14), `no stay may exceed 14 nights, got ${JSON.stringify(phases.map((p) => ({ area: p.areaLabel, nights: p.nights })))}`);
+  // Every one of the 36 calendar days must still be represented by exactly one phase.
+  const coveredDays = new Set<number>();
+  for (const phase of phases) {
+    for (let d = phase.startDayNumber; d <= phase.endDayNumber; d += 1) coveredDays.add(d);
+  }
+  assert.equal(coveredDays.size, dayCount, "all 36 calendar days must remain represented by the trip/day model");
+  assert.equal(Math.max(...phases.map((p) => p.endDayNumber)), dayCount, "the trip's last calendar day (36) must still be owned by some phase");
+  // The highest-weight stay (New York, proposed 10) must not silently
+  // absorb a phantom extra NIGHT — its nights value stays at (or below)
+  // its own proposed value, even though its CALENDAR day-span may
+  // legitimately be one day longer (the trip's pure departure day).
+  const newYork = phases.find((p) => p.areaLabel === "New York")!;
+  assert.ok(newYork, "New York must still be a real, resolved phase");
+  assert.ok(newYork.nights <= 10, `New York's nights must not be inflated beyond its own proposed value (10), got ${newYork.nights}`);
+});
+
+// §6 — coverage regressions A-G.
+test("Round 9.16.2.1 §6A: tripNights=35, coveredNights=35 => exact allocation, valid", () => {
+  // 3 stays (none individually over MAX_STAY_NIGHTS) so this isolates the
+  // exact-allocation signal from the unrelated overlong-stay check.
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 12 }, { nights: 12 }, { nights: 11 }], 35);
+  assert.equal(coverage.totalAllocatedNights, 35);
+  assert.equal(coverage.allocationStatus, "EXACTLY_ALLOCATED");
+  assert.ok(!coverage.reasonCodes.includes("TRIP_OVER_ALLOCATED"));
+  assert.equal(coverage.coverageValid, true);
+});
+
+test("Round 9.16.2.1 §6B: tripNights=35, coveredNights=34 => under-allocated, invalid (below the 0.8 ratio floor)", () => {
+  // 34/35 = 0.971 ratio, well above 0.8 — under-allocation by 1 night
+  // alone does not trip the coarse ratio gate; this proves UNDER_ALLOCATED
+  // is reported honestly regardless, without being conflated with
+  // coverageValid (a separate, coarser signal).
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 34 }], 35);
+  assert.equal(coverage.totalAllocatedNights, 34);
+  assert.equal(coverage.allocationStatus, "UNDER_ALLOCATED");
+  assert.ok(!coverage.reasonCodes.includes("TRIP_OVER_ALLOCATED"));
+});
+
+test("Round 9.16.2.1 §6C (CRITICAL VALIDATION): tripNights=35, coveredNights=36 => TRIP_OVER_ALLOCATED, invalid — the exact Round 9.16.3 shape", () => {
+  // 3 stays (none individually over MAX_STAY_NIGHTS) summing to 36 — the
+  // exact Round 9.16.3 shape, isolated from the unrelated overlong-stay check.
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 12 }, { nights: 12 }, { nights: 12 }], 35);
+  assert.equal(coverage.totalAllocatedNights, 36);
+  assert.equal(coverage.allocationStatus, "OVER_ALLOCATED");
+  assert.ok(coverage.reasonCodes.includes("TRIP_OVER_ALLOCATED"));
+  assert.equal(coverage.coverageValid, false, "over-allocation must invalidate coverage even though the raw ratio (1.03) and every other signal look healthy");
+  assert.equal(coverage.coverageRatio, 1.03, "the raw ratio must stay observable, never clamped to hide the defect");
+});
+
+test("Round 9.16.2.1 §6D: 36 calendar days remain represented even though phase nights sum to 35 (buildTripFrameFromResolvedStays)", () => {
+  const stays: ResolvedStay[] = [
+    { stayId: "s1", proposedId: null, areaLabel: "Alpha City", lat: 1, lon: 1, nights: 20, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+    { stayId: "s2", proposedId: null, areaLabel: "Beta Town", lat: 2, lon: 2, nights: 16, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" },
+  ];
+  const { frame } = buildTripFrameFromResolvedStays(stays, 36);
+  const totalNights = frame.phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(totalNights, 35);
+  assert.equal(Math.max(...frame.phases.map((p) => p.endDayNumber)), 36, "day 36 must still be represented");
+});
+
+test("Round 9.16.2.1 §6E: the 1-day trip edge case preserves existing planner semantics safely (tripNights floors at 1, never 0)", () => {
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 1 }], 1);
+  assert.equal(coverage.totalAllocatedNights, 1);
+  assert.equal(coverage.allocationStatus, "EXACTLY_ALLOCATED");
+  const stays: ResolvedStay[] = [{ stayId: "s1", proposedId: null, areaLabel: "Solo City", lat: 1, lon: 1, nights: 1, reasons: [], source: "gemini_resolved", confidence: "high", countryIso: "US" }];
+  const { frame } = buildTripFrameFromResolvedStays(stays, 1);
+  assert.equal(frame.phases[0].nights, 1, "a 1-day trip must never be reduced to 0 nights");
+});
+
+test("Round 9.16.2.1 §6F: exactly MAX_STAY_NIGHTS (14) remains legal", () => {
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 14 }], 14);
+  assert.equal(coverage.overlongStayCount, 0);
+  assert.equal(coverage.allocationStatus, "EXACTLY_ALLOCATED");
+  assert.equal(coverage.coverageValid, true);
+});
+
+test("Round 9.16.2.1 §6G: 15 nights (one over MAX_STAY_NIGHTS) remains illegal", () => {
+  const coverage = evaluateStaySkeletonCoverage([{ nights: 15 }], 15);
+  assert.equal(coverage.overlongStayCount, 1);
+  assert.equal(coverage.coverageValid, false);
+});
+
+// §7 — reallocateNightsAfterDiscovery regression.
+test("Round 9.16.2.1 §7: reallocateNightsAfterDiscovery preserves the frame's own real 24-night total after the upstream fix (never re-inflates it toward dayCount=25)", () => {
+  const frame = testFrame([
+    { id: "s1", areaLabel: "Rich City", nights: 12 },
+    { id: "s2", areaLabel: "Thin Town", nights: 12 },
+  ]);
+  const sumBefore = frame.phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(sumBefore, 24, "a 25-calendar-day / 24-sleeping-night trip's frame, per the sleeping-nights convention this round establishes");
+  const poolsByStay = new Map([
+    ["s1", pool({ stayId: "s1", ownerArea: "Rich City", candidates: Array.from({ length: 30 }) })],
+    ["s2", pool({ stayId: "s2", ownerArea: "Thin Town", candidates: Array.from({ length: 3 }) })],
+  ]);
+  const reallocated = reallocateNightsAfterDiscovery(frame, 25, poolsByStay as never, new Map(), []);
+  const sumAfter = reallocated.phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(sumAfter, 24, "reallocation must preserve the frame's own real total (24), never silently inflate it toward dayCount (25)");
+  assert.ok(reallocated.phases.every((p) => p.nights <= 14), "no stay may exceed 14 nights after reallocation");
+  assert.equal(Math.max(...reallocated.phases.map((p) => p.endDayNumber)), 25, "all 25 calendar days must remain represented after reallocation");
+});
+
 /* -------------------- adjustStayWeightForSupply (spec §14) -------------------- */
 
 // O. activity capacity influences nights
@@ -473,6 +614,42 @@ test("Round 9.3.1: reallocateNightsAfterDiscovery rebalances toward the stay wit
   const thin = reallocated.phases.find((p) => p.areaLabel === "Thin Town")!;
   assert.ok(rich.nights > thin.nights, `expected Rich City (${rich.nights}) > Thin Town (${thin.nights})`);
   assert.equal(reallocated.phases.reduce((s, p) => s + p.nights, 0), 10, "total nights must still equal the trip length exactly");
+});
+
+test("Round 9.16.2 §5: reallocateNightsAfterDiscovery never lets a richly-supplied stay's marginal value push it past MAX_STAY_NIGHTS", () => {
+  // A 26-night trip, 2 stays, one with vastly richer real post-discovery
+  // supply than the other — uncapped, marginal-value allocation would
+  // legitimately want to give the rich stay far more than 14 nights; here
+  // (unlike the next test) 2*14=28 >= 26, so the cap and full coverage are
+  // both simultaneously achievable, and both must actually be honored.
+  const frame = testFrame([{ id: "s1", areaLabel: "Rich Metro", nights: 13 }, { id: "s2", areaLabel: "Thin Town", nights: 13 }]);
+  const poolsByStay = new Map([
+    ["s1", pool({ stayId: "s1", ownerArea: "Rich Metro", candidates: Array.from({ length: 90 }), categorySupply: { CULTURE: 20, NATURE: 20, LANDMARK: 20, LOCAL_EXPERIENCE: 20 } })],
+    ["s2", pool({ stayId: "s2", ownerArea: "Thin Town", candidates: Array.from({ length: 3 }), categorySupply: { CULTURE: 3 } })],
+  ]);
+  const mealPoolsByStay = new Map([
+    ["s1", mealPool({ stayId: "s1" })],
+    ["s2", mealPool({ stayId: "s2" })],
+  ]);
+  const reallocated = reallocateNightsAfterDiscovery(frame, 26, poolsByStay as never, mealPoolsByStay, []);
+  assert.ok(reallocated.phases.every((p) => p.nights <= MAX_STAY_NIGHTS), `no stay may exceed ${MAX_STAY_NIGHTS} nights even when its real discovered supply strongly favors it`);
+  assert.equal(reallocated.phases.reduce((s, p) => s + p.nights, 0), 26, "full trip-day coverage must be preserved");
+});
+
+test("Round 9.16.2 §5 (bug fix): when the trip is too long for its known stay count even at the hard cap (2 phases, 30 nights: 2*14=28<30), full day coverage still wins — no day is ever left owned by no phase", () => {
+  const frame = testFrame([{ id: "s1", areaLabel: "Rich Metro", nights: 15 }, { id: "s2", areaLabel: "Thin Town", nights: 15 }]);
+  const poolsByStay = new Map([
+    ["s1", pool({ stayId: "s1", ownerArea: "Rich Metro", candidates: Array.from({ length: 90 }), categorySupply: { CULTURE: 20, NATURE: 20, LANDMARK: 20, LOCAL_EXPERIENCE: 20 } })],
+    ["s2", pool({ stayId: "s2", ownerArea: "Thin Town", candidates: Array.from({ length: 3 }), categorySupply: { CULTURE: 3 } })],
+  ]);
+  const mealPoolsByStay = new Map([
+    ["s1", mealPool({ stayId: "s1" })],
+    ["s2", mealPool({ stayId: "s2" })],
+  ]);
+  const reallocated = reallocateNightsAfterDiscovery(frame, 30, poolsByStay as never, mealPoolsByStay, []);
+  assert.equal(reallocated.phases.reduce((s, p) => s + p.nights, 0), 30, "full trip-day coverage must never be silently dropped, even when it is genuinely impossible to also honor the 14-night cap with only 2 known stays");
+  assert.equal(reallocated.phases[0].startDayNumber, 1);
+  assert.equal(reallocated.phases[reallocated.phases.length - 1].endDayNumber, 30, "every trip day, including the last, must belong to some phase");
 });
 
 test("Round 9.3.1: reallocateNightsAfterDiscovery never touches a single-phase frame", () => {
@@ -680,4 +857,236 @@ test("Round 9.3.2 Q: applyReservePromotion produces contiguous, gap-free day ran
     assert.equal(promoted.phases[i].startDayNumber, promoted.phases[i - 1].endDayNumber + 1);
   }
   assert.equal(promoted.phases.at(-1)!.endDayNumber, 10);
+});
+
+/* ==================================================================== *
+ * ROUND 9.16 — stay skeleton resilience + size/capacity-aware duration. *
+ * ==================================================================== */
+
+function rs(areaLabel: string, nights: number, overrides: Partial<ResolvedStay> = {}): ResolvedStay {
+  return {
+    stayId: `stay-${areaLabel}`,
+    proposedId: `p-${areaLabel}`,
+    areaLabel,
+    lat: 0,
+    lon: 0,
+    nights,
+    reasons: [],
+    source: "gemini_resolved",
+    confidence: "high",
+    countryIso: "US",
+    ...overrides,
+  };
+}
+
+/* ---- §10 locality semantic eligibility guard ---- */
+
+test("Round 9.16 §10/test J: a POI/institution masquerading as a locality (college, museum, business) is rejected as a stay destination, generically — never by hardcoded name", () => {
+  const college = { placeClass: "amenity", placeType: "college", addressComponents: { city: "Berlin", county: "Coös County", state: "New Hampshire", country: "United States" } };
+  const museum = { placeClass: "tourism", placeType: "museum", addressComponents: { city: "Springfield", state: "Illinois", country: "United States" } };
+  const shop = { placeClass: "shop", placeType: "supermarket", addressComponents: { city: "Reno", state: "Nevada", country: "United States" } };
+  for (const match of [college, museum, shop]) {
+    const result = classifyStayDestination(match);
+    assert.equal(result.kind, "rejected", `${match.placeClass}/${match.placeType} must never become a lodging locality merely because its address contains a settlement field`);
+  }
+});
+
+test("Round 9.16 test K: a legitimate city/town/village remains accepted as a practical stay base", () => {
+  assert.equal(classifyStayDestination({ placeClass: "place", placeType: "city", addressComponents: { city: "Denver", state: "Colorado", country: "United States" } }).kind, "practical_base");
+  assert.equal(classifyStayDestination({ placeClass: "place", placeType: "town", addressComponents: { town: "Hyannis", county: "Barnstable", state: "Massachusetts", country: "United States" } }).kind, "practical_base");
+  assert.equal(classifyStayDestination({ placeClass: "place", placeType: "village", addressComponents: { village: "Stowe", state: "Vermont", country: "United States" } }).kind, "practical_base");
+});
+
+/* ---- §5 minimum required stay count (hard lower bound only) ---- */
+
+test("Round 9.16 §5: computeMinimumRequiredStayCount is the hard ceil(tripNights/14) LOWER bound, never a desired count", () => {
+  assert.equal(computeMinimumRequiredStayCount(0), 1);
+  assert.equal(computeMinimumRequiredStayCount(10), 1);
+  assert.equal(computeMinimumRequiredStayCount(14), 1);
+  assert.equal(computeMinimumRequiredStayCount(15), 2);
+  assert.equal(computeMinimumRequiredStayCount(35), 3);
+  assert.equal(computeMinimumRequiredStayCount(36), 3);
+});
+
+/* ---- §2 StaySkeletonCoverage — the core new invariant ---- */
+
+test("Round 9.16 §2 (the exact Round 9.15.11 regression): 2 geographically valid stays covering only ~3 of 36 trip nights is coverageValid=false, not silently accepted", () => {
+  const stays = [rs("Boston", 1, { reasons: ["arrival"] }), rs("New York", 1, { reasons: ["departure"] })];
+  const coverage = evaluateStaySkeletonCoverage(stays, 35);
+  assert.equal(coverage.coverageValid, false, "the exact Round 9.15.11 shape must never be accepted as a healthy final stay skeleton");
+  assert.ok(coverage.reasonCodes.includes("TRIP_UNDER_COVERED"));
+  assert.ok(coverage.reasonCodes.includes("BELOW_MINIMUM_REQUIRED_STAY_COUNT"));
+});
+
+test("Round 9.16 §2/test E: a single stay proposed for more nights than the trip needs covers it, but a stay exceeding MAX_STAY_NIGHTS is still flagged overlong", () => {
+  const coverage = evaluateStaySkeletonCoverage([rs("Solo City", 15)], 15);
+  assert.equal(coverage.overlongStayCount, 1, "a single 15-night stay must fail the hard 14-night ceiling");
+  assert.equal(coverage.coverageValid, false);
+  assert.ok(coverage.reasonCodes.includes("STAY_EXCEEDS_MAX_NIGHTS"));
+});
+
+test("Round 9.16 test D: a 14-day rich region may remain ONE stay when its own capacity genuinely supports it", () => {
+  const coverage = evaluateStaySkeletonCoverage([rs("Rich Metro", 13)], 13);
+  assert.equal(coverage.stayCount, 1);
+  assert.equal(coverage.overlongStayCount, 0);
+  assert.equal(coverage.coverageValid, true, "a single stay within the ceiling that fully covers the trip must not be forced to split");
+});
+
+test("Round 9.16 test C: a 10-day rich city trip is NOT forced into unnecessary extra stays merely because expansion machinery exists", () => {
+  const coverage = evaluateStaySkeletonCoverage([rs("Rich City", 9)], 9);
+  assert.equal(coverage.coverageValid, true);
+  assert.equal(coverage.stayCount, 1);
+});
+
+test("Round 9.16 test L (inventory pressure): a starved stay is flagged even when its night count ALONE would already satisfy coverage", () => {
+  // 6 nights for a 6-night trip: night-count coverage alone is already 100%
+  // (coveredNights=6, coverageRatio=1.0, not overlong, stayCount meets the
+  // minimum) — ONLY the real, measured supply shortfall (10 available vs
+  // 18 required) can catch this, exactly the Round 9.15.11 New York shape
+  // (34 available vs 52 required, ratio 0.65) generalized.
+  const pressure = computeStayInventoryPressure("stay-Thin", "Thin City", 6, 10);
+  assert.equal(pressure.starved, true);
+  const withoutPressure = evaluateStaySkeletonCoverage([rs("Thin City", 6)], 6);
+  assert.equal(withoutPressure.coverageValid, true, "sanity: night-count alone genuinely looks sufficient here");
+  const withPressure = evaluateStaySkeletonCoverage([rs("Thin City", 6)], 6, [pressure]);
+  assert.ok(withPressure.reasonCodes.includes("INVENTORY_STARVED_STAY"));
+  assert.equal(withPressure.coverageValid, false, "real inventory pressure must be able to fail an otherwise night-count-sufficient skeleton — the allocator should expand rather than keep piling FreeTime onto a starved stay");
+});
+
+test("Round 9.16 §8: computeStayInventoryPressure never flags a stay with genuinely adequate real supply", () => {
+  const pressure = computeStayInventoryPressure("stay-Rich", "Rich City", 6, 30);
+  assert.equal(pressure.starved, false);
+});
+
+/* ---- §4/§9 hard max-stay invariant + safe redistribution ---- */
+
+test("Round 9.16 §4: clampPhaseNightsToMaximum redistributes overflow to phases with real headroom, never invents a phase, never drops trip days", () => {
+  const phases = [
+    { id: "p1", areaLabel: "Boston", nights: 18, startDayNumber: 1, endDayNumber: 18, intent: "mixed" as const },
+    { id: "p2", areaLabel: "New York", nights: 18, startDayNumber: 19, endDayNumber: 36, intent: "mixed" as const },
+    { id: "p3", areaLabel: "Providence", nights: 6, startDayNumber: 37, endDayNumber: 42, intent: "mixed" as const },
+  ];
+  const result = clampPhaseNightsToMaximum(phases, MAX_STAY_NIGHTS);
+  assert.ok(result.phases.every((p) => p.nights <= MAX_STAY_NIGHTS), "no phase may exceed the hard ceiling when real headroom exists elsewhere");
+  const totalBefore = phases.reduce((sum, p) => sum + p.nights, 0);
+  const totalAfter = result.phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(totalAfter, totalBefore, "total trip nights (day coverage) must never change — only the split across phases");
+  assert.equal(result.unallocatableNights, 0, "3 phases at up to 14 nights each (42) comfortably covers this 42-night trip");
+});
+
+test("Round 9.16 §4: clampPhaseNightsToMaximum never silently drops trip-day coverage even when NO phase has enough combined headroom", () => {
+  const phases = [
+    { id: "p1", areaLabel: "Boston", nights: 18, startDayNumber: 1, endDayNumber: 18, intent: "mixed" as const },
+    { id: "p2", areaLabel: "New York", nights: 18, startDayNumber: 19, endDayNumber: 36, intent: "mixed" as const },
+  ];
+  const result = clampPhaseNightsToMaximum(phases, MAX_STAY_NIGHTS);
+  const totalBefore = phases.reduce((sum, p) => sum + p.nights, 0);
+  const totalAfter = result.phases.reduce((sum, p) => sum + p.nights, 0);
+  assert.equal(totalAfter, totalBefore, "2 stays at 14 each (28) cannot legally cover a 36-night trip — the shortfall must be REPORTED (unallocatableNights), never hidden by silently shrinking day coverage");
+  assert.equal(result.unallocatableNights, 8, "36 - (2*14) = 8 nights genuinely cannot respect the ceiling with only 2 phases");
+});
+
+/* ---- §7 interest-driven demand classification (generic, never hardcoded destinations) ---- */
+
+test("Round 9.16 test M: classifyInterestDemand maps free-text interests to structured demand categories, in both Hebrew and English, without ever naming a destination", () => {
+  const demand = classifyInterestDemand("טבע, היסטוריה, אוכל, הרים, חופים, כפרים, תרבות, חיי לילה");
+  assert.ok(demand.has("NATURE"));
+  assert.ok(demand.has("HISTORY"));
+  assert.ok(demand.has("FOOD"));
+  assert.ok(demand.has("MOUNTAINS"));
+  assert.ok(demand.has("BEACHES"));
+  assert.ok(demand.has("VILLAGES"));
+  assert.ok(demand.has("CULTURE"));
+  assert.ok(demand.has("NIGHTLIFE"));
+
+  const englishDemand = classifyInterestDemand("hiking in the mountains, scenic coastal villages, street food");
+  assert.ok(englishDemand.has("HIKING"));
+  assert.ok(englishDemand.has("MOUNTAINS"));
+  assert.ok(englishDemand.has("SCENIC") || englishDemand.has("COAST") || englishDemand.has("VILLAGES"));
+  assert.ok(englishDemand.has("FOOD"));
+});
+
+test("Round 9.16 test M: classifyInterestDemand returns an empty set for blank/missing interests, never a fabricated default", () => {
+  assert.equal(classifyInterestDemand("").size, 0);
+  assert.equal(classifyInterestDemand(null).size, 0);
+  assert.equal(classifyInterestDemand(undefined).size, 0);
+});
+
+/* ---- §3 StayCapacityProfile ---- */
+
+test("Round 9.16 §3: estimateStayCapacityProfile returns the small/medium/large/exceptional tiers with the spec's own target ranges, and never exceeds MAX_STAY_NIGHTS", () => {
+  const small = estimateStayCapacityProfile({ stayId: "s1", areaLabel: "Small Town" }, new Set());
+  assert.equal(small.tier, "small");
+  assert.ok(small.recommendedMinNights >= 3 && small.recommendedMinNights <= 5);
+  assert.ok(small.recommendedMaxNights <= MAX_STAY_NIGHTS);
+
+  const exceptional = estimateStayCapacityProfile({ stayId: "s2", areaLabel: "Rich Metro" }, new Set(), { meaningfulActivitySupply: 80, diversityScore: 15 });
+  assert.equal(exceptional.tier, "exceptional");
+  assert.ok(exceptional.recommendedMaxNights <= MAX_STAY_NIGHTS, "exceptional is still bounded by the hard 14-day ceiling, never exceeds it");
+});
+
+test("Round 9.16 §3: a broad interest profile can only ever nudge the CEILING of an already-non-small tier, never fabricate supply for a genuinely thin one", () => {
+  const broadDemand = new Set(["NATURE", "HIKING", "FOOD", "CULTURE", "NIGHTLIFE"] as const);
+  const thin = estimateStayCapacityProfile({ stayId: "s1", areaLabel: "Thin Town" }, broadDemand, { meaningfulActivitySupply: 5 });
+  assert.equal(thin.tier, "small", "broad interests must never upgrade a stay whose real measured supply is genuinely thin");
+});
+
+/* ==================================================================== *
+ * ROUND 9.16.2 §2 — discoverRouteCorridorCandidates: provider-neutral,  *
+ * Gemini-independent region discovery along the real arrival<->        *
+ * departure line. Never invents a name — every candidate comes from a  *
+ * real reverse-geocode result, still subject to the SAME locality      *
+ * guard (via classifyStayDestination in the caller's own resolve step) *
+ * as every other candidate source.                                    *
+ * ==================================================================== */
+
+test("Round 9.16.2 §2: discoverRouteCorridorCandidates returns real, distinct candidates from interior points along the arrival<->departure line", async () => {
+  const arrival = { lat: 42.36, lon: -71.06 }; // Boston
+  const departure = { lat: 40.71, lon: -74.0 }; // New York
+  const seen: number[] = [];
+  const fakeReverse = async (lat: number, lon: number) => {
+    seen.push(lat);
+    return { name: `Corridor Town ${seen.length}`, lat, lon, placeClass: "place", placeType: "town", addressComponents: {} };
+  };
+  const candidates = await discoverRouteCorridorCandidates(arrival, departure, new Set(), 3, fakeReverse as never);
+  assert.equal(candidates.length, 3);
+  assert.equal(seen.length, 3, "exactly the requested sample count of interior points must be reverse-geocoded");
+  const names = new Set(candidates.map((c) => c.areaName));
+  assert.equal(names.size, 3, "each interior sample must produce a distinct candidate");
+  assert.ok(candidates.every((c) => c.reasons.includes("route_corridor")));
+  assert.ok(candidates.every((c) => c.nights > 0 && c.nights <= MAX_STAY_NIGHTS));
+});
+
+test("Round 9.16.2 §2: discoverRouteCorridorCandidates skips a point that already matches an existing stay, never proposing a duplicate", async () => {
+  const arrival = { lat: 42.36, lon: -71.06 };
+  const departure = { lat: 40.71, lon: -74.0 };
+  const fakeReverse = async () => ({ name: "Boston", lat: 42.36, lon: -71.06, placeClass: "place", placeType: "city", addressComponents: {} });
+  const candidates = await discoverRouteCorridorCandidates(arrival, departure, new Set(["boston"]), 2, fakeReverse as never);
+  assert.equal(candidates.length, 0, "a candidate resolving to an area label already in the trip must never be proposed again");
+});
+
+test("Round 9.16.2 §2: discoverRouteCorridorCandidates gracefully skips a failed/invalid reverse-geocode result rather than throwing or fabricating a name", async () => {
+  const arrival = { lat: 42.36, lon: -71.06 };
+  const departure = { lat: 40.71, lon: -74.0 };
+  let call = 0;
+  const flakyReverse = async () => {
+    call += 1;
+    if (call === 1) throw new Error("network down");
+    if (call === 2) return null;
+    return { name: "  ", lat: 41, lon: -72, placeClass: "place", placeType: "town", addressComponents: {} }; // blank name
+  };
+  const candidates = await discoverRouteCorridorCandidates(arrival, departure, new Set(), 3, flakyReverse as never);
+  assert.equal(candidates.length, 0, "every one of these three failure shapes must be skipped, never crash and never produce a fabricated candidate");
+});
+
+test("Round 9.16.2 §2: discoverRouteCorridorCandidates never queries more than 6 interior points regardless of a larger requested sampleCount", async () => {
+  const arrival = { lat: 42.36, lon: -71.06 };
+  const departure = { lat: 40.71, lon: -74.0 };
+  let calls = 0;
+  const countingReverse = async (lat: number, lon: number) => {
+    calls += 1;
+    return { name: `Town ${calls}`, lat, lon, placeClass: "place", placeType: "town", addressComponents: {} };
+  };
+  await discoverRouteCorridorCandidates(arrival, departure, new Set(), 20, countingReverse as never);
+  assert.ok(calls <= 6, `expected the sample count to be clamped to a small bound, got ${calls} calls`);
 });

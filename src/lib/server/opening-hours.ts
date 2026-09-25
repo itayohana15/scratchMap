@@ -35,6 +35,15 @@ const TIME_RANGE_PATTERN =
 const TIME_RANGE_GLOBAL_PATTERN =
   /(\d{1,2}):(\d{2})\s*(?:-|–|—|~|to|עד)\s*(\d{1,2}):(\d{2})/gi;
 
+/**
+ * Round 9.13.1 — OSM's open-ended time syntax: a single HH:MM immediately
+ * followed by "+" (e.g. "17:30+"), meaning "known not to open before this
+ * time; closing time unstated". Deliberately distinct from
+ * TIME_RANGE_GLOBAL_PATTERN (which always requires a SECOND HH:MM) so the
+ * two never ambiguously overlap on the same clause.
+ */
+const OPEN_ENDED_TIME_PATTERN = /(\d{1,2}):(\d{2})\s*\+/;
+
 function toMinutes(hours: string, minutes: string): number | null {
   const h = Number(hours);
   const m = Number(minutes);
@@ -127,7 +136,28 @@ export interface OpeningInterval {
   openMinute: number;
   closeMinute: number;
   crossesMidnight: boolean;
+  /**
+   * Round 9.13.1 — true for an OSM open-ended range ("17:30+": known NOT to
+   * open before 17:30, closing time genuinely unstated). `openMinute` is a
+   * real, enforced boundary; `closeMinute` here is only a computational
+   * placeholder (`openMinute + OPEN_ENDED_PLACEHOLDER_MINUTES`) so this
+   * interval still fits the existing bounded-range arithmetic below — it
+   * must NEVER be read as a claimed real closing time. Every legality
+   * branch that would otherwise reject on a CLOSING boundary checks this
+   * flag first and skips that rejection instead of trusting the
+   * placeholder number.
+   */
+  openEnded?: boolean;
 }
+
+/**
+ * A generous placeholder span for an open-ended interval's internal
+ * `closeMinute` — large enough that no real single-visit duration should
+ * ever reach it (so the placeholder itself can never masquerade as a
+ * closing-time violation), never presented to a caller as a real close
+ * time (see `OpeningInterval.openEnded`).
+ */
+const OPEN_ENDED_PLACEHOLDER_MINUTES = 600;
 
 export type ParsedOpeningHours =
   | { kind: "known"; intervals: OpeningInterval[] }
@@ -210,13 +240,38 @@ function weekdayForLocalDate(localDate: string): number | null {
   return new Date(ms).getUTCDay();
 }
 
+/**
+ * Round 9.15.10 §G — Google Places display-hours use a 12-hour clock with an
+ * AM/PM suffix ("11:00 AM", "8:00 PM") — the structured parser only ever
+ * understood 24-hour "HH:MM". Converted BEFORE the day-spec/time-range
+ * regexes run, so every downstream consumer (OSM or Google) sees the same
+ * plain "HH:MM" shape and never needs to know which provider it came from
+ * (spec §B: normalize at the input boundary, never duplicate legality logic
+ * downstream). Matches a bare "." after A/P too ("11:00 A.M.").
+ */
+const AMPM_TIME_PATTERN = /\b(\d{1,2}):(\d{2})\s*([AaPp])\.?[Mm]\.?\b/g;
+
+function convertAmPmTo24Hour(text: string): string {
+  return text.replace(AMPM_TIME_PATTERN, (_match, hourText: string, minuteText: string, meridiemLetter: string) => {
+    let hour = Number(hourText);
+    if (Number.isNaN(hour)) return _match;
+    const isPm = meridiemLetter.toUpperCase() === "P";
+    if (hour === 12) hour = isPm ? 12 : 0;
+    else if (isPm) hour += 12;
+    return `${String(hour).padStart(2, "0")}:${minuteText}`;
+  });
+}
+
 function normalizeHoursText(raw: string): string {
-  return raw
-    .replace(/[–—]/g, "-")
-    .replace(/׳/g, "'") // Hebrew geresh → apostrophe
-    .replace(/’/g, "'")
-    .replace(/\bfrom\b/gi, " ")
-    .replace(/\bUhr\b/gi, " ")
+  return convertAmPmTo24Hour(
+    raw
+      .replace(/[‐-―−]/g, "-") // hyphen/en/em/figure/minus-sign variants → plain hyphen
+      .replace(/[  -   　]/g, " ") // non-breaking / narrow / other Unicode spaces → plain space
+      .replace(/׳/g, "'") // Hebrew geresh → apostrophe
+      .replace(/’/g, "'")
+      .replace(/\bfrom\b/gi, " ")
+      .replace(/\bUhr\b/gi, " ")
+  )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -299,6 +354,77 @@ function parseDaySpec(rawSpec: string): number[] | null {
   return null;
 }
 
+const ENGLISH_DAY_TOKEN_TEST_PATTERN = /\b(su|sun|sunday|mo|mon|monday|tu|tue|tues|tuesday|we|wed|weds|wednesday|th|thu|thur|thurs|thursday|fr|fri|friday|sa|sat|saturday)\b/i;
+const HEBREW_LETTER_DAY_TOKEN_TEST_PATTERN = /(?:^|[\s,])([אבגדהוש])\s*'/;
+
+/** Round 9.15.10 §F — does this text contain a recognizable day token at all (English, Hebrew word, or Hebrew geresh-letter)? The comma-disambiguation logic below uses this as its ONE lexical signal — never string-position heuristics. */
+function hasDayToken(text: string): boolean {
+  if (ENGLISH_DAY_TOKEN_TEST_PATTERN.test(text)) return true;
+  if (HEBREW_LETTER_DAY_TOKEN_TEST_PATTERN.test(text)) return true;
+  return Object.keys(HEBREW_DAY_WORD_TO_INDEX).some((word) => text.includes(word));
+}
+
+function hasTimeSignal(text: string): boolean {
+  return new RegExp(TIME_RANGE_GLOBAL_PATTERN.source, "i").test(text) || OPEN_ENDED_TIME_PATTERN.test(text);
+}
+
+/**
+ * Round 9.15.10 §F — THE comma-disambiguation fix. A comma inside one
+ * semicolon-delimited segment can mean three different things, and this is
+ * the one lexical rule (never a string-position/index heuristic) that tells
+ * them apart:
+ *
+ *  1. A DAY LIST — "Mo,We,Fr 09:00-17:00": each of "Mo"/"We" carries a day
+ *     token but no time of its own yet, so it's accumulated into the SAME
+ *     still-open clause until a segment finally supplies the time range.
+ *  2. MULTIPLE INTERVALS for the same days — "Mo-Fr 09:00-12:00,13:00-17:00":
+ *     once a clause already has both a day-spec AND a time range (it is
+ *     "closed"/complete), a further segment with NO day token of its own is
+ *     an additional interval for the SAME days, not a new clause.
+ *  3. GENUINELY SEPARATE DAY-RANGE CLAUSES — "Mo-We 17:00-01:00,Th-Sa
+ *     12:00-02:00,Su 12:00-01:00": once a clause is already complete (day +
+ *     time), a segment that itself carries a NEW day token starts a
+ *     genuinely new clause.
+ *
+ * A single segment (no comma at all) is returned unchanged — this function
+ * is a strict no-op for every already-supported single-clause form.
+ */
+function splitCommaSeparatedDayClauses(clauseText: string): string[] {
+  const segments = clauseText.split(",").map((segment) => segment.trim()).filter(Boolean);
+  if (segments.length <= 1) return segments.length === 1 ? segments : [clauseText];
+
+  const groups: string[][] = [];
+  let current: string[] | null = null;
+  let currentHasTime = false;
+
+  for (const segment of segments) {
+    const segmentHasDay = hasDayToken(segment);
+    const segmentHasTime = hasTimeSignal(segment);
+
+    if (current == null) {
+      current = [segment];
+      currentHasTime = segmentHasTime;
+      continue;
+    }
+
+    if (currentHasTime && segmentHasDay) {
+      // The current clause is already complete (day + time) and this
+      // segment brings its OWN day token — a genuinely new clause.
+      groups.push(current);
+      current = [segment];
+      currentHasTime = segmentHasTime;
+    } else {
+      // Either still building a day list (current has no time yet) or this
+      // is a bare additional time interval for the current clause's days.
+      current.push(segment);
+      currentHasTime = currentHasTime || segmentHasTime;
+    }
+  }
+  if (current) groups.push(current);
+
+  return groups.map((group) => group.join(","));
+}
+
 function intervalsFromRanges(text: string, days: number[] | null): OpeningInterval[] {
   const intervals: OpeningInterval[] = [];
   const pattern = new RegExp(TIME_RANGE_GLOBAL_PATTERN.source, "gi");
@@ -315,6 +441,36 @@ function intervalsFromRanges(text: string, days: number[] | null): OpeningInterv
     }
   }
   return intervals;
+}
+
+/** Round 9.13.1 — the open-ended-syntax analogue of intervalsFromRanges: one interval per applicable day, `openEnded: true`, closeMinute a placeholder only. */
+function intervalsFromOpenEnded(text: string, days: number[] | null): OpeningInterval[] {
+  const intervals: OpeningInterval[] = [];
+  const pattern = new RegExp(OPEN_ENDED_TIME_PATTERN.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) != null) {
+    const open = toMinutes(match[1], match[2]);
+    if (open == null) continue;
+    const dayList = days ?? [null];
+    for (const d of dayList) {
+      intervals.push({ dayOfWeek: d as number | null, openMinute: open, closeMinute: open + OPEN_ENDED_PLACEHOLDER_MINUTES, crossesMidnight: false, openEnded: true });
+    }
+  }
+  return intervals;
+}
+
+/**
+ * Round 9.15.10 §G — a PER-CLAUSE "open 24 hours" marker (Google Places'
+ * per-day display shape, e.g. "Monday: Open 24 hours" mixed among other
+ * explicitly-timed weekdays). Deliberately separate from the top-level
+ * ALWAYS_OPEN_PATTERNS shortcut in parseOpeningHours (which answers "is the
+ * WHOLE string always-open" and must stay a whole-string decision — a
+ * mid-string clause-level match here must never upgrade the entire parse to
+ * `{kind:"always"}` when other clauses carry real, different hours).
+ */
+function intervalsFromAlwaysOpenClause(days: number[] | null): OpeningInterval[] {
+  const dayList = days ?? [null];
+  return dayList.map((d) => ({ dayOfWeek: d as number | null, openMinute: 0, closeMinute: 24 * 60, crossesMidnight: false }));
 }
 
 /**
@@ -334,27 +490,61 @@ export function parseOpeningHours(rawText: string | null | undefined): ParsedOpe
   for (const pattern of EXPLICITLY_CLOSED_PATTERNS) {
     if (pattern.test(text)) return { kind: "closed" };
   }
-  for (const pattern of ALWAYS_OPEN_PATTERNS) {
-    if (pattern.test(text)) return { kind: "always" };
+  // Round 9.15.10 §G — this WHOLE-STRING shortcut must only fire when the
+  // string genuinely describes the whole week uniformly (a bare "24/7", or
+  // a bare "Open 24 hours" with no other clause). Once a real per-day
+  // breakdown exists (semicolon-separated clauses), "24 hours" appearing in
+  // ONE of those clauses (Google's per-day "Monday: Open 24 hours" shape)
+  // must never upgrade every OTHER day's own, different hours to "always
+  // open" — that per-clause case is handled below instead, scoped to just
+  // its own day(s).
+  const topLevelClauseCount = text.split(/[;\n]+/).filter((segment) => segment.trim().length > 0).length;
+  if (topLevelClauseCount <= 1) {
+    for (const pattern of ALWAYS_OPEN_PATTERNS) {
+      if (pattern.test(text)) return { kind: "always" };
+    }
   }
 
-  const clauses = text.split(/[;\n]+/).map((clause) => clause.trim()).filter(Boolean);
+  // Round 9.15.10 §F — semicolons are always an unambiguous top-level
+  // separator; commas are not (a day list, multiple intervals for the same
+  // days, and genuinely separate day-range clauses all use commas
+  // differently) — splitCommaSeparatedDayClauses resolves that ambiguity
+  // per semicolon-segment via the one lexical day-token signal, never a
+  // naive global comma split.
+  const clauses = text
+    .split(/[;\n]+/)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .flatMap((clause) => splitCommaSeparatedDayClauses(clause));
   const intervals: OpeningInterval[] = [];
   let sawClosedClause = false;
 
   for (const clause of clauses) {
     const hasTimeRange = new RegExp(TIME_RANGE_GLOBAL_PATTERN.source, "i").test(clause);
+    // Round 9.13.1 — only checked when there's no bounded range, so a
+    // clause like "17:30-18:00" (which itself contains a bare "18:00"
+    // that could otherwise coincidentally precede a stray "+") is never
+    // double-parsed.
+    const hasOpenEndedTime = !hasTimeRange && OPEN_ENDED_TIME_PATTERN.test(clause);
     // The day-spec is whatever precedes the first time range (or the whole
     // clause when it has no time range at all, e.g. "Su off").
     const firstTime = /\d{1,2}:\d{2}/.exec(clause);
     const daySpecText = firstTime ? clause.slice(0, firstTime.index) : clause;
     const days = parseDaySpec(daySpecText);
 
-    if (!hasTimeRange) {
+    if (!hasTimeRange && !hasOpenEndedTime) {
+      // Round 9.15.10 §G — a PER-CLAUSE always-open marker ("Monday: Open
+      // 24 hours") mixed among other explicitly-timed weekdays. Checked
+      // only here (never upgrades the whole-string result — see
+      // intervalsFromAlwaysOpenClause's own docstring).
+      if (days != null && ALWAYS_OPEN_PATTERNS.some((pattern) => pattern.test(clause))) {
+        intervals.push(...intervalsFromAlwaysOpenClause(days));
+        continue;
+      }
       if (/\b(off|closed|סגור)\b/i.test(clause)) sawClosedClause = true;
       continue;
     }
-    intervals.push(...intervalsFromRanges(clause, days));
+    intervals.push(...(hasTimeRange ? intervalsFromRanges(clause, days) : intervalsFromOpenEnded(clause, days)));
   }
 
   if (intervals.length > 0) return { kind: "known", intervals };
@@ -418,10 +608,14 @@ export function evaluateOpeningHoursLegality(input: OpeningHoursLegalityInput): 
   const applicable = applicableIntervals(parsed.intervals, weekday);
   if (applicable.length === 0) return { status: "CLOSED_ALL_DAY" };
 
-  // 1) Fully-contained?
+  // 1) Fully-contained? An open-ended interval (Round 9.13.1) has no real
+  // closing bound to check against — its own known OPENING boundary is
+  // still fully enforced (`startMinutes >= openOnDay`), but a start at or
+  // after that boundary is never rejected merely for running past the
+  // internal closeMinute placeholder.
   for (const { interval, openOnDay, closeOnDay } of applicable) {
     const entryOk = lastEntry == null || startMinutes <= lastEntry;
-    if (startMinutes >= openOnDay && activityEnd <= closeOnDay && entryOk) {
+    if (startMinutes >= openOnDay && (interval.openEnded || activityEnd <= closeOnDay) && entryOk) {
       return { status: "LEGAL", intervalUsed: interval };
     }
   }
@@ -430,8 +624,10 @@ export function evaluateOpeningHoursLegality(input: OpeningHoursLegalityInput): 
   const sorted = [...applicable].sort((a, b) => a.openOnDay - b.openOnDay);
 
   // Starts inside an interval but ends after it → duration overruns closing.
+  // Never applies to an open-ended interval (closeOnDay is a placeholder,
+  // not a real closing time — see OpeningInterval.openEnded).
   for (const { interval, openOnDay, closeOnDay } of sorted) {
-    if (startMinutes >= openOnDay && startMinutes < closeOnDay && activityEnd > closeOnDay) {
+    if (!interval.openEnded && startMinutes >= openOnDay && startMinutes < closeOnDay && activityEnd > closeOnDay) {
       return { status: "CLOSES_BEFORE_END", intervalUsed: interval };
     }
   }
@@ -480,12 +676,58 @@ export function earliestLegalStartMinute(
   const applicable = applicableIntervals(parsed.intervals, weekday);
   const duration = Math.max(durationMinutes, 0);
   let best: number | null = null;
-  for (const { openOnDay, closeOnDay } of applicable) {
+  for (const { interval, openOnDay, closeOnDay } of applicable) {
     let candidate = Math.max(openOnDay, notBefore);
     if (lastEntryMinutes != null) candidate = Math.min(candidate, lastEntryMinutes);
-    if (candidate >= openOnDay && candidate + duration <= closeOnDay && (lastEntryMinutes == null || candidate <= lastEntryMinutes)) {
+    // Round 9.13.1 — an open-ended interval's closeOnDay is a placeholder,
+    // never a real closing bound to fit the candidate's duration under.
+    const fitsClose = interval.openEnded || candidate + duration <= closeOnDay;
+    if (candidate >= openOnDay && fitsClose && (lastEntryMinutes == null || candidate <= lastEntryMinutes)) {
       best = best == null ? candidate : Math.min(best, candidate);
     }
   }
   return best;
+}
+
+/**
+ * Round 9.15.10 §H — the real Round 9.15.9 forensic finding this closes: an
+ * unparseable-but-non-empty `openingHours` string was indistinguishable
+ * from a genuinely missing one — both collapsed into the same silent
+ * `{kind:"unknown"}`, so the final firewall had no way to even SEE that a
+ * real venue's real hours were being ignored. This is deliberately a
+ * SEPARATE, additive function rather than a change to `ParsedOpeningHours`
+ * itself — `parseOpeningHours`'s existing 4-way kind and every one of its
+ * current callers are untouched; this exists purely for observability.
+ *
+ *  - PARSED               — produced known/always/closed (a real verdict).
+ *  - UNKNOWN_OR_MISSING    — no real data was ever supplied (null/empty, or
+ *                            this codebase's own "לא זמין" placeholder —
+ *                            the exact same equivalence country-itinerary-
+ *                            generation.ts already treats as "no hours").
+ *                            This is normal, expected, NOT a parser gap.
+ *  - MALFORMED             — non-empty, real-looking data (it contains a
+ *                            recognizable day token or a HH:MM-shaped time
+ *                            token) that still failed to produce any
+ *                            interval — a genuine "we tried and it didn't
+ *                            cohere" case.
+ *  - UNSUPPORTED_FORMAT    — non-empty data with NEITHER signal at all — a
+ *                            shape this parser has simply never been taught,
+ *                            never a false claim about the underlying data.
+ */
+export type OpeningHoursParseQuality = "PARSED" | "UNKNOWN_OR_MISSING" | "MALFORMED" | "UNSUPPORTED_FORMAT";
+
+const NOT_AVAILABLE_PLACEHOLDER = "לא זמין";
+
+export function classifyOpeningHoursParseQuality(rawText: string | null | undefined): OpeningHoursParseQuality {
+  if (rawText == null) return "UNKNOWN_OR_MISSING";
+  const trimmedRaw = rawText.trim();
+  if (!trimmedRaw || trimmedRaw === NOT_AVAILABLE_PLACEHOLDER) return "UNKNOWN_OR_MISSING";
+
+  const parsed = parseOpeningHours(rawText);
+  if (parsed.kind !== "unknown") return "PARSED";
+
+  const normalized = normalizeHoursText(rawText);
+  if (!normalized) return "UNKNOWN_OR_MISSING";
+  const looksLikeRealData = hasDayToken(normalized) || /\d{1,2}\s*:\s*\d{2}/.test(normalized);
+  return looksLikeRealData ? "MALFORMED" : "UNSUPPORTED_FORMAT";
 }

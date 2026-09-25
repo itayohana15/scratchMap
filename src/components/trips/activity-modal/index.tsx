@@ -17,6 +17,7 @@ import { TipsSection } from "@/components/trips/activity-modal/tips-section";
 import { useActivityModalData } from "@/components/trips/activity-modal/use-activity-modal-data";
 import { WhyInItinerarySection } from "@/components/trips/activity-modal/why-here";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { IsolatedText } from "@/components/ui/isolated-text";
 import { Textarea } from "@/components/ui/textarea";
 import type { CountryItineraryRecord } from "@/lib/itineraries";
 import { createEmptyBooking, upsertBooking } from "@/lib/trip-bookings";
@@ -113,14 +114,14 @@ export function ActivityDetailsModal({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[calc(100vh-64px)] w-[min(900px,calc(100vw-64px))] flex-col gap-0 overflow-hidden rounded-[2rem] border border-border/70 bg-background p-0 sm:max-w-none">
-        <DialogTitle className="sr-only">{item.name}</DialogTitle>
+        <DialogTitle className="sr-only"><IsolatedText>{item.name}</IsolatedText></DialogTitle>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
           <ActivityHero item={item} countryName={countryName} open={open} />
 
           <div className="space-y-1">
-            <h2 className="font-heading text-xl font-semibold leading-tight">{item.name}</h2>
-            <p className="text-sm text-muted-foreground">{item.location || countryName}</p>
+            <h2 className="font-heading text-xl font-semibold leading-tight"><IsolatedText>{item.name}</IsolatedText></h2>
+            <p className="text-sm text-muted-foreground">{item.location ? <IsolatedText>{item.location}</IsolatedText> : countryName}</p>
           </div>
 
           <StatusActions

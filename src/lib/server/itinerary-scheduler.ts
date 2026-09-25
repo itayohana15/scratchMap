@@ -1,6 +1,7 @@
 import type { ArrivalDepartureWindow } from "../flight-planning";
 import type { AiGeneratedItem } from "../trip-workspace";
 import { classifyVisitScale, resolveVisitDurationMinutes, type VisitScale } from "./itinerary-planning-principles";
+import { logRealPlaceQA } from "./real-place-qa";
 
 /**
  * Real per-day clock-time scheduler — the missing piece that let two items
@@ -26,9 +27,70 @@ const DEFAULT_DAY_END_MINUTES = 22 * 60; // 22:00
 const MIN_WINDOW_MINUTES = 60;
 
 // Realistic buffers between activities (spec item 17) — never back-to-back.
-const BUFFER_NORMAL_MINUTES = 8; // 5-10 range
-const BUFFER_RESERVATION_MINUTES = 20; // 15-30 range
-const BUFFER_LARGE_ATTRACTION_MINUTES = 30;
+// Round 9.15.2 §G/§H/§I/§J — this is now split into two conceptually
+// distinct pieces per exit buffer (never exposed as separate items to the
+// user — both stay internal timeline spacing, spec §N):
+//   - "operational" (spec §I): mandatory practical overhead (leaving the
+//     venue, finding the exit) — small, and NEVER compressed, even for a
+//     fixed-time event (spec §M point 2).
+//   - "pacing" (spec §J): human breathing room — contextual by what the
+//     PREVIOUS item actually was (coffee/ordinary attraction/lunch/dinner/
+//     physically demanding), and the ONLY piece a fixed-time event may
+//     compress (spec §L/§M point 3), never below a small residual.
+// The old flat BUFFER_NORMAL_MINUTES(8)/BUFFER_RESERVATION_MINUTES(20)/
+// BUFFER_LARGE_ATTRACTION_MINUTES(30) constants are gone — every case they
+// covered is now one row in PACING_BUFFER_MINUTES_BY_REASON below (kept at
+// or above the LOW end of spec §J's own ranges, deliberately conservative
+// to bound how many pre-existing exact-time assertions shift).
+const OPERATIONAL_BUFFER_MINUTES_ORDINARY = 5;
+const OPERATIONAL_BUFFER_MINUTES_RESERVATION_OR_MAJOR = 10;
+const MIN_COMPRESSED_PACING_MINUTES = 5;
+
+export type PacingBufferReason = "COFFEE_CAFE" | "ORDINARY_ATTRACTION" | "LUNCH" | "DINNER" | "PHYSICALLY_DEMANDING" | "RESERVATION";
+
+const PACING_BUFFER_MINUTES_BY_REASON: Record<PacingBufferReason, number> = {
+  COFFEE_CAFE: 12,
+  ORDINARY_ATTRACTION: 18,
+  LUNCH: 30,
+  DINNER: 35,
+  PHYSICALLY_DEMANDING: 60,
+  RESERVATION: 15,
+};
+
+/**
+ * Round 9.15.2 §G/§J — classifies WHY a pacing buffer of a given size
+ * applies, from the item that just ended. A meal's OWN `slot` (lunch vs
+ * dinner) is the primary signal (never guessed from category name alone,
+ * since a "cafe" category item can legitimately be either a quick coffee
+ * stop or the day's lunch); a cafe-category item with no lunch/dinner slot
+ * is treated as an ordinary quick coffee stop, never a full meal.
+ */
+export function classifyPacingBufferReason(item: AiGeneratedItem, scale: VisitScale | null): PacingBufferReason {
+  if (item.reservationRequired) return "RESERVATION";
+  const isMealCategory = item.category === "restaurant" || item.category === "cafe";
+  if (isMealCategory) {
+    if (item.slot === "dinner") return "DINNER";
+    if (item.slot === "lunch") return "LUNCH";
+    return "COFFEE_CAFE";
+  }
+  if (scale === "full_day" || scale === "half_day") return "PHYSICALLY_DEMANDING";
+  return "ORDINARY_ATTRACTION";
+}
+
+export interface ExitBufferBreakdown {
+  operationalMinutes: number;
+  pacingMinutes: number;
+  reason: PacingBufferReason;
+}
+
+function computeExitBufferBreakdown(item: AiGeneratedItem, scale: VisitScale | null): ExitBufferBreakdown {
+  const reason = classifyPacingBufferReason(item, scale);
+  const operationalMinutes =
+    item.reservationRequired || scale === "full_day" || scale === "half_day"
+      ? OPERATIONAL_BUFFER_MINUTES_RESERVATION_OR_MAJOR
+      : OPERATIONAL_BUFFER_MINUTES_ORDINARY;
+  return { operationalMinutes, pacingMinutes: PACING_BUFFER_MINUTES_BY_REASON[reason], reason };
+}
 
 // A leftover window shorter than this isn't worth a dedicated "זמן חופשי"
 // block — it just becomes slack before the next scheduled thing.
@@ -87,10 +149,36 @@ export function computeDayWindow(
   return { startMinutes: start, endMinutes: end };
 }
 
-function bufferMinutesFor(item: AiGeneratedItem, scale: VisitScale | null): number {
-  if (item.reservationRequired) return BUFFER_RESERVATION_MINUTES;
-  if (scale === "half_day" || scale === "full_day") return BUFFER_LARGE_ATTRACTION_MINUTES;
-  return BUFFER_NORMAL_MINUTES;
+/**
+ * Round 9.15.2 §G/§L/§M — the exit buffer after an item ends, now
+ * contextual (spec §J's "not hard constants" — see PACING_BUFFER_MINUTES_BY_REASON).
+ * `compressForFixedEvent` (spec §L/§M): when the NEXT item is a fixed-time
+ * commitment that would otherwise be missed, the OPTIONAL pacing portion
+ * may shrink to a small residual — the MANDATORY operational portion never
+ * does, and this function never touches real travel time (that stays a
+ * separate addend at every call site, unchanged).
+ */
+export function bufferMinutesFor(item: AiGeneratedItem, scale: VisitScale | null, compressForFixedEvent = false): number {
+  const { operationalMinutes, pacingMinutes } = computeExitBufferBreakdown(item, scale);
+  const effectivePacing = compressForFixedEvent ? Math.min(pacingMinutes, MIN_COMPRESSED_PACING_MINUTES) : pacingMinutes;
+  return operationalMinutes + effectivePacing;
+}
+
+/**
+ * Round 9.4.4 §Q2 — a real arrival/entry buffer (queue, security, ticket
+ * check-in) BEFORE a visit starts, distinct from bufferMinutesFor's own
+ * EXIT buffer after it ends. Only applied where real evidence supports it
+ * (a reservation requirement, or a half/full-day-scale major attraction —
+ * the same two signals bufferMinutesFor already uses on the exit side) —
+ * never for an ordinary short/medium stop, and never by shrinking the
+ * visit's own duration (spec's explicit "do not solve fuller days by
+ * shrinking activity durations" applies here too — this ADDS time, never
+ * subtracts from resolveVisitDurationMinutes's own result).
+ */
+function entryBufferMinutesFor(item: AiGeneratedItem, scale: VisitScale | null): number {
+  if (item.reservationRequired) return 15;
+  if (scale === "half_day" || scale === "full_day") return 15;
+  return 0;
 }
 
 // Rotating phrasing (not one fixed name) — a multi-day trip based in one
@@ -316,6 +404,10 @@ export function scheduleDayItems(orderedItems: AiGeneratedItem[], window: DayTim
       // entirely and trust the item's own number.
       const isFillerItem = item.category === "practical";
       const scale = isFillerItem ? null : classifyVisitScale(item);
+      // Round 9.4.4 §Q2 — real entry/queue/security buffer, after travel
+      // but before the visit itself starts (never applied to a filler
+      // block, which has no "entry" of its own).
+      if (!isFillerItem) start += entryBufferMinutesFor(item, scale);
       const remainingWindow = Math.max(boundary - start, 60);
       const resolvedDuration = isFillerItem
         ? Math.max(item.estimatedDurationMinutes ?? 30, 5)
@@ -331,7 +423,29 @@ export function scheduleDayItems(orderedItems: AiGeneratedItem[], window: DayTim
       }
 
       scheduled.push({ ...item, plannedStartTime: minutesToClock(start), endTime: minutesToClock(end) });
-      cursor = end + bufferMinutesFor(item, scale);
+      // Round 9.15.2 §L/§M — a full pacing buffer here would push past the
+      // upcoming fixed anchor's own start (or the day's end); the OPTIONAL
+      // pacing portion compresses to make room, the MANDATORY operational
+      // portion never does (bufferMinutesFor's own compressForFixedEvent
+      // flag, never touching travel time, which is added separately at the
+      // top of this same loop body).
+      const wouldOverrunBoundary = end + bufferMinutesFor(item, scale) > boundary;
+      // Round 9.15.2 §AE — bounded: only the compression case is logged
+      // (an ordinary gap that never presses against the boundary is not
+      // an "internal scoring attempt" worth a line for every item).
+      if (wouldOverrunBoundary) {
+        const breakdown = computeExitBufferBreakdown(item, scale);
+        logRealPlaceQA("PacingBufferDecision", {
+          reason: breakdown.reason,
+          pacingMinutes: breakdown.pacingMinutes,
+          compressedTo: Math.min(breakdown.pacingMinutes, MIN_COMPRESSED_PACING_MINUTES),
+        });
+        logRealPlaceQA("OperationalBufferDecision", {
+          operationalMinutes: breakdown.operationalMinutes,
+          preserved: true,
+        });
+      }
+      cursor = end + bufferMinutesFor(item, scale, wouldOverrunBoundary);
     }
   }
 

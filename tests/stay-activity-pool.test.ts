@@ -19,12 +19,17 @@ import {
   defaultFetchNearbyRecommendations,
   OverpassProviderFailureError,
   CANDIDATE_RESERVE_FACTOR,
+  computeUsableActivityPoolTarget,
+  classifyCandidateReach,
+  estimateOneWayTravelMinutes,
+  meetsExcursionValueBar,
   type StayDayCapacityInput,
   type StayActivityPool,
   type StayActivityPoolCandidate,
   type RecentActivityHistoryEntry,
 } from "../src/lib/server/stay-activity-pool";
 import type { TripFrame, TripFramePhase } from "../src/lib/server/itinerary-planning-principles";
+import { evaluateDayTripFeasibility } from "../src/lib/trip-workspace";
 import type { TripRecommendation, DestinationMobilityProfile } from "../src/lib/trip-workspace";
 import type { OverpassNearbyRecommendation, FetchLike } from "../src/lib/places/overpass";
 
@@ -77,6 +82,10 @@ function rec(overrides: Partial<TripRecommendation> = {}): TripRecommendation {
     website: null,
     wheelchairAccessible: null,
     isFree: null,
+    // Round 9.9 — pass-through so tests can attach provenance/osmTags for
+    // classifyTouristEligibility; absent (undefined) for every pre-existing
+    // caller that never set it, exactly like every other optional field above.
+    provenance: overrides.provenance,
   };
 }
 
@@ -543,4 +552,300 @@ test("Round 9.3.3: a real provider outage reaching refillStayActivityPool throug
   });
   assert.equal(refilled.diagnostics.providerFailures, 1, "the underlying Overpass outage must be visible here, not swallowed into a bare empty result");
   assert.equal(refilled.candidates.length, 0);
+});
+
+/* ==================================================================== *
+ * ROUND 9.9 — TOURIST ELIGIBILITY APPLIED AT POOL-ADMISSION TIME         *
+ * (classifyTouristEligibility's own pure classification is unit-tested  *
+ * directly in tests/activity-taxonomy.test.ts — these tests cover the   *
+ * PIPELINE wiring: that the gate actually runs inside buildStayActivity-*
+ * Pool/acceptRawCandidatesIntoPool, BEFORE any candidate reaches the     *
+ * pool's own `candidates` array that selectStayPortfolio/backfillReal-   *
+ * Activities later draw from — spec §F's "not real place -> portfolio   *
+ * -> repair later".)                                                     *
+ * ==================================================================== */
+
+function junkRec(overrides: Partial<TripRecommendation> = {}): TripRecommendation {
+  return rec({
+    id: "junk-target",
+    name: "Target",
+    category: "shopping",
+    provenance: { provider: "overpass", providerId: "overpass:shopping:10.00000:10.00000:Target", osmTags: { shop: "department_store", brand: "Target", name: "Target" } },
+    ...overrides,
+  });
+}
+function strongRec(overrides: Partial<TripRecommendation> = {}): TripRecommendation {
+  return rec({
+    id: "strong-museum",
+    name: "City History Museum",
+    category: "museum",
+    provenance: { provider: "overpass", providerId: "overpass:museum:10.00000:10.00000:City History Museum", osmTags: { tourism: "museum", name: "City History Museum" } },
+    ...overrides,
+  });
+}
+
+// Test M — low-value rejection happens BEFORE portfolio: a junk candidate
+// never even reaches pool.candidates, so selectStayPortfolio (which only
+// ever sees pool.candidates) structurally cannot admit it.
+test("Round 9.9 test M: a low-value candidate (Target) is rejected at pool admission, before it could ever reach the portfolio", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const owned = [junkRec(), strongRec()];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.ok(!pool.candidates.some((c) => c.name === "Target"), "Target must never reach the pool's own candidates array");
+  assert.ok(pool.candidates.some((c) => c.name === "City History Museum"), "a genuine museum must still be admitted");
+  assert.equal(pool.diagnostics.touristIneligibleRejected, 1);
+});
+
+// Test N — an unused ANCHOR/STRONG candidate remains available (the
+// pre-existing "prefer real content over FreeTime" principle, spec §G,
+// depends entirely on the pool actually containing it — verified here that
+// the new gate never over-rejects genuine tourist content).
+test("Round 9.9 test N: a genuine strong candidate stays available in the pool even when junk was discovered alongside it", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const owned = [junkRec(), strongRec({ id: "strong-2", name: "Old Town Historic Site", provenance: { provider: "overpass", providerId: "x", osmTags: { historic: "yes", name: "Old Town Historic Site" } } })];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.equal(pool.candidates.length, 1, "exactly the one genuine strong candidate remains — available for backfillRealActivities to prefer over FreeTime");
+  assert.equal(pool.candidates[0]!.name, "Old Town Historic Site");
+});
+
+// Test O — a junk candidate does NOT beat FreeTime: even when it is the
+// ONLY candidate discovered for a supply-starved stay, it still never
+// enters the pool (the gate has no supply-awareness — scarcity can never
+// relax it, spec §G: "if the only available candidates are Target...
+// FreeTime is preferable").
+test("Round 9.9 test O: a junk candidate is rejected even when it is the ONLY candidate a supply-starved stay has", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const owned = [junkRec()];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.equal(pool.candidates.length, 0, "junk must be rejected even as the sole candidate — a downstream FreeTime block is the correct outcome, never scheduling Target");
+});
+
+// Test P — production-shaped contamination fixture (spec §J), modeled
+// directly on the actual Round 9.8 evidence: a generic big-box store, a
+// generic mall, a neighborhood playground, a community recreation center,
+// an ordinary sports field, a museum, a historic landmark, a major
+// destination park, and a destination market, all discovered for the SAME
+// stay in the SAME round.
+test("Round 9.9 test P: production-shaped contamination fixture — junk excluded, genuine tourist content and destination market survive", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 6 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const owned: TripRecommendation[] = [
+    rec({ id: "big-box", name: "Generic Big-Box Store", category: "shopping", provenance: { provider: "overpass", providerId: "1", osmTags: { shop: "department_store", name: "Generic Big-Box Store" } } }),
+    rec({ id: "generic-mall", name: "Riverside Shopping Centre", category: "shopping", provenance: { provider: "overpass", providerId: "2", osmTags: { shop: "mall", name: "Riverside Shopping Centre" } } }),
+    rec({ id: "playground", name: "Elm Street Playground", category: "family", provenance: { provider: "overpass", providerId: "3", osmTags: { leisure: "park", name: "Elm Street Playground" } } }),
+    rec({ id: "rec-center", name: "Downtown Community Recreation Center", category: "family", provenance: { provider: "overpass", providerId: "4", osmTags: { amenity: "community_centre", name: "Downtown Community Recreation Center" } } }),
+    rec({ id: "sports-field", name: "Lincoln Athletic Field", category: "family", provenance: { provider: "overpass", providerId: "5", osmTags: { leisure: "pitch", name: "Lincoln Athletic Field" } } }),
+    rec({ id: "museum", name: "City Art Museum", category: "museum", provenance: { provider: "overpass", providerId: "6", osmTags: { tourism: "museum", name: "City Art Museum" } } }),
+    rec({ id: "historic", name: "Founders' Square", category: "attraction", provenance: { provider: "overpass", providerId: "7", osmTags: { historic: "yes", name: "Founders' Square" } } }),
+    rec({ id: "destination-park", name: "Riverside National Park", category: "family", provenance: { provider: "overpass", providerId: "8", osmTags: { leisure: "park", name: "Riverside National Park", wikipedia: "en:Riverside National Park" } } }),
+    rec({ id: "market", name: "Old Town Market Hall", category: "shopping", provenance: { provider: "overpass", providerId: "9", osmTags: { amenity: "marketplace", name: "Old Town Market Hall" } } }),
+  ];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3, 4, 5, 6].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  const admittedNames = new Set(pool.candidates.map((c) => c.name));
+
+  for (const junkName of ["Generic Big-Box Store", "Riverside Shopping Centre", "Elm Street Playground", "Downtown Community Recreation Center", "Lincoln Athletic Field"]) {
+    assert.ok(!admittedNames.has(junkName), `${junkName} must not consume a normal tourist portfolio slot`);
+  }
+  for (const goodName of ["City Art Museum", "Founders' Square", "Riverside National Park", "Old Town Market Hall"]) {
+    assert.ok(admittedNames.has(goodName), `${goodName} must survive as genuine tourist content`);
+  }
+  assert.equal(pool.diagnostics.touristIneligibleRejected, 5);
+});
+
+/* ==================================================================== *
+ * ROUND 9.11 — POOL DEPTH + TRAVEL-TIME REACH + DURATION-AWARE DAY      *
+ * COMPOSITION (the pool-level / geography-level half; day-composition   *
+ * (FULL_DAY/HALF_DAY backfill exemption) is tested in                   *
+ * tests/country-itinerary-generation.test.ts, where backfillRealActiv-  *
+ * ities itself lives).                                                  *
+ * ==================================================================== */
+
+// km -> degrees-of-latitude offset, for building test candidates at a
+// known approximate distance from a (0,0)-ish anchor (1° latitude ≈ 111km).
+function latOffsetForKm(km: number): number {
+  return km / 111;
+}
+
+// Test A — 3 days -> usable pool target 12.
+test("Round 9.11 test A: a 3-day stay has a usable activity pool target of 12", () => {
+  assert.equal(computeUsableActivityPoolTarget(3), 12);
+});
+
+// Test B — 7 days -> target 28.
+test("Round 9.11 test B: a 7-day stay has a usable activity pool target of 28", () => {
+  assert.equal(computeUsableActivityPoolTarget(7), 28);
+});
+
+test("Round 9.11: 5-day -> 20, 10-day -> 40 (spec's own worked examples)", () => {
+  assert.equal(computeUsableActivityPoolTarget(5), 20);
+  assert.equal(computeUsableActivityPoolTarget(10), 40);
+});
+
+// Test C — rejected tourist candidates do not count toward the target: a
+// stay's pool.candidates.length (what the target is measured against) only
+// ever contains admitted, tourist-eligible candidates.
+test("Round 9.11 test C: rejected tourist-ineligible candidates never count toward usableActivityPoolTarget", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const owned = [junkRec(), junkRec({ id: "junk-2", name: "Forman Mills", provenance: { provider: "overpass", providerId: "x", osmTags: { shop: "department_store", name: "Forman Mills" } } }), strongRec()];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.equal(pool.usableActivityPoolTarget, computeUsableActivityPoolTarget(capacity.usableSightseeingDays));
+  assert.equal(pool.candidates.length, 1, "only the one genuine museum counts toward the pool — both junk candidates are excluded");
+  assert.ok(pool.candidates.length < pool.usableActivityPoolTarget!, "3 raw candidates (2 junk + 1 real) can never satisfy a 12-target regardless of raw count");
+});
+
+// Test D — low-value candidates cannot pad the pool even when supply is thin.
+test("Round 9.11 test D: low-value candidates cannot pad the pool to reach the target", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const manyJunk = Array.from({ length: 20 }, (_, i) =>
+    rec({ id: `junk-${i}`, name: `Big Box Store ${i}`, category: "shopping", provenance: { provider: "overpass", providerId: `j${i}`, osmTags: { shop: "department_store", name: `Big Box Store ${i}` } } })
+  );
+  const assigned = assignCandidatesToStays(manyJunk, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.equal(pool.candidates.length, 0, "20 raw junk candidates must still yield a pool of exactly 0 — quantity never substitutes for quality");
+});
+
+// Tests E/F/G/H — reach classification + the excursion value gate.
+test("Round 9.11 test E: a local candidate (~30km, ~40min) is classified LOCAL and always admissible", () => {
+  const minutes = estimateOneWayTravelMinutes(30);
+  const reach = classifyCandidateReach(minutes);
+  assert.equal(reach, "LOCAL");
+  assert.equal(meetsExcursionValueBar(reach, "TOURIST_SUPPORTING"), true, "a LOCAL candidate needs no extra value bar");
+});
+
+test("Round 9.11 test F: a strong ~100-minute excursion candidate (TOURIST_ANCHOR) is eligible", () => {
+  const minutes = estimateOneWayTravelMinutes(150);
+  const reach = classifyCandidateReach(minutes);
+  assert.equal(reach, "EXCURSION");
+  assert.equal(meetsExcursionValueBar(reach, "TOURIST_ANCHOR"), true, "a major/anchor-tier attraction justifies a ~150-minute excursion");
+});
+
+test("Round 9.11 test G: a weak ~100-minute excursion candidate (TOURIST_SUPPORTING) is rejected", () => {
+  const minutes = estimateOneWayTravelMinutes(150);
+  const reach = classifyCandidateReach(minutes);
+  assert.equal(reach, "EXCURSION");
+  assert.equal(meetsExcursionValueBar(reach, "TOURIST_SUPPORTING"), false, "an ordinary supporting attraction never justifies a 150-minute one-way trip");
+  assert.equal(meetsExcursionValueBar(reach, "DESTINATION_SHOPPING"), false);
+});
+
+test("Round 9.11 test H: a >150-minute ordinary candidate is excluded outright, regardless of value tier", () => {
+  const minutes = estimateOneWayTravelMinutes(250);
+  const reach = classifyCandidateReach(minutes);
+  assert.equal(reach, "TOO_FAR");
+  assert.equal(meetsExcursionValueBar(reach, "TOURIST_ANCHOR"), false, "even a TOURIST_ANCHOR cannot buy its way past the absolute 150-minute ceiling");
+});
+
+// Integration: the excursion path actually admits a strong ~150-minute
+// candidate into the pool, tagged with the correct reach, and rejects an
+// equally-far but low-value one.
+test("Round 9.11: a strong excursion-distance candidate is admitted into the pool and tagged EXCURSION", () => {
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const farLat = 10 + latOffsetForKm(150);
+  const owned = [
+    rec({ id: "excursion-strong", name: "Grand National Park", category: "nature", lat: farLat, lon: 10, provenance: { provider: "overpass", providerId: "e1", osmTags: { tourism: "attraction", name: "Grand National Park" } } }),
+    // Ordinarily portfolio-eligible (TOURIST_SUPPORTING — a genuine family-
+    // category park with real positive structured evidence, Round 9.13 §M)
+    // but NOT strong enough (SUPPORTING, not ANCHOR/STRONG) to justify a
+    // 150-minute one-way trip — must be rejected by the EXCURSION-specific
+    // value bar specifically, not by ordinary tourist-eligibility.
+    rec({ id: "excursion-weak", name: "Roadside Rest Park", category: "family", lat: farLat, lon: 10.01, provenance: { provider: "overpass", providerId: "e2", osmTags: { leisure: "park", name: "Roadside Rest Park", wikipedia: "en:Roadside Rest Park" } } }),
+  ];
+  const assigned = assignCandidatesToStays(owned, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  const pool = buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+  assert.equal(pool.candidates.length, 1, "only the strong excursion candidate is admitted");
+  assert.equal(pool.candidates[0]!.name, "Grand National Park");
+  assert.equal(pool.candidates[0]!.reach, "EXCURSION");
+  assert.equal(pool.diagnostics.excursionCandidateCount, 1);
+  assert.equal(pool.diagnostics.excursionValueRejected, 1, "the weak far-away candidate is rejected via the value gate, not silently merged into ordinary geographyRejected");
+});
+
+// Round 9.11 — poolTargetMet (the TouristEligibilityFunnel log field) must
+// be computed against the POST-FILTER pool, never raw discovery count: 20
+// raw junk candidates for a 3-day stay (target 12) must report
+// poolTargetMet: false, not true just because 20 >= 12 at the RAW level.
+test("Round 9.11: poolTargetMet is computed against the post-filter pool, not raw candidate count", (t) => {
+  const originalEnv = process.env.PLANNER_QA_TRACE;
+  const originalLog = console.log;
+  process.env.PLANNER_QA_TRACE = "1";
+  const calls: unknown[][] = [];
+  console.log = (...args: unknown[]) => calls.push(args);
+  t.after(() => {
+    console.log = originalLog;
+    if (originalEnv === undefined) delete process.env.PLANNER_QA_TRACE;
+    else process.env.PLANNER_QA_TRACE = originalEnv;
+  });
+
+  const tripFrame = frame([{ areaLabel: "Area A", startDayNumber: 1, endDayNumber: 3 }]);
+  const anchor = { lat: 10, lon: 10 };
+  const manyJunk = Array.from({ length: 20 }, (_, i) =>
+    rec({ id: `junk2-${i}`, name: `Big Box Store ${i}`, category: "shopping", provenance: { provider: "overpass", providerId: `k${i}`, osmTags: { shop: "department_store", name: `Big Box Store ${i}` } } })
+  );
+  const assigned = assignCandidatesToStays(manyJunk, tripFrame, new Map([["Area A", anchor]]), normalizeArea, textMatch);
+  const capacity = computeStayCapacity([1, 2, 3].map((d) => ({ dayNumber: d, dayType: "normal" as const, hasExplicitRestWindow: false })));
+  buildStayActivityPool(tripFrame.phases[0], assigned.get("stay-0")!, anchor, MOBILITY, capacity, [], 600);
+
+  const funnelCall = calls.find((args) => args[0] === "[RealPlaceQA:TouristEligibilityFunnel]");
+  assert.ok(funnelCall, "TouristEligibilityFunnel must be logged");
+  const details = funnelCall![1] as { poolTargetMet: boolean; rawCandidateCount: number; usableActivityPoolTarget: number };
+  assert.equal(details.rawCandidateCount, 20, "sanity: 20 raw candidates really were discovered");
+  assert.equal(details.poolTargetMet, false, "20 raw junk candidates must never satisfy the target — only post-filter usable content counts");
+});
+
+// Round 9.11 — closes a real test-coverage gap found while mutation-testing
+// this round: every existing tourist-eligibility test exercised
+// buildStayActivityPool's (payload-owned) admission gate, never
+// acceptRawCandidatesIntoPool's — the actual LIVE-DISCOVERY refill path
+// (refillStayActivityPool/refillTripRecommendationPool) real Overpass/
+// Google candidates go through. Verifies the gate holds on THAT path too.
+test("Round 9.11: acceptRawCandidatesIntoPool (the live-discovery refill path) also rejects a Target-shaped junk candidate", async () => {
+  const anchor = { lat: 10, lon: 10 };
+  const capacity = { usableSightseeingDays: 3, requiredRealActivityTarget: 9, perDayTargets: [] };
+  const pool = buildStayActivityPool({ id: "s", areaLabel: "Area A", nights: 3, startDayNumber: 1, endDayNumber: 3, intent: "mixed" }, [], anchor, MOBILITY, capacity, [], 600);
+  const fakeFetch = async (): Promise<OverpassNearbyRecommendation[]> => [
+    { name: "Target", category: "shopping", location: "Area A", shortDescription: null, lat: 10.01, lon: 10.01, openingHours: null, wikipediaUrl: null, website: null, provenance: { provider: "overpass", providerId: "overpass:shopping:10.01:10.01:Target", osmTags: { shop: "department_store", name: "Target" } } },
+    { name: "City History Museum", category: "museum", location: "Area A", shortDescription: null, lat: 10.01, lon: 10.02, openingHours: null, wikipediaUrl: null, website: null, provenance: { provider: "overpass", providerId: "overpass:museum:10.01:10.02:City History Museum", osmTags: { tourism: "museum", name: "City History Museum" } } },
+  ];
+  const { pool: refilled } = await refillStayActivityPool(pool, MOBILITY, 600, [], { fetchCandidates: fakeFetch, maxRounds: 1 });
+  assert.ok(!refilled.candidates.some((c) => c.name === "Target"), "Target must never survive the live-discovery refill path either");
+  assert.ok(refilled.candidates.some((c) => c.name === "City History Museum"), "the genuine museum must still be admitted");
+});
+
+// Test O — excursion day includes round-trip travel accounting (reuses the
+// EXISTING day-trip feasibility machinery, never new composition code).
+test("Round 9.11 test O: evaluateDayTripFeasibility accounts for round-trip travel, not just one-way", () => {
+  const farButShort = evaluateDayTripFeasibility({
+    outboundTravelMinutes: 150,
+    returnTravelMinutes: 150,
+    internalTravelMinutes: 0,
+    visitMinutes: 60,
+    usableMinutes: 600,
+  });
+  assert.equal(farButShort.totalMinutes, 360, "outbound + return + visit must all be counted, not just the one-way trip");
+  assert.equal(farButShort.feasible, false, "300 minutes of round-trip travel for a 60-minute visit fails the value-ratio floor even though it fits the time budget");
+
+  const worthwhile = evaluateDayTripFeasibility({
+    outboundTravelMinutes: 90,
+    returnTravelMinutes: 90,
+    internalTravelMinutes: 0,
+    visitMinutes: 240,
+    usableMinutes: 600,
+  });
+  assert.equal(worthwhile.feasible, true, "a major multi-hour anchor justifies the same round-trip travel a short visit could not");
 });

@@ -94,6 +94,8 @@ export interface TripPreferenceProfile {
   dietaryKeywords: string[];
   preferredAreaKeywords: string[];
   luxuryEnabled: boolean;
+  /** Round 9.4.4 §S1 — true only when the user's own words say so (ROAD_TRIP_KEYWORDS); an inter-stay transfer chooser reads this to prefer driving even when flying would be faster, and must never assume it by default. */
+  roadTripIntent: boolean;
   summary: string;
 }
 
@@ -392,6 +394,27 @@ const LUXURY_KEYWORDS = [
   "יוקרתי",
   "פיין דיינינג",
   "מסעדת שף",
+];
+
+// Round 9.4.4 §S1 — explicit trip transport strategy: an inter-stay
+// transfer chooser must never silently assume every trip is a road trip
+// (spec's own explicit warning), so this is a real user-signal-derived
+// flag, same keyword-detection pattern as LUXURY_KEYWORDS, checked ONLY
+// when the user's own words actually say so.
+const ROAD_TRIP_KEYWORDS = [
+  "road trip",
+  "roadtrip",
+  "self-drive",
+  "self drive",
+  "driving trip",
+  "driving vacation",
+  "car trip",
+  "טיול רכב",
+  "טיול דרכים",
+  "נסיעה ברכב",
+  "נהיגה",
+  "רכב שכור",
+  "השכרת רכב",
 ];
 
 const PREMIUM_VENUE_KEYWORDS = [
@@ -693,7 +716,16 @@ export { deriveDailyCapacityMinutes } from "../trip-workspace";
 // known candidate id or real coordinates) — shared here, not reimplemented,
 // so these three checks can never drift from duplicatePlaces' own
 // definition of "real."
-function isRealPlaceCandidate(item: Pick<AiGeneratedItem, "recommendationId" | "lat" | "lon">): boolean {
+// Round 9.15.6.1 §C — a known synthetic itemRole (e.g. "hotel_recovery",
+// which legitimately carries real stay-anchor coordinates on every
+// occurrence by design) must never be treated as a real-place claim
+// merely because it has coordinates — coordinates presence alone is never
+// a valid "is this a real place" classifier. Checked here BEFORE the
+// coordinate check below, never after, so a synthetic item's real
+// coordinates never even reach the branch that would otherwise treat them
+// as a place identity.
+function isRealPlaceCandidate(item: Pick<AiGeneratedItem, "recommendationId" | "lat" | "lon" | "itemRole">): boolean {
+  if (isSyntheticScheduleItem(item)) return false;
   return Boolean(item.recommendationId) || (item.lat != null && item.lon != null);
 }
 
@@ -1341,6 +1373,10 @@ export function buildTripPreferenceProfile(
     `${preferences.tripStyle} ${preferences.interests} ${preferences.generationMode}`,
     LUXURY_KEYWORDS
   );
+  const roadTripIntent = includesAnyKeyword(
+    `${preferences.tripStyle} ${preferences.interests} ${preferences.generationMode} ${preferences.transportationPreferences}`,
+    ROAD_TRIP_KEYWORDS
+  );
 
   const hardConstraints = [
     budgetTarget != null ? `תקציב מקסימלי: ₪${budgetTarget}` : "",
@@ -1427,6 +1463,7 @@ export function buildTripPreferenceProfile(
     dietaryKeywords,
     preferredAreaKeywords,
     luxuryEnabled,
+    roadTripIntent,
     summary,
   };
 }
@@ -1616,7 +1653,19 @@ export function calculateDayLoadMinutes(day: Pick<AiGeneratedDay, "items" | "res
   return itemMinutes + (day.restWindow ? 20 : 0);
 }
 
-function buildPlaceKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location">) {
+function buildPlaceKey(item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "location" | "itemRole">) {
+  // Round 9.15.6.1 §A/§C — the exact regression fix (real E2E trace
+  // gen-mub2e0sr-eatiuusk, PLAN_NOT_FEASIBLE / primaryFailure: "duplicates"):
+  // a known synthetic itemRole (e.g. hotel-recovery blocks, which reuse the
+  // stay's own real anchor coordinates by design on every occurrence) must
+  // never fall into the coords-based real-place branch below merely
+  // because it happens to carry real lat/lon — checked FIRST, before the
+  // recommendationId check even, so this can never be shadowed by a stray
+  // id. Each synthetic occurrence gets its own random key (identical
+  // reasoning/shape to the existing "no id and no coordinates" branch
+  // further down), so multiple recovery blocks across different days are
+  // never collapsed into one canonical identity.
+  if (isSyntheticScheduleItem(item)) return `generic:${crypto.randomUUID()}`;
   if (item.recommendationId) return `id:${item.recommendationId}`;
   if (item.lat != null && item.lon != null) {
     // ~111m grid (was 4 decimals / ~11m) plus the normalized name — see

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { TripHero } from "@/components/country/trip-hero";
 import { TripRatingsSection } from "@/components/country/trip-ratings-section";
 import { Badge } from "@/components/ui/badge";
+import { IsolatedText } from "@/components/ui/isolated-text";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -130,7 +131,7 @@ export function TripSummarySection({ draft, country, onPatchDraft }: TripSummary
             {routeStory.map((stop, index) => (
               <span key={`${stop}-${index}`} className="flex items-center gap-2">
                 {index > 0 ? <span className="text-muted-foreground">←</span> : null}
-                <Badge variant="outline">{stop}</Badge>
+                <Badge variant="outline"><IsolatedText>{stop}</IsolatedText></Badge>
               </span>
             ))}
           </div>

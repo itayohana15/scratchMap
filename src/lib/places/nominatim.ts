@@ -22,6 +22,14 @@ export interface GeocodedPlace {
   placeClass?: string;
   placeType?: string;
   adminPath?: string;
+  // Round 9.6.2 — the raw address component keys (city/town/state/...),
+  // additive alongside adminPath (which only ever joins the VALUES into one
+  // display string and loses which key each one came from). Needed to
+  // tell a genuine settlement match (its own address carries a city/town/
+  // village key) apart from a broad administrative-region-only match
+  // (state/country keys only) — see trip-stay-skeleton.ts's
+  // isPracticalStayLocality.
+  addressComponents?: Record<string, string>;
 }
 
 const USER_AGENT = "ScratchMap/1.0 (personal travel-tracking app, single user, low volume)";
@@ -113,5 +121,58 @@ export async function searchPlaces(
           .map(([, value]) => value)
           .join(" > ")
       : undefined,
+    addressComponents: item.address,
   }));
+}
+
+/**
+ * Round 9.6.5 §A — reverse geocoding, used ONLY to derive a practical
+ * settlement/lodging base near a real destination CONCEPT that isn't
+ * itself a settlement (a peninsula, an island's coastline point, a
+ * mountain range, ...). zoom=10 asks Nominatim for the city/town-level
+ * containing feature for that exact point (Nominatim's own documented
+ * address-detail granularity), not the raw point itself — the same
+ * "existing geocoding stack, no new provider" discipline searchPlaces
+ * already follows. Same rate-limited queue, same house style; never
+ * throws (mirrors searchPlaces' own callers' "never throw" expectation
+ * via a null return, since every caller of this treats "nothing found"
+ * as a normal, structurally-representable outcome, not an exception).
+ */
+export async function reverseGeocode(lat: number, lon: number, opts: { zoom?: number } = {}): Promise<GeocodedPlace | null> {
+  const params = new URLSearchParams({
+    format: "json",
+    lat: String(lat),
+    lon: String(lon),
+    zoom: String(opts.zoom ?? 10),
+    addressdetails: "1",
+  });
+  try {
+    const res = await throttled(() =>
+      fetch(`https://nominatim.openstreetmap.org/reverse?${params.toString()}`, {
+        headers: { "User-Agent": USER_AGENT, "Accept-Language": "he" },
+        next: { revalidate: 60 * 60 * 24 },
+      })
+    );
+    if (!res.ok) return null;
+    const item = (await res.json()) as (NominatimResult & { error?: string }) | null;
+    if (!item || item.error || !item.lat || !item.lon) return null;
+    captureProviderFixture("geocode", `reverse:${lat},${lon}|${params.toString()}`, { lat, lon, params: params.toString(), response: item });
+    return {
+      name: item.name || item.display_name?.split(",")[0] || "",
+      lat: parseFloat(item.lat),
+      lon: parseFloat(item.lon),
+      osmType: item.osm_type,
+      placeClass: item.class,
+      placeType: item.type,
+      adminPath: item.address
+        ? Object.entries(item.address)
+            .filter(([key]) => key !== "country_code")
+            .map(([, value]) => value)
+            .join(" > ")
+        : undefined,
+      addressComponents: item.address,
+    };
+  } catch {
+    return null;
+  }
 }

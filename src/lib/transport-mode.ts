@@ -9,7 +9,20 @@
  * flight-planning.ts's estimateFlightDurationMinutesByDistance and
  * airports-data.ts's curated dataset for the same pattern.
  */
-export type TransportMode = "walking" | "transit" | "car" | "taxi" | "train" | "bus";
+/**
+ * Round 9.4.4 §S/§T — "flight" added as a real, selectable inter-stay mode
+ * (previously ground-only, so even a 1500km hop resolved to "train" —
+ * see selectTransportMode below). Its duration is NEVER computed via
+ * estimateMinutesForMode/TRANSPORT_MODE_SPEED_KMH's flat distance÷speed
+ * formula — a real flight's minutes must include airport access/buffers,
+ * so travel-routing.ts's buildFlightDoorToDoorLeg is the only source of a
+ * "flight" leg's duration. The speed constant below exists purely so
+ * every Record<TransportMode, ...> in this codebase stays exhaustive
+ * (e.g. isImplausiblyFastTravelTime's sanity check, if ever applied to an
+ * already-labeled flight item) — production code must not call
+ * estimateMinutesForMode("flight", ...) to get a real flight duration.
+ */
+export type TransportMode = "walking" | "transit" | "car" | "taxi" | "train" | "bus" | "flight";
 
 const WALKING_MAX_KM = 1.5;
 const TRANSIT_MAX_KM = 5;
@@ -23,6 +36,7 @@ export const TRANSPORT_MODE_SPEED_KMH: Record<TransportMode, number> = {
   bus: 45,
   car: 60,
   train: 90,
+  flight: 750,
 };
 
 /**

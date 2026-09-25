@@ -102,6 +102,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import {
@@ -1030,7 +1031,7 @@ export function CountryItineraryDetailsDialog({
                               ) : null}
                             </span>
                             <span className="mt-1 block truncate text-[11px] text-muted-foreground">
-                              {[compactDate(day.date), day.cityRegion || null].filter(Boolean).join(" · ") ||
+                              {[compactDate(day.date), day.cityRegion ? isolateText(day.cityRegion) : null].filter(Boolean).join(" · ") ||
                                 "ללא תאריך"}
                             </span>
                           </button>
@@ -1342,7 +1343,7 @@ export function CountryItineraryDetailsDialog({
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-2">
                               <h4 className="font-heading text-lg font-semibold text-foreground">
-                                Day {selectedDay.dayNumber} · {selectedDay.title || `יום ${selectedDay.dayNumber}`}
+                                Day {selectedDay.dayNumber} · {selectedDay.title ? <IsolatedText>{selectedDay.title}</IsolatedText> : `יום ${selectedDay.dayNumber}`}
                               </h4>
                               <Badge variant="secondary">נבחר</Badge>
                               {selectedDay.theme ? <Badge variant="outline">{selectedDay.theme}</Badge> : null}
@@ -1356,8 +1357,8 @@ export function CountryItineraryDetailsDialog({
                             <p className="mt-1 text-sm text-muted-foreground">
                               {[
                                 formatDate(selectedDay.date),
-                                selectedDay.cityRegion || null,
-                                selectedDay.accommodation ? `לינה: ${selectedDay.accommodation}` : null,
+                                selectedDay.cityRegion ? isolateText(selectedDay.cityRegion) : null,
+                                selectedDay.accommodation ? `לינה: ${isolateText(selectedDay.accommodation)}` : null,
                               ]
                                 .filter(Boolean)
                                 .join(" · ") || "ללא תאריך"}
@@ -1456,7 +1457,7 @@ export function CountryItineraryDetailsDialog({
                                 <div className="space-y-1.5">
                                   <div className="flex items-center gap-2">
                                     <BedDouble className="size-4 text-primary" />
-                                    <span className="font-medium">{selectedDay.accommodation}</span>
+                                    <span className="font-medium"><IsolatedText>{selectedDay.accommodation}</IsolatedText></span>
                                   </div>
                                   {selectedDay.accommodationCost != null ? (
                                     <p className="text-xs text-muted-foreground">
@@ -1794,7 +1795,7 @@ export function CountryItineraryDetailsDialog({
                                           <div className="min-w-0">
                                             <div className="flex flex-wrap items-center gap-2">
                                               <h5 className="font-semibold text-foreground">
-                                                {item.name || `פעילות ${itemIndex + 1}`}
+                                                {item.name ? <IsolatedText>{item.name}</IsolatedText> : `פעילות ${itemIndex + 1}`}
                                               </h5>
                                               <Badge variant="secondary">
                                                 {RECOMMENDATION_CATEGORY_LABELS[item.category]}
@@ -1803,7 +1804,7 @@ export function CountryItineraryDetailsDialog({
                                             <div className="mt-2 flex flex-wrap gap-3 text-sm text-muted-foreground">
                                               <span className="inline-flex items-center gap-1.5">
                                                 <MapPin className="size-3.5" />
-                                                {item.location || "מיקום לא צוין"}
+                                                {item.location ? <IsolatedText>{item.location}</IsolatedText> : "מיקום לא צוין"}
                                               </span>
                                               <span>{activityPrice(item.approximatePrice)}</span>
                                               {item.openingHours ? <span>{item.openingHours}</span> : null}

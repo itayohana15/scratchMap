@@ -3,6 +3,7 @@
 import { Clock, Coins, MapPin, Tag, Thermometer, Timer } from "lucide-react";
 
 import { formatCurrency } from "@/lib/format";
+import { isolateText } from "@/components/ui/isolated-text";
 import { useCountryWeather, WEATHER_CODE_LABELS } from "@/lib/weather/country-weather";
 import { RECOMMENDATION_CATEGORY_LABELS, type TripItineraryItem } from "@/lib/trip-workspace";
 
@@ -28,7 +29,7 @@ export function ActivityQuickInfoGrid({ item }: { item: TripItineraryItem }) {
       value: item.approximatePrice != null ? formatCurrency(item.approximatePrice) : "חינם",
     },
     { icon: Tag, label: "סוג פעילות", value: RECOMMENDATION_CATEGORY_LABELS[item.category] },
-    { icon: MapPin, label: "אזור", value: item.location || null },
+    { icon: MapPin, label: "אזור", value: item.location ? isolateText(item.location) : null },
     {
       icon: Thermometer,
       label: "מזג אוויר עכשיו",

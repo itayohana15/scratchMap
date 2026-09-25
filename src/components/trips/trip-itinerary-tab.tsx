@@ -22,6 +22,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import { formatCurrency, formatDate } from "@/lib/format";
 import { useGeoResolutionDebugMap } from "@/lib/hooks/use-geo-resolution-debug";
 import {
@@ -73,7 +74,7 @@ function ItineraryDayHeader({
           {day.cityRegion ? (
             <span className="flex items-center gap-1 text-sm text-muted-foreground">
               <MapPin className="size-3.5" />
-              {day.cityRegion}
+              <IsolatedText>{day.cityRegion}</IsolatedText>
             </span>
           ) : null}
         </div>
@@ -86,7 +87,7 @@ function ItineraryDayHeader({
                 className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-2.5 py-1 text-xs text-foreground"
               >
                 <span aria-hidden="true">{chip.icon}</span>
-                {chip.label}
+                <IsolatedText>{chip.label}</IsolatedText>
               </span>
             ))}
           </div>
@@ -162,7 +163,7 @@ function ItineraryDayRail({
                 <span className="font-semibold">יום {day.dayNumber}</span>
                 <span className={cn("text-[10px]", isSelected ? "opacity-90" : "text-muted-foreground")}>
                   {day.date ? formatDate(day.date, "d/M") : ""}
-                  {day.cityRegion ? ` · ${day.cityRegion}` : ""}
+                  {day.cityRegion ? ` · ${isolateText(day.cityRegion)}` : ""}
                 </span>
               </button>
             );
@@ -208,7 +209,7 @@ function ItineraryDayRail({
           {days.map((day) => (
             <option key={day.id} value={day.id}>
               יום {day.dayNumber} מתוך {days.length} · {day.date ? formatDate(day.date, "d בMMM") : ""}
-              {day.cityRegion ? ` · ${day.cityRegion}` : ""}
+              {day.cityRegion ? ` · ${isolateText(day.cityRegion)}` : ""}
             </option>
           ))}
         </select>
@@ -237,7 +238,7 @@ function TimelineTravelConnector({ item }: { item: TripItineraryItem }) {
       <span aria-hidden="true" className="w-px flex-1 self-stretch border-r border-dashed border-border/60" />
       <span className="flex items-center gap-1.5">
         <span aria-hidden="true">🚶</span>
-        {item.travelMinutes ? `${formatMinutes(item.travelMinutes)}` : item.transportation || "הליכה"}
+        {item.travelMinutes ? `${formatMinutes(item.travelMinutes)}` : item.transportation ? <IsolatedText>{item.transportation}</IsolatedText> : "הליכה"}
       </span>
     </div>
   );
@@ -270,11 +271,11 @@ function TimelineActivityCard({
         className="section-card group min-w-0 flex-1 space-y-1 border border-transparent p-3 text-right transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-md"
       >
         <div className="flex items-start justify-between gap-2">
-          <h4 className="truncate text-sm font-semibold text-foreground">{item.name}</h4>
+          <h4 className="truncate text-sm font-semibold text-foreground"><IsolatedText>{item.name}</IsolatedText></h4>
           <ArrowLeft className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
         </div>
         <p className="truncate text-xs text-muted-foreground">
-          {item.location || RECOMMENDATION_CATEGORY_LABELS[item.category]}
+          {item.location ? <IsolatedText>{item.location}</IsolatedText> : RECOMMENDATION_CATEGORY_LABELS[item.category]}
           {item.location ? ` · ${RECOMMENDATION_CATEGORY_LABELS[item.category]}` : ""}
         </p>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -310,7 +311,7 @@ function MealOpportunityRow({ item, onOpenFoodTab }: { item: TripItineraryItem; 
         className="flex min-w-0 flex-1 items-center gap-2 rounded-xl border border-dashed border-border/60 bg-transparent px-3 py-2.5 text-right text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
       >
         <div className="min-w-0 flex-1">
-          <p className="truncate text-xs">{item.name}</p>
+          <p className="truncate text-xs"><IsolatedText>{item.name}</IsolatedText></p>
           <p className="text-[11px]">הצג המלצות אוכל</p>
         </div>
         <ArrowLeft className="size-3.5 shrink-0" />

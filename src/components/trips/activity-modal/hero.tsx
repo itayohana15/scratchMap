@@ -7,6 +7,7 @@ import { ImageLightbox } from "@/components/trips/activity-modal/image-lightbox"
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatCurrency } from "@/lib/format";
+import { isolateText } from "@/components/ui/isolated-text";
 import { usePlaceImages } from "@/lib/photos/place-images";
 import { RECOMMENDATION_CATEGORY_LABELS, type TripItineraryItem } from "@/lib/trip-workspace";
 import { cn } from "@/lib/utils";
@@ -99,7 +100,7 @@ export function ActivityHero({ item, countryName, open }: ActivityHeroProps) {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={activeImage.url}
-              alt={item.name}
+              alt={isolateText(item.name)}
               loading="eager"
               className="h-full w-full object-cover"
               onError={() => markFailed(activeImage.id)}

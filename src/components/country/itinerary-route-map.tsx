@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCountryMiniMap } from "@/components/country/use-country-mini-map";
 import { formatCurrency } from "@/lib/format";
@@ -1024,7 +1025,7 @@ function DayMapCanvas({
 
         const title = document.createElement("p");
         title.className = "font-medium";
-        title.textContent = `${stop.order}. ${stop.name}`;
+        title.textContent = `${stop.order}. ${isolateText(stop.name)}`;
         popupNode.appendChild(title);
 
         const meta = document.createElement("p");
@@ -1034,7 +1035,7 @@ function DayMapCanvas({
 
         const location = document.createElement("p");
         location.className = "text-xs";
-        location.textContent = stop.location;
+        location.textContent = isolateText(stop.location);
         popupNode.appendChild(location);
 
         const details = document.createElement("p");
@@ -1210,7 +1211,7 @@ function SelectedSegmentDetail({
     <div className="rounded-[18px] border border-primary/30 bg-primary/5 p-3.5" role="region" aria-label="פרטי מקטע נבחר">
       <div className="flex items-start justify-between gap-3">
         <p className="text-sm font-medium text-foreground">
-          {segment.from.name} ← {segment.to.name}
+          <IsolatedText>{segment.from.name}</IsolatedText> ← <IsolatedText>{segment.to.name}</IsolatedText>
         </p>
         <button type="button" onClick={onClose} className="shrink-0 text-xs text-muted-foreground hover:text-foreground" aria-label="סגור פרטי מקטע">
           ✕
@@ -1697,9 +1698,9 @@ export function ItineraryTripSummarySection({
             <ol className="mt-4 space-y-2">
               {cityRuns.map((entry, index) => (
                 <li key={`${entry.city}-${index}`} className="rounded-[18px] border border-border/60 bg-muted/20 p-3 text-sm">
-                  <p className="font-medium">{index + 1}. {entry.city}</p>
+                  <p className="font-medium">{index + 1}. <IsolatedText>{entry.city}</IsolatedText></p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {entry.nights} לילות · מעבר עיקרי: {entry.transport || "תחבורה מקומית"}
+                    {entry.nights} לילות · מעבר עיקרי: {entry.transport ? <IsolatedText>{entry.transport}</IsolatedText> : "תחבורה מקומית"}
                   </p>
                 </li>
               ))}

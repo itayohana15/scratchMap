@@ -4,6 +4,7 @@ import Link from "next/link";
 import { RotateCcw, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { IsolatedText } from "@/components/ui/isolated-text";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -44,7 +45,7 @@ function OverrideHint({ from, to }: { from: string; to: string }) {
         התאמה לטיול הזה
       </Badge>
       <span className="text-muted-foreground">
-        {from} ← {to}
+        <IsolatedText>{from}</IsolatedText> ← <IsolatedText>{to}</IsolatedText>
       </span>
     </p>
   );

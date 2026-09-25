@@ -6,6 +6,7 @@ import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import {
   Select,
   SelectContent,
@@ -62,7 +63,7 @@ function ItemRow({
   return (
     <div className="flex items-center justify-between gap-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2">
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-foreground">{item.name || "פעילות ללא שם"}</p>
+        <p className="truncate text-sm font-medium text-foreground">{item.name ? <IsolatedText>{item.name}</IsolatedText> : "פעילות ללא שם"}</p>
         <p className="text-xs text-muted-foreground">{detail}</p>
       </div>
       {item.spontaneous ? (
@@ -115,7 +116,7 @@ function DayCard({
             יום {day.dayNumber}
             {day.date ? ` · ${formatDate(day.date)}` : ""}
           </h4>
-          {day.cityRegion ? <p className="text-xs text-muted-foreground">{day.cityRegion}</p> : null}
+          {day.cityRegion ? <p className="text-xs text-muted-foreground"><IsolatedText>{day.cityRegion}</IsolatedText></p> : null}
         </div>
         <div className="flex items-center gap-1 rounded-full border border-border/60 bg-background/60 p-1">
           {(["planned", "actual", "compare"] as const).map((value) => (
@@ -143,7 +144,7 @@ function DayCard({
               <ItemRow
                 key={item.id}
                 item={item}
-                detail={[item.plannedStartTime, item.location].filter(Boolean).join(" · ")}
+                detail={[item.plannedStartTime, item.location ? isolateText(item.location) : null].filter(Boolean).join(" · ")}
                 onToggleFavorite={() => toggleFavorite(item)}
               />
             ))}
@@ -163,8 +164,8 @@ function DayCard({
                 item={item}
                 detail={[
                   item.actualStartTime || item.plannedStartTime,
-                  item.actualPlaceName || item.location,
-                  item.actualTransportation || null,
+                  item.actualPlaceName || item.location ? isolateText(item.actualPlaceName || item.location || "") : null,
+                  item.actualTransportation ? isolateText(item.actualTransportation) : null,
                 ]
                   .filter(Boolean)
                   .join(" · ")}
@@ -207,7 +208,7 @@ function DayCard({
                   item.skipped ? "border-destructive/40 bg-destructive/5" : "border-border/60 bg-background/60"
                 )}
               >
-                <p className="min-w-0 truncate text-sm text-foreground">{item.name || "פעילות ללא שם"}</p>
+                <p className="min-w-0 truncate text-sm text-foreground">{item.name ? <IsolatedText>{item.name}</IsolatedText> : "פעילות ללא שם"}</p>
                 <Badge variant={item.skipped ? "destructive" : "outline"} className="shrink-0 text-[11px]">
                   {diffLabel(day, item)}
                 </Badge>
@@ -218,7 +219,7 @@ function DayCard({
                 key={item.id}
                 className="flex items-center justify-between gap-2 rounded-xl border border-primary/30 bg-primary/5 px-3 py-2"
               >
-                <p className="min-w-0 truncate text-sm text-foreground">{item.name || "פעילות ללא שם"}</p>
+                <p className="min-w-0 truncate text-sm text-foreground">{item.name ? <IsolatedText>{item.name}</IsolatedText> : "פעילות ללא שם"}</p>
                 <Badge variant="secondary" className="shrink-0 text-[11px]">
                   נוסף: {item.actualStartTime || "—"}
                 </Badge>

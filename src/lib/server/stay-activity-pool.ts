@@ -18,10 +18,13 @@ import {
   ACTIVITY_FAMILIES,
   buildPreferenceFamilyWeights,
   classifyActivity,
+  classifyTouristEligibility,
   determinePlanningRole,
+  isTouristPortfolioEligible,
   type ActivityClassification,
   type ActivityFamily,
   type ActivitySubtype,
+  type TouristEligibility,
 } from "@/lib/server/activity-taxonomy";
 import type { TripFrame, TripFramePhase } from "@/lib/server/itinerary-planning-principles";
 import { queryNearbyRecommendationsDetailed, type FetchLike, type OverpassNearbyRecommendation } from "@/lib/places/overpass";
@@ -31,9 +34,19 @@ import {
   type DestinationMobilityProfile,
   type RecommendationCategory,
   type TripRecommendation,
+  type RealPlaceProvenance,
+  type NatureSubPreference,
 } from "@/lib/trip-workspace";
+import {
+  assembleNatureExperiences,
+  classifyNatureTypesFromTags,
+  computeNatureSubPreferenceFit,
+  extractSelectedNatureSubPreferences,
+  type NatureExperienceComponentInput,
+} from "@/lib/server/nature-experience";
 import type { DerivedDayType } from "@/lib/server/country-itinerary-generation";
 import { classifyZeroPoolReason, logRealPlaceQA } from "@/lib/server/real-place-qa";
+import { estimateMinutesForMode, selectTransportMode } from "@/lib/transport-mode";
 
 /* ------------------------------------------------------------------ *
  * 1. Capacity-driven pool sizing (spec §3)                             *
@@ -122,6 +135,77 @@ export function computeMinimumViableCandidateCount(requiredRealActivityTarget: n
   return Math.max(1, Math.ceil(requiredRealActivityTarget * MINIMUM_VIABLE_RESERVE_FACTOR));
 }
 
+/**
+ * Round 9.11 §B/§C — a DEPTH target, deliberately distinct from
+ * `desiredCandidateCount`/`minimumViableCandidateCount` above (which size
+ * RAW DISCOVERY, before tourist-eligibility filtering ever runs). This is
+ * measured AFTER the full admission funnel (dedupe, geography, semantic
+ * role, tourist eligibility) — i.e. against a pool's own final
+ * `candidates.length`, which by construction (Round 9.9) already excludes
+ * every PRACTICAL_ONLY/LOW_VALUE_LOCAL_AMENITY/NOT_TOURIST_ACTIVITY
+ * candidate. "roughly four good alternatives per stay-day" (spec §C) — a
+ * composer richness signal, never a required-usage count: most candidates
+ * are expected to stay unused (spec §C). `usableSightseeingDays` (normal +
+ * day_trip days only — the same "stay days" concept `computeStayCapacity`
+ * already reports) is the deliberate choice of "days" here, since an
+ * arrival/departure/transfer day was never expected to need four full
+ * alternatives of its own.
+ */
+export function computeUsableActivityPoolTarget(usableSightseeingDays: number): number {
+  return Math.max(0, usableSightseeingDays) * 4;
+}
+
+/**
+ * Round 9.11 §D/§E — candidate GEOGRAPHIC REACH, classified by estimated
+ * one-way TRAVEL TIME (never a naive fixed-km radius, spec §D) from the
+ * stay's own anchor — LOCAL/REGIONAL/EXCURSION mirror spec §E's own
+ * suggested minute bands; TOO_FAR is anything beyond the round's own
+ * absolute ceiling (spec §D: "approximately 150 minutes one-way... a
+ * candidate ELIGIBILITY ceiling, not a recommendation"). Deliberately a
+ * SEPARATE, additive classification from `evaluateScheduledPlaceLegality`'s
+ * existing km-radius legality check (trip-workspace.ts) — that function
+ * continues to govern actual day-scheduling legality unchanged; this one
+ * only widens POOL ADMISSION eligibility for candidates the existing
+ * locality-radius check would otherwise reject outright, gated by the
+ * excursion value bar below.
+ */
+export type CandidateReach = "LOCAL" | "REGIONAL" | "EXCURSION" | "TOO_FAR";
+
+const LOCAL_REACH_MAX_MINUTES = 60;
+const REGIONAL_REACH_MAX_MINUTES = 90;
+const EXCURSION_REACH_MAX_MINUTES = 150;
+/** Mirrors trip-workspace.ts's own private TRANSIT_MAX_KM_FOR_LEGALITY — the same "beyond this, treat as an intercity-style hop for mode selection" boundary, kept as its own constant here rather than a cross-file import since the two checks are deliberately independent (see module doc above). */
+const TRANSIT_MAX_KM_FOR_REACH = 5;
+
+export function estimateOneWayTravelMinutes(distanceKm: number): number {
+  const mode = selectTransportMode(distanceKm, { isIntercity: distanceKm > TRANSIT_MAX_KM_FOR_REACH });
+  return estimateMinutesForMode(distanceKm, mode);
+}
+
+export function classifyCandidateReach(oneWayTravelMinutes: number): CandidateReach {
+  if (oneWayTravelMinutes <= LOCAL_REACH_MAX_MINUTES) return "LOCAL";
+  if (oneWayTravelMinutes <= REGIONAL_REACH_MAX_MINUTES) return "REGIONAL";
+  if (oneWayTravelMinutes <= EXCURSION_REACH_MAX_MINUTES) return "EXCURSION";
+  return "TOO_FAR";
+}
+
+/**
+ * Round 9.11 §F — the excursion value gate: "travel distance alone must not
+ * make an activity desirable... the farther the candidate, the stronger its
+ * tourist value must be." A REGIONAL candidate may enter at any normal
+ * portfolio-eligible tier; an EXCURSION-distance candidate needs the top two
+ * tiers specifically (TOURIST_ANCHOR/TOURIST_STRONG) — never a mere
+ * TOURIST_SUPPORTING/DESTINATION_SHOPPING riding along on distance alone.
+ * Reuses the existing TouristEligibility architecture from Round 9.9 —
+ * never a new, parallel value system, never a country/name-specific rule.
+ */
+export function meetsExcursionValueBar(reach: CandidateReach, eligibility: TouristEligibility): boolean {
+  if (reach === "LOCAL") return true;
+  if (reach === "REGIONAL") return isTouristPortfolioEligible(eligibility);
+  if (reach === "EXCURSION") return eligibility === "TOURIST_ANCHOR" || eligibility === "TOURIST_STRONG";
+  return false; // TOO_FAR is never admissible regardless of value
+}
+
 /* ------------------------------------------------------------------ *
  * 2. Canonical stay ownership (spec §2)                                *
  * ------------------------------------------------------------------ */
@@ -150,9 +234,37 @@ export function assignCandidatesToStays(
     anchor: areaAnchors.get(phase.areaLabel) ?? null,
   }));
 
+  // Round 9.15.4 §G/§H — this function already computes the real answer to
+  // "which stay does this candidate legally belong to" (nearest-anchor,
+  // falling back to a text match) — but historically only USED that answer
+  // once, to seed buildStayActivityPool's own initial candidate list, and
+  // never recorded it on the candidate itself. Every later repair/
+  // replacement function that searches payload.recommendations trip-wide
+  // (pickReplacementRecommendation and friends) then had nothing but the
+  // generic 80km CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM distance gate to
+  // fall back on — not strict enough to keep two real stays ~60-80km apart
+  // (the exact proven case: a Boston candidate scheduled on a Providence
+  // day) from crossing into each other. Stamping ownerStayId HERE, once,
+  // at the moment this function already decides ownership, closes that gap
+  // for every later consumer without duplicating the assignment logic.
+  // Mutates the SAME candidate objects also referenced by
+  // payload.recommendations (safe: each candidate is assigned to at most
+  // one phase below, so there is no risk of an inconsistent double-stamp).
+  // Never fabricates a provenance object for a candidate that doesn't
+  // already have one (manual/saved places without any provenance keep
+  // ownerStayId unset — "unknown ownership always passes", the same
+  // backward-compatible convention this file already uses for `types`/
+  // `osmTags`).
+  const stampOwnership = (candidate: TripRecommendation, phaseId: string, anchor: { lat: number; lon: number } | null) => {
+    if (candidate.provenance) {
+      candidate.provenance = { ...candidate.provenance, ownerStayId: phaseId, ownerAnchor: anchor };
+    }
+  };
+
   for (const candidate of candidates) {
     if (candidate.lat != null && candidate.lon != null) {
       let bestPhaseId: string | null = null;
+      let bestAnchor: { lat: number; lon: number } | null = null;
       let bestDistanceKm = Infinity;
       for (const { phase, anchor } of phaseAnchors) {
         if (!anchor) continue;
@@ -160,9 +272,11 @@ export function assignCandidatesToStays(
         if (distanceKm < bestDistanceKm) {
           bestDistanceKm = distanceKm;
           bestPhaseId = phase.id;
+          bestAnchor = anchor;
         }
       }
       if (bestPhaseId) {
+        stampOwnership(candidate, bestPhaseId, bestAnchor);
         byStay.get(bestPhaseId)!.push(candidate);
         continue;
       }
@@ -173,6 +287,7 @@ export function assignCandidatesToStays(
     if (!normalizedLocation) continue;
     for (const phase of tripFrame.phases) {
       if (resolveTextualAreaMatchFn(normalizedLocation, phase.areaLabel)) {
+        stampOwnership(candidate, phase.id, areaAnchors.get(phase.areaLabel) ?? null);
         byStay.get(phase.id)!.push(candidate);
         break;
       }
@@ -227,6 +342,12 @@ export interface StayActivityPoolCandidate {
   lon: number | null;
   location: string;
   source: TripRecommendation["source"];
+  /** Round 9.11 §E — geographic reach from the stay's own anchor; absent (undefined) for every pre-9.11 candidate/fixture, treated as "LOCAL" by every consumer (backward compatible, and true in practice — this field is only ever set to something other than LOCAL for a candidate admitted via the widened excursion path). */
+  reach?: CandidateReach;
+  /** Round 9.15 §K — which structured nature sub-type(s) this candidate's own OSM tags represent (classifyNatureTypesFromTags), only ever set for category==="nature" candidates. Absent for every non-nature candidate and every pre-9.15 fixture (backward compatible) — used by selectStayPortfolio's optional fit-bonus term, never a required field. */
+  natureTypes?: NatureSubPreference[];
+  /** Round 9.15.1 §D — true only for a candidate synthesized by assembleNatureExperiences (provenance.natureExperience was present on its source TripRecommendation). Lets a later re-assembly pass skip candidates that are ALREADY a combined experience, instead of trying to re-cluster an experience's own representative point with other lone candidates. */
+  isAssembledExperience?: boolean;
 }
 
 export type CategorySupply = Partial<Record<ActivityFamily, number>>;
@@ -252,6 +373,37 @@ export interface StayActivityPoolDiagnostics {
   supplyDegraded: boolean;
   /** Round 9.3.4 §8 — per-group discovery accounting for THIS stay's round-0 grouped query pass. Optional so every pre-existing object literal built before this round (tests, fixtures) stays valid without updating each one — populated for real by refillStayActivityPool/refillTripRecommendationPool. */
   groupResults?: QueryGroupResult[];
+  /** Round 9.9 — real, legal, non-duplicate, non-meal-role candidates additionally rejected by classifyTouristEligibility (ordinary retail/utility/low-value local amenity) before ever entering this pool's `candidates` array. Optional for the same backward-compatibility reason as groupResults above. */
+  touristIneligibleRejected?: number;
+  /** Round 9.9 — per-tier counts across every candidate classifyTouristEligibility actually looked at (admitted AND rejected), spec §I's TouristEligibilityFunnel. */
+  touristEligibilityBreakdown?: Partial<Record<TouristEligibility, number>>;
+  /** Round 9.9 — a bounded sample of REJECTED candidates, spec §I: "why was Target rejected — without reading source code." */
+  touristEligibilitySamples?: Array<{ name: string; provider: string; eligibility: TouristEligibility; matchedSignal: string | null; reason: string }>;
+  /** Round 9.11 §P — reach distribution across every candidate ADMITTED into this pool (LOCAL is the overwhelming majority in practice; REGIONAL/EXCURSION only ever appear when the widened excursion path actually admitted one). Optional for the same backward-compatibility reason as the fields above. */
+  localCandidateCount?: number;
+  regionalCandidateCount?: number;
+  excursionCandidateCount?: number;
+  /** Round 9.11 §P — real, non-duplicate, non-meal-role candidates rejected specifically because they exceeded the 150-minute excursion ceiling or failed the reach-appropriate excursion value bar (spec §F) — kept distinct from ordinary local geographyRejected so "why wasn't this far-away candidate admitted" is answerable without conflating it with an everyday too-far-for-normal-day rejection. */
+  excursionValueRejected?: number;
+}
+
+const TOURIST_ELIGIBILITY_SAMPLE_CAP = 10;
+
+function recordTouristEligibilityOutcome(
+  diagnostics: Pick<StayActivityPoolDiagnostics, "touristIneligibleRejected" | "touristEligibilityBreakdown" | "touristEligibilitySamples">,
+  name: string,
+  provider: string,
+  result: { eligibility: TouristEligibility; reason: string; matchedSignal: string | null }
+): void {
+  diagnostics.touristEligibilityBreakdown = diagnostics.touristEligibilityBreakdown ?? {};
+  diagnostics.touristEligibilityBreakdown[result.eligibility] = (diagnostics.touristEligibilityBreakdown[result.eligibility] ?? 0) + 1;
+  if (!isTouristPortfolioEligible(result.eligibility)) {
+    diagnostics.touristIneligibleRejected = (diagnostics.touristIneligibleRejected ?? 0) + 1;
+    diagnostics.touristEligibilitySamples = diagnostics.touristEligibilitySamples ?? [];
+    if (diagnostics.touristEligibilitySamples.length < TOURIST_ELIGIBILITY_SAMPLE_CAP) {
+      diagnostics.touristEligibilitySamples.push({ name, provider, eligibility: result.eligibility, matchedSignal: result.matchedSignal, reason: result.reason });
+    }
+  }
 }
 
 export interface StayActivityPool {
@@ -263,6 +415,8 @@ export interface StayActivityPool {
   desiredCandidateCount: number;
   /** Round 9.1 §16 — the smaller "can we build usable days at all" floor; see computeMinimumViableCandidateCount. */
   minimumViableCandidateCount: number;
+  /** Round 9.11 §B/§C — the depth target (usableDayCapacity × 4), measured against this pool's own final `candidates.length` (already tourist-eligibility-filtered) — see computeUsableActivityPoolTarget. Optional so every pre-9.11 object literal (tests, fixtures) stays valid without updating each one, matching this file's own established convention for additive fields. */
+  usableActivityPoolTarget?: number;
   candidates: StayActivityPoolCandidate[];
   categorySupply: CategorySupply;
   diagnostics: StayActivityPoolDiagnostics;
@@ -287,14 +441,111 @@ export function buildStayActivityPool(
   const initialCandidateCount = ownedCandidates.length;
   const desiredCandidateCount = computeDesiredCandidateCount(capacity.requiredRealActivityTarget);
 
+  // Round 9.15 §F/§H — assemble coherent multi-component nature experiences
+  // (trailhead+trail+waterfall+viewpoint, etc.) from this stay's OWN raw
+  // nature candidates BEFORE the ordinary per-candidate admission loop
+  // below runs, so a genuine multi-part hike is offered to the portfolio
+  // as ONE candidate instead of N unrelated point-POIs. Only nature
+  // candidates that already pass the SAME tourist-eligibility gate every
+  // other candidate is judged by are eligible to become a component — an
+  // ordinary low-value amenity mistakenly tagged "nature" can never be
+  // laundered into a fake experience via assembly (spec §V's quality
+  // floor). A cluster with no genuine trail/route evidence is never
+  // assembled (assembleNatureExperiences' own rule) — its members simply
+  // flow through unchanged, exactly as if this step didn't run.
+  const rawNatureCandidates = ownedCandidates.filter((c) => c.category === "nature" && c.lat != null && c.lon != null);
+  const eligibleNatureComponents: NatureExperienceComponentInput[] = [];
+  for (const candidate of rawNatureCandidates) {
+    const eligibility = classifyTouristEligibility({
+      category: candidate.category,
+      name: candidate.name,
+      shortDescription: candidate.shortDescription,
+      osmTags: candidate.provenance?.osmTags ?? null,
+      providerTypes: candidate.provenance?.types ?? null,
+    });
+    if (!isTouristPortfolioEligible(eligibility.eligibility)) continue;
+    eligibleNatureComponents.push({
+      recommendationId: candidate.id,
+      name: candidate.name,
+      lat: candidate.lat as number,
+      lon: candidate.lon as number,
+      osmTags: candidate.provenance?.osmTags ?? null,
+    });
+  }
+  const { experiences: assembledExperiences, unassembled: unassembledNatureComponents } = assembleNatureExperiences(eligibleNatureComponents);
+  const assembledComponentIds = new Set(
+    assembledExperiences.flatMap((experience) => experience.provenance.natureExperience?.componentRecommendationIds ?? [])
+  );
+  const experienceRecommendations: TripRecommendation[] = assembledExperiences.map((experience) => ({
+    id: experience.provenance.providerId ?? experience.name,
+    name: experience.name,
+    category: experience.category,
+    location: phase.areaLabel,
+    shortDescription: experience.shortDescription,
+    estimatedDurationMinutes: experience.estimatedDurationMinutes,
+    approximatePrice: null,
+    openingHours: "",
+    recommendedTimeOfDay: "any",
+    reservationRequired: false,
+    mapLink: "",
+    imageUrl: "",
+    imageQuery: "",
+    lat: experience.lat,
+    lon: experience.lon,
+    source: "api",
+    wikipediaUrl: null,
+    website: null,
+    wheelchairAccessible: null,
+    isFree: null,
+    provenance: experience.provenance,
+  }));
+  if (rawNatureCandidates.length > 0 || assembledExperiences.length > 0) {
+    logRealPlaceQA("NatureCandidateFunnel", {
+      stayId: phase.id,
+      ownerArea: phase.areaLabel,
+      rawNatureCandidates: rawNatureCandidates.length,
+      eligibleNatureComponents: eligibleNatureComponents.length,
+      assembledExperiences: assembledExperiences.length,
+      unassembledNatureComponents: unassembledNatureComponents.length,
+    });
+  }
+  if (assembledExperiences.length > 0) {
+    logRealPlaceQA("NatureExperienceAssembly", {
+      stayId: phase.id,
+      ownerArea: phase.areaLabel,
+      experiences: assembledExperiences.map((experience) => ({
+        title: experience.name,
+        experienceType: experience.provenance.natureExperience?.experienceType,
+        componentCount: experience.provenance.natureExperience?.componentRecommendationIds.length,
+        estimatedDurationMinutes: experience.estimatedDurationMinutes,
+      })),
+    });
+  }
+  // Every non-nature candidate, every nature candidate NOT consumed into an
+  // assembled experience (including ones that failed eligibility above —
+  // the main loop below still judges them itself, unchanged), plus the
+  // newly synthesized experience candidates.
+  const effectiveCandidates: TripRecommendation[] = [
+    ...ownedCandidates.filter((c) => c.category !== "nature" || !assembledComponentIds.has(c.id)),
+    ...experienceRecommendations,
+  ];
+
   const seen = new Set<string>();
   let dedupeRejected = 0;
   let geographyRejected = 0;
   let mealVenueExcluded = 0;
+  let localCandidateCount = 0;
+  let regionalCandidateCount = 0;
+  let excursionCandidateCount = 0;
+  let excursionValueRejected = 0;
   const classificationBreakdown: CategorySupply = {};
+  // Round 9.9 — a minimal accumulator recordTouristEligibilityOutcome can
+  // mutate in place; merged into the real diagnostics object literal below
+  // once every candidate has been considered.
+  const touristEligibilityAccumulator: Pick<StayActivityPoolDiagnostics, "touristIneligibleRejected" | "touristEligibilityBreakdown" | "touristEligibilitySamples"> = {};
   const poolCandidates: StayActivityPoolCandidate[] = [];
 
-  for (const candidate of ownedCandidates) {
+  for (const candidate of effectiveCandidates) {
     const dedupeKey = candidate.id || `${candidate.name}|${candidate.lat}|${candidate.lon}`;
     if (seen.has(dedupeKey)) {
       dedupeRejected += 1;
@@ -322,6 +573,7 @@ export function buildStayActivityPool(
       continue;
     }
 
+    let reach: CandidateReach = "LOCAL";
     if (candidate.lat != null && candidate.lon != null && anchor) {
       const legal = evaluateScheduledPlaceLegality({
         placeLat: candidate.lat,
@@ -333,10 +585,39 @@ export function buildStayActivityPool(
         visitMinutes: candidate.estimatedDurationMinutes,
       }).legal;
       if (!legal) {
-        geographyRejected += 1;
-        continue;
+        const distanceKm = haversineKm(anchor.lat, anchor.lon, candidate.lat, candidate.lon);
+        reach = classifyCandidateReach(estimateOneWayTravelMinutes(distanceKm));
+        if (reach === "TOO_FAR") {
+          geographyRejected += 1;
+          continue;
+        }
       }
     }
+
+    // Round 9.9 — same tourist-eligibility quality floor as
+    // acceptRawCandidatesIntoPool (spec §F), applied here too for the
+    // initial payload-owned pool so a candidate carrying provenance/osmTags
+    // is judged identically regardless of which of this file's two
+    // admission paths it happens to enter through.
+    const eligibility = classifyTouristEligibility({
+      category: candidate.category,
+      name: candidate.name,
+      shortDescription: candidate.shortDescription,
+      osmTags: candidate.provenance?.osmTags ?? null,
+      providerTypes: candidate.provenance?.types ?? null,
+    });
+    recordTouristEligibilityOutcome(touristEligibilityAccumulator, candidate.name, candidate.provenance?.provider ?? "unknown", eligibility);
+    if (!isTouristPortfolioEligible(eligibility.eligibility)) {
+      continue;
+    }
+    // Round 9.11 §F — same excursion value gate as acceptRawCandidatesIntoPool.
+    if (reach !== "LOCAL" && !meetsExcursionValueBar(reach, eligibility.eligibility)) {
+      excursionValueRejected += 1;
+      continue;
+    }
+    if (reach === "LOCAL") localCandidateCount += 1;
+    else if (reach === "REGIONAL") regionalCandidateCount += 1;
+    else excursionCandidateCount += 1;
 
     classificationBreakdown[classification.primaryFamily] = (classificationBreakdown[classification.primaryFamily] ?? 0) + 1;
 
@@ -350,6 +631,12 @@ export function buildStayActivityPool(
       lon: candidate.lon,
       location: candidate.location,
       source: candidate.source,
+      reach,
+      natureTypes:
+        candidate.category === "nature"
+          ? (candidate.provenance?.natureExperience?.natureTypes ?? classifyNatureTypesFromTags(candidate.provenance?.osmTags))
+          : undefined,
+      isAssembledExperience: candidate.provenance?.natureExperience != null,
     });
   }
 
@@ -361,6 +648,7 @@ export function buildStayActivityPool(
     requiredRealActivityTarget: capacity.requiredRealActivityTarget,
     desiredCandidateCount,
     minimumViableCandidateCount: computeMinimumViableCandidateCount(capacity.requiredRealActivityTarget),
+    usableActivityPoolTarget: computeUsableActivityPoolTarget(capacity.usableSightseeingDays),
     candidates: poolCandidates,
     categorySupply: classificationBreakdown,
     diagnostics: {
@@ -378,8 +666,39 @@ export function buildStayActivityPool(
       mealVenueExcluded,
       classificationBreakdown,
       supplyDegraded: false,
+      localCandidateCount,
+      regionalCandidateCount,
+      excursionCandidateCount,
+      excursionValueRejected,
+      ...touristEligibilityAccumulator,
     },
   };
+
+  // logRealPlaceQA no-ops on its own when tracing is off — no extra flag check needed here.
+  logRealPlaceQA("TouristEligibilityFunnel", {
+    stayId: phase.id,
+    ownerArea: phase.areaLabel,
+    rawCandidateCount: initialCandidateCount,
+    postGeographyCount: initialCandidateCount - dedupeRejected - mealVenueExcluded - geographyRejected,
+    postTouristEligibilityCount: poolCandidates.length,
+    touristEligibleCount: poolCandidates.length,
+    finalUsablePoolCount: poolCandidates.length,
+    destinationShoppingCount: touristEligibilityAccumulator.touristEligibilityBreakdown?.DESTINATION_SHOPPING ?? 0,
+    practicalOnlyCount: touristEligibilityAccumulator.touristEligibilityBreakdown?.PRACTICAL_ONLY ?? 0,
+    lowValueRejectedCount:
+      (touristEligibilityAccumulator.touristEligibilityBreakdown?.LOW_VALUE_LOCAL_AMENITY ?? 0) +
+      (touristEligibilityAccumulator.touristEligibilityBreakdown?.NOT_TOURIST_ACTIVITY ?? 0),
+    roleRejectedCount: mealVenueExcluded,
+    rejectedSamples: touristEligibilityAccumulator.touristEligibilitySamples ?? [],
+    // Round 9.11 §P — depth target + reach distribution.
+    stayDays: capacity.usableSightseeingDays,
+    usableActivityPoolTarget: pool.usableActivityPoolTarget,
+    poolTargetMet: poolCandidates.length >= (pool.usableActivityPoolTarget ?? 0),
+    localCandidateCount,
+    regionalCandidateCount,
+    excursionCandidateCount,
+    excursionValueRejected,
+  });
 
   // Round 9.4 §E/§F/§G/§H — one combined log covering the normalization/
   // geography/role-classification funnel (the SAME counters this function
@@ -403,7 +722,13 @@ export function buildStayActivityPool(
     providerTimeouts: pool.diagnostics.providerTimeouts,
     candidateIds: poolCandidates.slice(0, 30).map((c) => c.recommendationId),
     candidateNames: poolCandidates.slice(0, 30).map((c) => c.name),
-    zeroPoolReason: poolCandidates.length === 0 ? classifyZeroPoolReason(pool.diagnostics) : undefined,
+    // Round 9.6.2 §7 — an unresolved anchor means no provider was ever
+    // eligible to be queried for this stay (refillTripRecommendationPool's
+    // own needsActivityDiscovery/meal-eligibility checks both require a
+    // non-null anchor) — checked BEFORE the ordinary supply-shape
+    // classifier, since "anchor is null" is never a genuine discovery
+    // outcome to explain via dedup/geography/meal-role rejection counts.
+    zeroPoolReason: poolCandidates.length === 0 ? (anchor == null ? "DISCOVERY_NOT_ATTEMPTED_MISSING_ANCHOR" : classifyZeroPoolReason(pool.diagnostics)) : undefined,
   });
 
   return pool;
@@ -548,9 +873,27 @@ export interface RefillResult {
   addedRecommendations: TripRecommendation[];
 }
 
+/**
+ * Round 9.6 §A — `id` stays exactly the pre-existing Overpass-shaped
+ * composite string when the candidate carries no explicit provenance
+ * (every pre-existing Overpass caller, unchanged). A candidate WITH
+ * explicit provenance (google-places.ts's own discovery function) gets an
+ * id keyed by that provider's own canonical id instead — never the
+ * Overpass composite string for a place that isn't from Overpass — and
+ * the provenance itself is preserved on the recommendation so later code
+ * never has to guess a candidate's origin.
+ */
 export function toTripRecommendation(candidate: OverpassNearbyRecommendation): TripRecommendation {
+  const provenance: RealPlaceProvenance = candidate.provenance ?? {
+    provider: "overpass",
+    providerId: `overpass:${candidate.category}:${candidate.lat.toFixed(5)}:${candidate.lon.toFixed(5)}:${candidate.name}`,
+  };
+  const id =
+    provenance.provider === "overpass"
+      ? provenance.providerId!
+      : `${provenance.provider}:${provenance.providerId ?? `${candidate.lat.toFixed(5)}:${candidate.lon.toFixed(5)}:${candidate.name}`}`;
   return {
-    id: `overpass:${candidate.category}:${candidate.lat.toFixed(5)}:${candidate.lon.toFixed(5)}:${candidate.name}`,
+    id,
     name: candidate.name,
     category: candidate.category,
     location: candidate.location,
@@ -570,6 +913,7 @@ export function toTripRecommendation(candidate: OverpassNearbyRecommendation): T
     website: candidate.website ?? null,
     wheelchairAccessible: null,
     isFree: null,
+    provenance,
   };
 }
 
@@ -595,6 +939,8 @@ export function acceptRawCandidatesIntoPool(
     dailyCapacityMinutes: number;
     mustVisitKeywords: string[];
     desiredCandidateCount: number;
+    /** Round 9.15.4 §H — optional so every pre-existing call site (tests, other admission paths) keeps compiling unchanged; production's own call sites (inside refillTripRecommendationPool/buildStayActivityPool) pass their own phase.id, stamping real ownership onto every candidate discovered through this function. */
+    ownerStayId?: string;
   }
 ): { addedRecommendations: TripRecommendation[]; acceptedCount: number } {
   const addedRecommendations: TripRecommendation[] = [];
@@ -602,6 +948,9 @@ export function acceptRawCandidatesIntoPool(
   for (const raw of fetched) {
     if (state.candidates.length >= context.desiredCandidateCount) break;
     const recommendation = toTripRecommendation(raw);
+    if (context.ownerStayId != null && recommendation.provenance) {
+      recommendation.provenance = { ...recommendation.provenance, ownerStayId: context.ownerStayId, ownerAnchor: context.anchor };
+    }
     if (state.seenKeys.has(recommendation.id)) {
       state.diagnostics.dedupeRejected += 1;
       continue;
@@ -617,10 +966,57 @@ export function acceptRawCandidatesIntoPool(
       dailyCapacityMinutes: context.dailyCapacityMinutes,
       visitMinutes: recommendation.estimatedDurationMinutes,
     }).legal;
+    // Round 9.11 §D/§E — a candidate the EXISTING local-radius check
+    // rejects is not necessarily out of reach entirely: widen admission up
+    // to a 150-minute one-way travel-time ceiling, classified LOCAL/
+    // REGIONAL/EXCURSION/TOO_FAR (never a naive fixed-km radius change to
+    // the existing check itself, which keeps governing ordinary local-day
+    // scheduling legality unchanged everywhere else it's used).
+    let reach: CandidateReach = "LOCAL";
     if (!legal) {
-      state.diagnostics.geographyRejected += 1;
+      if (recommendation.lat == null || recommendation.lon == null) {
+        state.diagnostics.geographyRejected += 1;
+        continue;
+      }
+      const distanceKm = haversineKm(context.anchor.lat, context.anchor.lon, recommendation.lat, recommendation.lon);
+      reach = classifyCandidateReach(estimateOneWayTravelMinutes(distanceKm));
+      if (reach === "TOO_FAR") {
+        state.diagnostics.geographyRejected += 1;
+        continue;
+      }
+    }
+
+    // Round 9.9 — the tourist-eligibility quality floor, applied BEFORE this
+    // candidate becomes an authoritative pool entry (spec §F: "apply
+    // tourist eligibility BEFORE candidates become authoritative stay
+    // portfolio activities... not real place -> portfolio -> try to repair
+    // later"). Real, legal, non-duplicate is necessary but not sufficient —
+    // this is the actual "is this genuinely tourist-worthy" check that was
+    // missing everywhere else in this pipeline (Round 9.8's Target/Forman
+    // Mills/Burns Playground/etc. root cause).
+    const eligibility = classifyTouristEligibility({
+      category: recommendation.category,
+      name: recommendation.name,
+      shortDescription: recommendation.shortDescription,
+      osmTags: recommendation.provenance?.osmTags ?? null,
+      providerTypes: recommendation.provenance?.types ?? null,
+    });
+    recordTouristEligibilityOutcome(state.diagnostics, recommendation.name, recommendation.provenance?.provider ?? "unknown", eligibility);
+    if (!isTouristPortfolioEligible(eligibility.eligibility)) {
       continue;
     }
+    // Round 9.11 §F — the excursion value gate: distance alone never makes
+    // a candidate desirable. A REGIONAL/EXCURSION-reach candidate must ALSO
+    // clear a reach-appropriate value bar on top of ordinary portfolio
+    // eligibility above (already required for every candidate regardless
+    // of reach).
+    if (reach !== "LOCAL" && !meetsExcursionValueBar(reach, eligibility.eligibility)) {
+      state.diagnostics.excursionValueRejected = (state.diagnostics.excursionValueRejected ?? 0) + 1;
+      continue;
+    }
+    if (reach === "LOCAL") state.diagnostics.localCandidateCount = (state.diagnostics.localCandidateCount ?? 0) + 1;
+    else if (reach === "REGIONAL") state.diagnostics.regionalCandidateCount = (state.diagnostics.regionalCandidateCount ?? 0) + 1;
+    else state.diagnostics.excursionCandidateCount = (state.diagnostics.excursionCandidateCount ?? 0) + 1;
 
     const classification = classifyActivity({
       category: recommendation.category,
@@ -640,6 +1036,17 @@ export function acceptRawCandidatesIntoPool(
       lon: recommendation.lon,
       location: recommendation.location,
       source: recommendation.source,
+      reach,
+      // Round 9.15.1 §D — this refill admission path previously never set
+      // natureTypes at all, so a trail candidate accepted HERE (e.g. via
+      // the new nature-trail discovery pass) would silently lose its
+      // sub-preference fit bonus and never register as trail evidence for
+      // assembly — a real "no silent drop" gap this round closes.
+      natureTypes:
+        recommendation.category === "nature"
+          ? (recommendation.provenance?.natureExperience?.natureTypes ?? classifyNatureTypesFromTags(recommendation.provenance?.osmTags))
+          : undefined,
+      isAssembledExperience: recommendation.provenance?.natureExperience != null,
     });
     state.diagnostics.classificationBreakdown[classification.primaryFamily] =
       (state.diagnostics.classificationBreakdown[classification.primaryFamily] ?? 0) + 1;
@@ -664,12 +1071,17 @@ export function acceptRawMealCandidates(
   fetched: OverpassNearbyRecommendation[],
   seenKeys: Set<string>,
   context: { anchor: { lat: number; lon: number }; mobilityProfile: DestinationMobilityProfile; dailyCapacityMinutes: number }
-): { addedRecommendations: TripRecommendation[]; acceptedCount: number } {
+): { addedRecommendations: TripRecommendation[]; acceptedCount: number; dedupRejectedCount: number; geographyRejectedCount: number } {
   const addedRecommendations: TripRecommendation[] = [];
   let acceptedCount = 0;
+  let dedupRejectedCount = 0;
+  let geographyRejectedCount = 0;
   for (const raw of fetched) {
     const recommendation = toTripRecommendation(raw);
-    if (seenKeys.has(recommendation.id)) continue;
+    if (seenKeys.has(recommendation.id)) {
+      dedupRejectedCount += 1;
+      continue;
+    }
     seenKeys.add(recommendation.id);
     const legal = evaluateScheduledPlaceLegality({
       placeLat: recommendation.lat,
@@ -680,11 +1092,14 @@ export function acceptRawMealCandidates(
       dailyCapacityMinutes: context.dailyCapacityMinutes,
       visitMinutes: recommendation.estimatedDurationMinutes,
     }).legal;
-    if (!legal) continue;
+    if (!legal) {
+      geographyRejectedCount += 1;
+      continue;
+    }
     addedRecommendations.push(recommendation);
     acceptedCount += 1;
   }
-  return { addedRecommendations, acceptedCount };
+  return { addedRecommendations, acceptedCount, dedupRejectedCount, geographyRejectedCount };
 }
 
 /**
@@ -758,7 +1173,7 @@ export async function refillStayActivityPool(
     acceptRawCandidatesIntoPool(
       fetched,
       { candidates, seenKeys, diagnostics },
-      { anchor, mobilityProfile, dailyCapacityMinutes, mustVisitKeywords, desiredCandidateCount: pool.desiredCandidateCount }
+      { anchor, mobilityProfile, dailyCapacityMinutes, mustVisitKeywords, desiredCandidateCount: pool.desiredCandidateCount, ownerStayId: pool.stayId }
     ).addedRecommendations.forEach((r) => addedRecommendations.push(r));
   }
 
@@ -849,7 +1264,14 @@ export async function defaultFetchNearbyRecommendations(
     Math.min(radiusKm, ACTIVITY_DISCOVERY_RADIUS_CAP_KM) * 1000,
     categories,
     perCategoryLimit,
-    fetchImpl ? { fetchImpl } : {}
+    {
+      ...(fetchImpl ? { fetchImpl } : {}),
+      // Round 9.6.6 §7 — best-effort trace labels from data already
+      // available at this exact call site (never a new parameter threaded
+      // through the fixed fetchCandidates signature every test fake and
+      // production caller already shares).
+      logContext: { stay: `${anchor.lat.toFixed(2)},${anchor.lon.toFixed(2)}`, categoryGroup: categories.join(",") },
+    }
   );
   if (outcome.providerFailed) {
     throw new OverpassProviderFailureError(outcome.failureReason ?? "unknown");
@@ -947,7 +1369,18 @@ export function selectStayPortfolio(
   familyWeights: Record<ActivityFamily, number>,
   recentHistory: RecentActivityHistoryEntry[],
   currentStayStartDayIndex: number,
-  excludeRecommendationIds: Set<string> = new Set()
+  excludeRecommendationIds: Set<string> = new Set(),
+  /**
+   * Round 9.15 §B/§K — the SPECIFIC nature sub-preferences this traveler
+   * actually selected (never invented), used ONLY as a small additive fit
+   * bonus on top of the existing flat NATURE family weight above — never a
+   * replacement for it, never a huge multiplier applied to every bare
+   * category=nature candidate regardless of fit (spec §V/§K's explicit
+   * warning). Defaulted to an empty array so every pre-9.15 caller/test
+   * keeps compiling and behaving exactly as before (zero bonus for nobody
+   * who selected a specific sub-preference).
+   */
+  selectedNatureSubPreferences: NatureSubPreference[] = []
 ): StayActivityPortfolio {
   const available = pool.candidates.filter((c) => !excludeRecommendationIds.has(c.recommendationId));
   const otherFamiliesHaveSupply = (family: ActivityFamily) =>
@@ -961,6 +1394,10 @@ export function selectStayPortfolio(
   const scoreCandidate = (candidate: StayActivityPoolCandidate): number => {
     const weight = familyWeights[candidate.classification.primaryFamily] ?? 1;
     let score = candidate.significance * weight;
+
+    if (candidate.natureTypes && candidate.natureTypes.length > 0) {
+      score += candidate.significance * computeNatureSubPreferenceFit(selectedNatureSubPreferences, candidate.natureTypes);
+    }
 
     const subtypeRepeats = subtypeCounts.get(candidate.classification.subtype) ?? 0;
     score -= SUBTYPE_REPEAT_PENALTY_BASE * subtypeRepeats;
@@ -1133,6 +1570,9 @@ export function buildTripActivityPortfolios(
     resolveTextualAreaMatchFn
   );
   const familyWeights = buildPreferenceFamilyWeights(preferenceTexts);
+  // Round 9.15 §B/§K — derived ONCE per trip (preference text doesn't vary
+  // by stay), from the traveler's own real interest text only.
+  const selectedNatureSubPreferences = extractSelectedNatureSubPreferences(preferenceTexts.join(" "));
 
   const poolsByStay = new Map<string, StayActivityPool>();
   const portfoliosByStay = new Map<string, StayActivityPortfolio>();
@@ -1161,7 +1601,8 @@ export function buildTripActivityPortfolios(
       familyWeights,
       recentHistory,
       phase.startDayNumber,
-      usedAcrossTrip
+      usedAcrossTrip,
+      selectedNatureSubPreferences
     );
     portfoliosByStay.set(phase.id, portfolio);
     for (const candidate of portfolio.selected) usedAcrossTrip.add(candidate.recommendationId);

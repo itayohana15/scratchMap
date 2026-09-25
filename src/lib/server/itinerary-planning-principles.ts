@@ -2,6 +2,13 @@ import { evaluateFinalBaseDepartureFeasibility } from "../flight-planning";
 import { estimateMinutesForMode, selectTransportMode, type TransportMode } from "../transport-mode";
 import { haversineKm } from "../trip-workspace";
 import type { RecommendationCategory } from "../trip-workspace";
+import {
+  chooseInterStayTransferLeg,
+  type RouteCache,
+  type TravelLeg,
+  type TripTransportStrategy,
+} from "./travel-routing";
+import { logRealPlaceQA } from "./real-place-qa";
 
 /**
  * Reusable "how to plan a trip" reference layer, shared by the trip-frame
@@ -210,6 +217,9 @@ export interface StayTransition {
   estimatedTravelMinutes: number | null;
   /** The day this transition happens on — always the new phase's first day. */
   dayNumber: number;
+  /** Round 9.4.4 §R/§W — set only by buildStayTransitionsWithRouting (the flight-aware builder); absent (undefined) for every plain buildStayTransitions call, never a fabricated value. */
+  routingLeg?: TravelLeg;
+  selectionReason?: string;
 }
 
 /**
@@ -247,6 +257,100 @@ export function buildStayTransitions(
       transportMode,
       estimatedTravelMinutes,
       dayNumber: to.startDayNumber,
+    });
+  }
+
+  return transitions;
+}
+
+/**
+ * Round 9.4.4 §R/§S/§T — the flight-aware sibling of buildStayTransitions,
+ * used only where the FINAL, user-facing transition is actually built
+ * (finalizeArrivalDepartureContent, repairPlan's own live stayTransitions)
+ * — every purely-internal/structural feasibility check
+ * (attemptStayStructureRepair and friends) keeps using the plain
+ * ground-only buildStayTransitions above unchanged, since those only ask
+ * "is this transition possible at all", never render anything to the
+ * user. Compares a real door-to-door flight candidate against the
+ * existing ground heuristic (travel-routing.ts's chooseInterStayTransferLeg)
+ * instead of assuming a ground mode by distance tier alone — a long
+ * inter-stay hop can now genuinely resolve to "flight" instead of always
+ * "train" regardless of distance.
+ */
+export async function buildStayTransitionsWithRouting(
+  frame: TripFrame,
+  areaAnchors: Map<string, { lat: number; lon: number } | null>,
+  countryIso: string,
+  strategy: TripTransportStrategy,
+  cache?: RouteCache
+): Promise<StayTransition[]> {
+  const transitions: StayTransition[] = [];
+
+  for (let index = 1; index < frame.phases.length; index += 1) {
+    const from = frame.phases[index - 1];
+    const to = frame.phases[index];
+    const fromCoordinates = areaAnchors.get(from.areaLabel) ?? null;
+    const toCoordinates = areaAnchors.get(to.areaLabel) ?? null;
+
+    if (!fromCoordinates || !toCoordinates) {
+      // Same fail-open shape as buildStayTransitions above — no usable
+      // geometry means no routing decision can be made either.
+      transitions.push({
+        fromBase: from.areaLabel,
+        toBase: to.areaLabel,
+        fromCoordinates,
+        toCoordinates,
+        transportMode: "car",
+        estimatedTravelMinutes: null,
+        dayNumber: to.startDayNumber,
+      });
+      continue;
+    }
+
+    // Round 9.5.1 §C — a real (possibly network-bound) Google Maps
+    // lookup now lives behind this call; sequential per-transition
+    // awaits are intentional (a trip has at most a handful of stay
+    // boundaries, and this keeps result order deterministic — never a
+    // Promise.all race that would complicate the route cache's own
+    // per-key dedup logic).
+    const decision = await chooseInterStayTransferLeg(
+      { ...fromCoordinates, label: from.areaLabel },
+      { ...toCoordinates, label: to.areaLabel },
+      countryIso,
+      strategy,
+      cache
+    );
+
+    // Round 9.4.4 §W — one QA row per inter-stay transfer decision,
+    // self-gated (no-ops outside QA trace mode), so every major
+    // travel-time number in a real replay can be traced to exactly which
+    // candidates existed and why one was chosen over the other.
+    logRealPlaceQA("InterStayTransferDecision", {
+      fromStay: from.areaLabel,
+      toStay: to.areaLabel,
+      candidateModes: decision.candidates.map((leg) => ({
+        mode: leg.mode,
+        provider: leg.provider,
+        doorToDoorMinutes: leg.durationMinutes,
+        mainLegMinutes: leg.breakdown?.flightMinutes ?? leg.durationMinutes,
+        accessMinutes: leg.breakdown ? leg.breakdown.originAccessMinutes + leg.breakdown.destinationAccessMinutes : 0,
+        bufferMinutes: leg.breakdown ? leg.breakdown.departureBufferMinutes + leg.breakdown.arrivalBufferMinutes : 0,
+        confidence: leg.confidence,
+      })),
+      selectedMode: decision.selectedLeg.mode,
+      selectionReason: decision.selectionReason,
+    });
+
+    transitions.push({
+      fromBase: from.areaLabel,
+      toBase: to.areaLabel,
+      fromCoordinates,
+      toCoordinates,
+      transportMode: decision.selectedLeg.mode,
+      estimatedTravelMinutes: decision.selectedLeg.durationMinutes,
+      dayNumber: to.startDayNumber,
+      routingLeg: decision.selectedLeg,
+      selectionReason: decision.selectionReason,
     });
   }
 

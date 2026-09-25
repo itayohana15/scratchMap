@@ -17,6 +17,7 @@ import { useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { LiveDelaySheet, type DelayAction } from "@/components/country/live-delay-sheet";
@@ -168,13 +169,13 @@ export function LiveTripTodaySection({
 
   function handleMarkCompleted(item: TripItineraryItem, patch?: Parameters<typeof markItemCompleted>[1]) {
     onPatchItem(today!.id, item.id, (current) => markItemCompleted(current, patch));
-    logEvent("activity_completed", item.id, `${item.name} סומן כבוצע`);
+    logEvent("activity_completed", item.id, `${isolateText(item.name)} סומן כבוצע`);
     setExpandedCompletionId(null);
   }
 
   function handleMarkSkipped(item: TripItineraryItem, reason: string | null) {
     onPatchItem(today!.id, item.id, (current) => markItemSkipped(current, reason));
-    logEvent("activity_skipped", item.id, `${item.name} דולג${reason ? ` (${reason})` : ""}`);
+    logEvent("activity_skipped", item.id, `${isolateText(item.name)} דולג${reason ? ` (${reason})` : ""}`);
     setSkipTargetId(null);
   }
 
@@ -248,7 +249,7 @@ export function LiveTripTodaySection({
   }
 
   function handleReplaceClosed(item: TripItineraryItem) {
-    logEvent("activity_replaced", item.id, `${item.name} הוחלף (סגור/לא זמין)`);
+    logEvent("activity_replaced", item.id, `${isolateText(item.name)} הוחלף (סגור/לא זמין)`);
     void onRegenerate(draft.id, "live_replace_item", today!.id, item.id);
   }
 
@@ -320,7 +321,7 @@ export function LiveTripTodaySection({
     <section className="space-y-4">
       <div className="section-card space-y-1 p-4">
         <p className="text-sm text-muted-foreground">
-          {countryName} · {today.cityRegion || countryName}
+          {countryName} · <IsolatedText>{today.cityRegion || countryName}</IsolatedText>
         </p>
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <h3 className="font-heading text-xl font-semibold text-foreground">
@@ -548,7 +549,7 @@ export function LiveTripTodaySection({
         <div className="section-card space-y-1 p-4">
           <p className="text-sm font-medium text-foreground">חזרה למלון</p>
           <p className="text-xs text-muted-foreground">
-            {today.accommodation} · כ-{hotelReturnDistanceKm.toFixed(1)} ק&quot;מ מהמיקום האחרון
+            <IsolatedText>{today.accommodation}</IsolatedText> · כ-{hotelReturnDistanceKm.toFixed(1)} ק&quot;מ מהמיקום האחרון
           </p>
           <Button
             variant="outline"
@@ -652,7 +653,7 @@ function QuickCompletionForm({
 
   return (
     <div className="space-y-2 rounded-[16px] border border-border/60 bg-background/70 p-3">
-      <p className="text-sm font-medium text-foreground">{item.name} — בוצע!</p>
+      <p className="text-sm font-medium text-foreground"><IsolatedText>{item.name}</IsolatedText> — בוצע!</p>
       <div className="grid gap-2 sm:grid-cols-3">
         <Input type="number" value={actualCost} onChange={(event) => setActualCost(event.target.value)} placeholder="כמה עלה בפועל?" />
         <Input value={note} onChange={(event) => setNote(event.target.value)} placeholder="להוסיף הערה?" className="sm:col-span-2" />
@@ -762,7 +763,7 @@ function TodayTimeline({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className={cn("text-sm font-medium", item.completed || item.skipped ? "text-muted-foreground" : "text-foreground", item.skipped ? "line-through" : "")}>
-                      {effectiveStartTime(item) || "—"} · {item.name}
+                      {effectiveStartTime(item) || "—"} · <IsolatedText>{item.name}</IsolatedText>
                     </span>
                     <Badge variant={delayed ? "destructive" : "outline"} className="h-5 px-1.5 text-[10px]">
                       {label}

@@ -48,6 +48,9 @@ export type PlaceInsertionSource =
   | "day_fill"
   | "transfer_repair"
   | "quality_backfill"
+  | "underfilled_daytime_repair"
+  | "ownership_firewall_repair"
+  | "semantic_time_repair"
   | "other_existing_path";
 
 export type SyntheticInsertionSource = "free_time" | "meal_opportunity" | "practical_block";
@@ -76,7 +79,7 @@ export interface CanonicalPlaceIdentity {
 }
 
 export function computeCanonicalPlaceIdentity(
-  item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "itemRole">,
+  item: Pick<AiGeneratedItem, "recommendationId" | "name" | "lat" | "lon" | "itemRole"> & { plannedStartTime?: string },
   /** From the caller's own normalizePlaceNameSlug(item.name) — see this module's own header comment for why it isn't imported here directly. */
   normalizedName: string
 ): CanonicalPlaceIdentity {
@@ -95,7 +98,20 @@ export function computeCanonicalPlaceIdentity(
       lon: item.lon,
     };
   }
-  return { kind: "synthetic", identity: null, recommendationId: null, normalizedName, lat: item.lat, lon: item.lon };
+  // Round 9.15.6.1 §E/§I — a real regression proved this needs to stay
+  // "synthetic" even when real coordinates are present (a hotel-recovery
+  // block reusing the stay's own anchor on purpose, every day). Every
+  // consumer already excludes anything but kind:"real" from duplicate
+  // counting (identity.kind !== "real" is checked first, always), so this
+  // string's exact content never affects correctness — it exists purely
+  // so the QA trace can still tell two synthetic occurrences apart
+  // (spec's own "must never present 'מנוחה במלון' as a genuine duplicated
+  // POI again", not "must have a globally unique id"). AiGeneratedItem has
+  // no stable id at this stage, so plannedStartTime is the best available
+  // per-occurrence disambiguator — a documented, honest limitation, not a
+  // claim of true uniqueness.
+  const syntheticIdentity = item.itemRole ? `synthetic:${item.itemRole}:${item.plannedStartTime || normalizedName}` : null;
+  return { kind: "synthetic", identity: syntheticIdentity, recommendationId: null, normalizedName, lat: item.lat, lon: item.lon };
 }
 
 export interface PlaceInsertionEvent {

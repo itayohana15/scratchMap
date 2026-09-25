@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, RotateCcw, Utensils, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { isolateText } from "@/components/ui/isolated-text";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/format";
 import { useFoodRecommendations } from "@/lib/hooks/use-food-recommendations";
@@ -202,11 +203,11 @@ export function TripFoodTab({
               <div>
                 <h4 className="font-semibold text-foreground">
                   יום {day.dayNumber}
-                  {day.title ? ` · ${day.title}` : ""}
+                  {day.title ? ` · ${isolateText(day.title)}` : ""}
                 </h4>
                 <p className="text-xs text-muted-foreground">
                   {day.date ? formatDate(day.date, "d בMMM") : ""}
-                  {day.cityRegion ? ` · ${day.cityRegion}` : ""}
+                  {day.cityRegion ? ` · ${isolateText(day.cityRegion)}` : ""}
                 </p>
               </div>
             </div>

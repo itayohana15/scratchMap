@@ -373,3 +373,317 @@ export function buildPreferenceFamilyWeights(preferenceTexts: string[]): Record<
   }
   return weights;
 }
+
+/**
+ * Round 9.9 — THE provider-neutral tourist-eligibility gate (spec §B/§C).
+ *
+ * Root cause this closes: a real production run (Round 9.8) scheduled
+ * Target (shop=department_store), Forman Mills (shop=department_store),
+ * Maine Midcoast Mall (shop=mall), Burns Playground (leisure=park — a
+ * genuine municipal playground, OSM-tagged as a "park" the way many small
+ * US municipal parks/playgrounds/athletic fields are) and Monsignor
+ * Crawford Field (same "family"-category leisure=park pattern) as real
+ * scheduled tourist activities. Traced live: nothing anywhere in the
+ * pipeline ever asked "is this genuinely tourist-worthy" — every existing
+ * check (geography legality, dedupe, meal-role, `computeSignificance`) only
+ * asks "is this real/legal/non-duplicate", and `computeSignificance` itself
+ * starts every ordinary Overpass candidate at the SAME neutral 40/100
+ * regardless of place type. Google Places already has a hard-exclusion set
+ * (`PRIMARY_TYPE_HARD_EXCLUSIONS` in google-places.ts) for exactly this
+ * purpose, keyed off Google's own `primaryType` — but nothing analogous
+ * ever existed for Overpass's OSM tags, and Round 9.8 was the first real
+ * run where Overpass stayed healthy enough end-to-end for that gap to
+ * surface (every earlier round's real traffic happened to route through
+ * Google, whose narrower gate was doing the filtering by accident).
+ *
+ * This function is deliberately PROVIDER-NEUTRAL and STRUCTURED-METADATA-
+ * FIRST (spec §C): it reads whichever real structured signal the candidate
+ * actually carries — Overpass's raw OSM tags (`osmTags`, threaded through
+ * by overpass.ts's own query loop) or Google's `primaryType`/`types`
+ * (`providerTypes`, already populated since Round 9.6) — and only falls
+ * back to a narrow, GENERIC (never a brand/name blacklist, spec §C/§Q) name
+ * keyword check when the structured tag itself is genuinely ambiguous
+ * (bare `shop=mall`/Google `shopping_mall`, or the "family" category's own
+ * bare `leisure=park` — which Overpass's own family-category query already
+ * requests broadly, so the tag alone can never distinguish a real
+ * destination park from a mistagged neighborhood playground/sports field).
+ * A positive structured signal (tourism=museum/attraction, historic=*,
+ * heritage=*, amenity=marketplace, a real Google tourist_attraction/museum
+ * type, ...) always wins over any negative one — spec §D's own rule
+ * ("ordinary utility/local amenity != tourist activity", never "retail/
+ * sport/university always forbidden").
+ */
+export type TouristEligibility =
+  | "TOURIST_ANCHOR"
+  | "TOURIST_STRONG"
+  | "TOURIST_SUPPORTING"
+  | "DESTINATION_SHOPPING"
+  | "PRACTICAL_ONLY"
+  | "LOW_VALUE_LOCAL_AMENITY"
+  | "NOT_TOURIST_ACTIVITY";
+
+export interface TouristEligibilityInput {
+  category: RecommendationCategory;
+  name: string;
+  shortDescription?: string | null;
+  /** Overpass's raw OSM tags, when captured (overpass.ts populates this on every candidate since Round 9.9). */
+  osmTags?: Record<string, string> | null;
+  /** Google's own `[primaryType, ...types]` array (already populated in provenance.types since Round 9.6), OR any other provider's equivalent flat type-string list. */
+  providerTypes?: string[] | null;
+}
+
+export interface TouristEligibilityResult {
+  eligibility: TouristEligibility;
+  reason: string;
+  /** e.g. "osm:shop=department_store", "osm:tourism=museum", "google:type=department_store", "name:playground_keyword" — machine-checkable evidence, spec §I ("why was Target rejected — without reading source code"). */
+  matchedSignal: string | null;
+}
+
+/** A candidate real place actually earns a normal-day portfolio slot only at these tiers (spec §F/§G) — PRACTICAL_ONLY/LOW_VALUE_LOCAL_AMENITY/NOT_TOURIST_ACTIVITY are all real, legal, non-duplicate places that must still never occupy one. */
+export function isTouristPortfolioEligible(eligibility: TouristEligibility): boolean {
+  return (
+    eligibility === "TOURIST_ANCHOR" ||
+    eligibility === "TOURIST_STRONG" ||
+    eligibility === "TOURIST_SUPPORTING" ||
+    eligibility === "DESTINATION_SHOPPING"
+  );
+}
+
+// Structured OSM signals that, on their own, are strong POSITIVE evidence —
+// checked first, and always override any negative signal below (spec §D).
+const OSM_TOURISM_ANCHOR_VALUES = new Set(["museum"]);
+const OSM_TOURISM_STRONG_VALUES = new Set(["attraction", "gallery", "artwork", "zoo", "theme_park", "aquarium", "viewpoint", "alpine_hut"]);
+const OSM_LEISURE_STRONG_VALUES = new Set(["nature_reserve", "water_park"]);
+const OSM_CRAFT_EXPERIENCE_VALUES = new Set(["brewery", "winery", "distillery"]); // spec §D's brewery/winery exception
+// Round 9.15 §C — genuine nature landmarks: a peak/waterfall/cliff is
+// inherently a point-of-interest, never an ambiguous "could be anything"
+// tag the way a bare highway=path is (see the separate path/footway gate
+// below), so these are structured POSITIVE signals like any other.
+const OSM_NATURAL_STRONG_VALUES = new Set(["peak", "waterfall", "cliff"]);
+
+// Structured OSM signals that are NOT_TOURIST_ACTIVITY / LOW_VALUE on their
+// own — only reached once every positive check above has already failed to
+// match, so a museum that also happens to sell souvenirs (shop=gift) is
+// never caught here.
+const OSM_ORDINARY_RETAIL_SHOP_VALUES = new Set([
+  "supermarket", "department_store", "discount_store", "variety_store", "convenience",
+  "wholesale", "doityourself", "hardware", "trade", "car", "car_repair",
+  "mobile_phone", "electronics", "furniture", "appliance",
+]);
+const OSM_LOW_VALUE_LEISURE_VALUES = new Set(["pitch", "playground", "track", "fitness_centre", "sports_centre"]);
+const OSM_LOW_VALUE_AMENITY_VALUES = new Set([
+  "parking", "hospital", "clinic", "doctors", "school", "university", "community_centre",
+  "social_facility", "fuel", "bank", "post_office", "townhall", "courthouse", "police", "fire_station",
+]);
+const OSM_LOW_VALUE_BUILDING_VALUES = new Set(["residential", "house", "apartments", "garage", "warehouse", "industrial"]);
+
+// Google `primaryType`/`types` equivalents of the same positive/negative
+// signals — kept as its own small table (never re-deriving from Overpass's
+// OSM vocabulary) because the two providers' type systems are genuinely
+// different, per spec §A ("do not assume the Google exclusion table can
+// simply be copied... Overpass has different structured metadata") — this
+// is that same asymmetry in the other direction: Google's own type system
+// has no "shop=department_store"-style key/value pairing to reuse.
+const GOOGLE_TOURIST_ANCHOR_TYPES = new Set(["museum"]);
+const GOOGLE_TOURIST_STRONG_TYPES = new Set(["tourist_attraction", "historical_landmark", "monument", "cultural_landmark", "art_gallery", "amusement_park", "zoo", "aquarium", "national_park", "state_park", "nature_preserve"]);
+const GOOGLE_DESTINATION_SHOPPING_TYPES = new Set(["market"]);
+// Google's OWN google-places.ts already hard-excludes supermarket/
+// department_store/grocery_store/convenience_store at the source, so this
+// row is reached only for whatever slips past that (parity safety net,
+// never a duplicate of that table).
+const GOOGLE_NOT_TOURIST_TYPES = new Set(["parking", "hospital", "school", "university", "supermarket", "department_store", "grocery_store", "convenience_store", "gas_station"]);
+// "shopping_mall" is deliberately NOT in either set above — Google's own
+// GOOGLE_CATEGORY_TYPE_FILTERS.shopping already requests it as an included
+// type with no further distinction, the exact same ambiguity Overpass's
+// bare shop=mall has (spec §H: provider parity) — resolved the same way
+// below, via the shared ambiguous-mall name check.
+
+// SECONDARY evidence only (spec §C/§Q — never a brand/place-name blacklist;
+// these are generic English/Hebrew words describing what a place IS, never
+// a specific real-world business or landmark name).
+const DESTINATION_SHOPPING_NAME_KEYWORDS = ["outlet", "factory outlet", "historic", "heritage", "landmark", "אאוטלט", "היסטורי"];
+const LOW_VALUE_FAMILY_NAME_KEYWORDS = [
+  "playground", "ballfield", "ball field", "athletic field", "sports field", "sports complex",
+  // "field" alone (word-boundary matched, so "Fieldstone"/"Sheffield" never
+  // false-positive) — a generic word for an ordinary playing field, never a
+  // specific place name. A genuinely famous stadium/arena is caught EARLIER
+  // by the leisure=stadium/building=stadium positive check above and never
+  // reaches this branch (this branch only fires for the ambiguous, bare
+  // family-category leisure=park tag a real stadium is never tagged with).
+  "field",
+  "little league", "softball", "recreation center", "recreation centre", "community center", "community centre",
+  "מגרש משחקים", "מגרש ספורט", "מרכז קהילתי",
+];
+
+function firstOsmMatch(tags: Record<string, string>, key: string, values: Set<string>): string | null {
+  const value = tags[key];
+  return value != null && values.has(value) ? `osm:${key}=${value}` : null;
+}
+
+/**
+ * THE classifier (spec §B/§C). Structured metadata first; a narrow, generic
+ * name-keyword check only for the specific tags that are genuinely
+ * ambiguous on their own (bare shop=mall/shopping_mall, bare family-category
+ * leisure=park). Every other category (attraction/museum/nature/nightlife/
+ * hidden_gem/day_trip/seasonal_event with no negative structured signal)
+ * keeps its existing category-baseline behavior — this gate only ever
+ * REJECTS/DOWNGRADES on positive evidence of low value, never invents new
+ * restrictions for categories the pipeline already trusted.
+ */
+export function classifyTouristEligibility(input: TouristEligibilityInput): TouristEligibilityResult {
+  const tags = input.osmTags ?? null;
+  const types = input.providerTypes ?? null;
+  const haystack = `${input.name} ${input.shortDescription ?? ""}`.toLowerCase();
+
+  // --- 1. Structured POSITIVE signals — always checked first, always win. ---
+  if (tags) {
+    const tourism = tags.tourism;
+    if (tourism && OSM_TOURISM_ANCHOR_VALUES.has(tourism)) {
+      return { eligibility: "TOURIST_ANCHOR", reason: "Overpass tourism=museum", matchedSignal: `osm:tourism=${tourism}` };
+    }
+    if (tags.museum != null) {
+      return { eligibility: "TOURIST_ANCHOR", reason: "Overpass museum=* tag present", matchedSignal: `osm:museum=${tags.museum}` };
+    }
+    if (tourism && OSM_TOURISM_STRONG_VALUES.has(tourism)) {
+      return { eligibility: "TOURIST_STRONG", reason: `Overpass tourism=${tourism}`, matchedSignal: `osm:tourism=${tourism}` };
+    }
+    if (tags.historic != null) {
+      return { eligibility: "TOURIST_STRONG", reason: "Overpass historic=* tag present", matchedSignal: `osm:historic=${tags.historic}` };
+    }
+    if (tags.heritage != null) {
+      return { eligibility: "TOURIST_STRONG", reason: "Overpass heritage=* tag present", matchedSignal: `osm:heritage=${tags.heritage}` };
+    }
+    if (tags.amenity === "marketplace") {
+      return { eligibility: "DESTINATION_SHOPPING", reason: "Overpass amenity=marketplace — a genuine market, not ordinary retail", matchedSignal: "osm:amenity=marketplace" };
+    }
+    if (tags.leisure && OSM_LEISURE_STRONG_VALUES.has(tags.leisure)) {
+      return { eligibility: "TOURIST_STRONG", reason: `Overpass leisure=${tags.leisure}`, matchedSignal: `osm:leisure=${tags.leisure}` };
+    }
+    // Round 9.15 §C — nature/hiking structured positives (Round 9.14 audit:
+    // none of these were recognized at all before this round, so a
+    // discovered peak/waterfall/trailhead/protected-area/named-hiking-route
+    // had no path to TOURIST_SUPPORTING-or-better regardless of discovery).
+    if (tags.natural && OSM_NATURAL_STRONG_VALUES.has(tags.natural)) {
+      return { eligibility: "TOURIST_STRONG", reason: `Overpass natural=${tags.natural}`, matchedSignal: `osm:natural=${tags.natural}` };
+    }
+    if (tags.route === "hiking") {
+      return { eligibility: "TOURIST_STRONG", reason: "Overpass route=hiking — a named hiking route", matchedSignal: "osm:route=hiking" };
+    }
+    if (tags.information === "trailhead") {
+      return { eligibility: "TOURIST_SUPPORTING", reason: "Overpass information=trailhead — a genuine trail access point", matchedSignal: "osm:information=trailhead" };
+    }
+    if (tags.boundary === "protected_area") {
+      return { eligibility: "TOURIST_SUPPORTING", reason: "Overpass boundary=protected_area", matchedSignal: "osm:boundary=protected_area" };
+    }
+    if (tags.craft && OSM_CRAFT_EXPERIENCE_VALUES.has(tags.craft)) {
+      return { eligibility: "TOURIST_SUPPORTING", reason: `Overpass craft=${tags.craft} — a visitable brewery/winery/distillery experience`, matchedSignal: `osm:craft=${tags.craft}` };
+    }
+    if (tags.leisure === "stadium" || tags.building === "stadium") {
+      return { eligibility: "TOURIST_SUPPORTING", reason: "a stadium/arena — visitor-significant per exception, not an ordinary sports field", matchedSignal: `osm:${tags.leisure === "stadium" ? "leisure" : "building"}=stadium` };
+    }
+  }
+  if (types && types.length > 0) {
+    const anchorMatch = types.find((t) => GOOGLE_TOURIST_ANCHOR_TYPES.has(t));
+    if (anchorMatch) return { eligibility: "TOURIST_ANCHOR", reason: `Google type=${anchorMatch}`, matchedSignal: `google:type=${anchorMatch}` };
+    const strongMatch = types.find((t) => GOOGLE_TOURIST_STRONG_TYPES.has(t));
+    if (strongMatch) return { eligibility: "TOURIST_STRONG", reason: `Google type=${strongMatch}`, matchedSignal: `google:type=${strongMatch}` };
+    const marketMatch = types.find((t) => GOOGLE_DESTINATION_SHOPPING_TYPES.has(t));
+    if (marketMatch) return { eligibility: "DESTINATION_SHOPPING", reason: `Google type=${marketMatch} — a genuine market`, matchedSignal: `google:type=${marketMatch}` };
+  }
+
+  // --- 2. Structured NEGATIVE signals (only reached once every positive above missed). ---
+  if (tags) {
+    const shopReject = firstOsmMatch(tags, "shop", OSM_ORDINARY_RETAIL_SHOP_VALUES);
+    if (shopReject) return { eligibility: "NOT_TOURIST_ACTIVITY", reason: "ordinary chain retail (shop=* matches Google's own hard-exclusion vocabulary)", matchedSignal: shopReject };
+    const leisureReject = firstOsmMatch(tags, "leisure", OSM_LOW_VALUE_LEISURE_VALUES);
+    if (leisureReject) return { eligibility: "LOW_VALUE_LOCAL_AMENITY", reason: "an ordinary sports pitch/playground/track/fitness facility, not a visitor destination", matchedSignal: leisureReject };
+    const amenityReject = firstOsmMatch(tags, "amenity", OSM_LOW_VALUE_AMENITY_VALUES);
+    if (amenityReject) return { eligibility: "NOT_TOURIST_ACTIVITY", reason: "a practical/administrative/civic amenity, not a tourist activity", matchedSignal: amenityReject };
+    if (tags.office != null) {
+      return { eligibility: "NOT_TOURIST_ACTIVITY", reason: "an office", matchedSignal: `osm:office=${tags.office}` };
+    }
+    const buildingReject = firstOsmMatch(tags, "building", OSM_LOW_VALUE_BUILDING_VALUES);
+    if (buildingReject) return { eligibility: "NOT_TOURIST_ACTIVITY", reason: "a residential/utility building, not a tourist destination", matchedSignal: buildingReject };
+  }
+  if (types) {
+    const googleReject = types.find((t) => GOOGLE_NOT_TOURIST_TYPES.has(t));
+    if (googleReject) return { eligibility: "NOT_TOURIST_ACTIVITY", reason: `Google type=${googleReject}`, matchedSignal: `google:type=${googleReject}` };
+  }
+
+  // --- 3. Genuinely AMBIGUOUS structured signals — narrow, generic name check only. ---
+  // Round 9.15 §C/§V — a bare highway=path/footway is structurally
+  // ambiguous the same way a bare leisure=park is: it could be a genuine
+  // named hiking trail, or it could be an ordinary sidewalk/service path
+  // that merely happens to carry a name tag. Positive structured evidence
+  // (sac_scale/trail_visibility — genuine hiking-specific OSM enrichment
+  // tags — or its own route tag) is required; the mere presence of a name
+  // is NOT enough on its own for this specific ambiguous shape (unlike
+  // every other nature tag above, which is inherently point-like/
+  // unambiguous). Never a name/keyword check — this is exactly the
+  // "quality floor" spec §V asks for: FreeTime beats a fake hiking
+  // experience assembled from an ordinary named path.
+  if (tags?.highway === "path" || tags?.highway === "footway") {
+    const hasHikingEvidence = Boolean(tags.sac_scale) || Boolean(tags.trail_visibility) || Boolean(tags.route);
+    if (hasHikingEvidence) {
+      return { eligibility: "TOURIST_SUPPORTING", reason: `Overpass highway=${tags.highway} with genuine hiking-trail evidence (sac_scale/trail_visibility/route)`, matchedSignal: `osm:highway=${tags.highway}+hiking_evidence` };
+    }
+    return { eligibility: "LOW_VALUE_LOCAL_AMENITY", reason: `an ordinary highway=${tags.highway} with no positive hiking-trail evidence (a name alone is not sufficient)`, matchedSignal: `osm:highway=${tags.highway}` };
+  }
+  const bareMall = tags?.shop === "mall" || (types?.includes("shopping_mall") ?? false);
+  if (bareMall) {
+    if (matchesAny(haystack, DESTINATION_SHOPPING_NAME_KEYWORDS)) {
+      return { eligibility: "DESTINATION_SHOPPING", reason: "a mall with positive destination-shopping evidence in its own name/description", matchedSignal: "name:destination_shopping_keyword" };
+    }
+    return { eligibility: "PRACTICAL_ONLY", reason: "an ordinary mall/shopping centre with no destination-shopping evidence", matchedSignal: tags?.shop === "mall" ? "osm:shop=mall" : "google:type=shopping_mall" };
+  }
+  if (input.category === "family" && tags?.leisure === "park") {
+    if (matchesAny(haystack, LOW_VALUE_FAMILY_NAME_KEYWORDS)) {
+      return { eligibility: "LOW_VALUE_LOCAL_AMENITY", reason: "a neighborhood playground/sports field/rec-centre mistagged under a broad leisure=park-style family query, not a genuine family destination", matchedSignal: "name:low_value_family_keyword" };
+    }
+    // Round 9.13 §M/§N — a real production run found bare leisure=park
+    // ordinary neighborhood parks (Round 9.12: "New Springville Park",
+    // "Pumphouse Park", "Baederwood Park", "Grove Park", the Battery Park
+    // City "Forecourt"s) surviving purely because they had no NEGATIVE
+    // keyword — the OLD "absence of a negative keyword is the honest
+    // default" fail-open was itself the bug. The absence of negative
+    // evidence is no longer sufficient on its own for this specific
+    // structured shape; genuine POSITIVE visitor-value evidence is now
+    // required — all still structural, never a name/place blacklist.
+    // `wikipedia` (a real, curated encyclopedia article) is deliberately
+    // used instead of `wikidata` alone (spec §M explicitly forbids that —
+    // Round 9.12's own New Springville Park had a routine wikidata tag,
+    // which nearly every named OSM feature eventually gets, and is not
+    // itself evidence of visitor significance). `designation`/
+    // `protection_title`/`boundary=national_park`/`garden:type` are the
+    // generic OSM tags real national/state parks and botanical gardens
+    // (spec §N's own preserved list) actually carry.
+    const hasPositiveParkEvidence =
+      Boolean(tags.wikipedia) ||
+      Boolean(tags.designation) ||
+      Boolean(tags.protection_title) ||
+      tags.boundary === "national_park" ||
+      tags.boundary === "protected_area" ||
+      Boolean(tags["garden:type"]);
+    if (hasPositiveParkEvidence) {
+      return { eligibility: "TOURIST_SUPPORTING", reason: "a family-category park with genuine structured visitor-value evidence", matchedSignal: "osm:leisure=park+positive_evidence" };
+    }
+    return { eligibility: "LOW_VALUE_LOCAL_AMENITY", reason: "an ordinary leisure=park with no positive structured visitor-value evidence (wikidata alone, or no evidence at all, is not sufficient)", matchedSignal: "osm:leisure=park" };
+  }
+  if (input.category === "family" && !tags && !types) {
+    // Fail-open ONLY for candidates with NO structured data at all (manual/
+    // saved places, gemini-verified places, older fixtures/tests) — the
+    // established, unchanged backward-compatibility convention. This is a
+    // narrower carve-out than before: it no longer covers a candidate that
+    // DOES carry a bare leisure=park tag (handled, stricter, above).
+    return { eligibility: "TOURIST_SUPPORTING", reason: "no structured evidence available at all — fail-open for backward compatibility", matchedSignal: null };
+  }
+
+  // --- 4. No negative/ambiguous signal matched anywhere — category-baseline default. ---
+  // Deliberately fail-open (spec's own established convention elsewhere in
+  // this codebase, e.g. classifyStayDestination): a candidate with no
+  // structured data at all (manual/saved places, gemini-verified places,
+  // older fixtures) or whose structured data carried no negative/ambiguous
+  // signal keeps exactly the behavior this pipeline already had before this
+  // round — never newly rejected on the mere ABSENCE of positive evidence.
+  return { eligibility: "TOURIST_SUPPORTING", reason: "no negative or ambiguous structured evidence found", matchedSignal: null };
+}

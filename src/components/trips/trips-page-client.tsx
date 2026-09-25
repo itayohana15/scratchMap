@@ -26,6 +26,7 @@ import { toast } from "sonner";
 import { CountryBanner } from "@/components/shared/country-banner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { IsolatedText } from "@/components/ui/isolated-text";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   DropdownMenu,
@@ -730,18 +731,18 @@ function HistoryTripCard({
             <div className="grid gap-3 sm:grid-cols-3">
               <div>
                 <p className="text-xs text-muted-foreground">העיר של היום</p>
-                <p className="mt-1 text-sm font-medium">{trip.currentDay.cityRegion || trip.countryName}</p>
+                <p className="mt-1 text-sm font-medium"><IsolatedText>{trip.currentDay.cityRegion || trip.countryName}</IsolatedText></p>
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">הפעילות הבאה</p>
                 <p className="mt-1 text-sm font-medium">
-                  {trip.nextActivity?.name || "היום עוד פתוח לגמישות"}
+                  {trip.nextActivity?.name ? <IsolatedText>{trip.nextActivity.name}</IsolatedText> : "היום עוד פתוח לגמישות"}
                 </p>
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">לינה</p>
                 <p className="mt-1 text-sm font-medium">
-                  {trip.currentDay.accommodation || "טרם הוגדרה"}
+                  {trip.currentDay.accommodation ? <IsolatedText>{trip.currentDay.accommodation}</IsolatedText> : "טרם הוגדרה"}
                 </p>
               </div>
             </div>

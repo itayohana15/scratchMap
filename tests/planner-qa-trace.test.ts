@@ -196,7 +196,11 @@ test("planner-qa-trace: synthetic items never pollute the real-place duplicate t
     const events = getPlannerQaTraceEvents();
     assert.equal(events.length, 2);
     assert.ok(events.every((event) => event.identity.kind === "synthetic"));
-    assert.ok(events.every((event) => event.identity.identity === null));
+    // Round 9.15.6.1 §E/§I — synthetic items now get a distinguishable
+    // (never null) identity for observability, but it must never be the
+    // coords-based REAL-place key these same coordinates would otherwise
+    // map to — that's the actual invariant this test guards.
+    assert.ok(events.every((event) => event.identity.identity !== "coords:41.878:-87.630:free-time-chicago"));
     // The would-be real-place key these coordinates map to (had itemRole
     // been ignored) must return no history at all.
     assert.equal(findInsertionsByIdentity("coords:41.878:-87.630:free-time-chicago").length, 0);

@@ -19,6 +19,10 @@ import {
   InsufficientRealActivitySupplyError,
   InsufficientRealActivityCoverageError,
   RealPlaceDiscoveryUnavailableError,
+  RealPlaceDuplicatesRemainError,
+  OpeningHoursViolationsRemainError,
+  TimeOfDaySemanticViolationsRemainError,
+  InsufficientStayRegionCoverageError,
 } from "@/lib/server/country-itinerary-generation";
 import {
   beginRealPlaceTrace,
@@ -344,7 +348,11 @@ function devLog(message: string, details?: Record<string, unknown>) {
   else console.log(`[Itinerary] ${message}`);
 }
 
-async function runGenerationStage<T>(
+// Round 9.16.4 §11 — exported so the pass-through allowlist itself (which
+// typed errors survive vs get silently re-wrapped into a generic
+// ItineraryGenerationPipelineError) can be unit-tested directly, without
+// needing the full Supabase-backed generateAndStoreCountryItinerary path.
+export async function runGenerationStage<T>(
   stage: ItineraryGenerationFailureStage,
   work: () => Promise<T>,
   details?: Record<string, unknown>
@@ -370,7 +378,18 @@ async function runGenerationStage<T>(
       // round's own production evidence showed for what was actually a
       // coverage failure.
       error instanceof InsufficientRealActivityCoverageError ||
-      error instanceof RealPlaceDiscoveryUnavailableError
+      error instanceof RealPlaceDiscoveryUnavailableError ||
+      // Round 9.16.4 §11 — the exact same "silently re-wrapped, structured
+      // diagnostics lost" gap the comment above already fixed for two
+      // other typed errors, found still open for four more during the
+      // Round 9.16.3 forensic trace (the log showed `errorName:
+      // 'ItineraryGenerationPipelineError'` for what was actually a
+      // TimeOfDaySemanticViolationsRemainError) — never reaching route.ts's
+      // own dedicated instanceof branches for these.
+      error instanceof RealPlaceDuplicatesRemainError ||
+      error instanceof OpeningHoursViolationsRemainError ||
+      error instanceof TimeOfDaySemanticViolationsRemainError ||
+      error instanceof InsufficientStayRegionCoverageError
     ) {
       throw error;
     }

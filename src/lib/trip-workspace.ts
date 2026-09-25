@@ -208,10 +208,115 @@ export interface TripPreferences {
  */
 export type PriceSourceType = "candidate" | "ai_estimate";
 
+/**
+ * Round 9.6 §A — structured, provider-neutral origin evidence for a real
+ * place. Additive/optional so every pre-existing TripRecommendation
+ * literal (tests, fixtures, manual entries) keeps compiling unchanged.
+ * `providerId` is the provider's own canonical identifier — the real OSM-
+ * derived composite string for "overpass", the real Google place ID for
+ * "google_places", null for a manual/user-selected entry. Deliberately
+ * separate from `id` (this app's own app-wide-unique recommendation key,
+ * unchanged in shape) — spec "do not overload recommendationId semantics
+ * if a dedicated provider identifier is cleaner".
+ */
+export interface RealPlaceProvenance {
+  provider: "overpass" | "google_places" | "manual" | "gemini_proposed_then_verified";
+  providerId: string | null;
+  /** Raw provider type tags, when the provider returns them (Google Places' own primaryType/types) — strong semantic evidence for tourist-value classification, never fabricated when a provider (like Overpass) doesn't supply it. */
+  types?: string[];
+  /** Round 9.9 — Overpass's own raw OSM tags (shop=*, leisure=*, tourism=*, historic=*, amenity=*, office=*, building=*, ...), when captured — the structured, provider-neutral evidence classifyTouristEligibility uses for an Overpass-sourced candidate, mirroring what `types` already provides for Google. Never fabricated for a candidate whose tags weren't captured (pre-9.9 candidates, tests, manual/saved places). */
+  osmTags?: Record<string, string>;
+  /** Only meaningful for provider "gemini_proposed_then_verified" — which authoritative provider actually resolved/verified the proposed name. */
+  verifiedBy?: "overpass" | "google_places";
+  /**
+   * Round 9.15 §F — present only when this candidate is a synthesized
+   * SINGLE-DAY nature/hiking experience (assembleNatureExperiences,
+   * src/lib/server/nature-experience.ts) aggregating multiple verified real
+   * components, rather than one raw discovered place. Absent for every
+   * ordinary candidate (backward compatible, same optional-field convention
+   * as every other provenance addition in this codebase). Deliberately
+   * shaped so a future multi-day extension (durationDays > 1, segments[],
+   * overnightStops[]) can be added here without discarding this
+   * representation (Round 9.15 §W) — never built this round.
+   */
+  natureExperience?: NatureExperienceMetadata;
+  /**
+   * Round 9.15.4 §G/§H — the id of the TripFrame phase whose discovery pass
+   * actually found this candidate (the same id AiGeneratedDay.phaseId
+   * already uses as "ONE DAY HAS ONE AUTHORITATIVE STRUCTURAL OWNER").
+   * Root-caused from a real 39-day/6-stay production run (trace
+   * gen-muadytbg-axmgtlz6): a Boston-discovered candidate ("Cheers Beacon
+   * Hill", ~66km from Providence's own anchor) was scheduled on a
+   * Providence day, because every candidate-selection/replacement function
+   * only ever had a flat 80km CANDIDATE_GEOGRAPHIC_COMPATIBILITY_KM
+   * distance check to go on — generous enough to treat two genuinely
+   * distinct, adjacent stays as "compatible" with each other. This field
+   * lets isCandidateOwnedByStay (below) ask the actually-correct question
+   * ("which stay discovered this?") instead of only "how far away is it?".
+   * Absent for manual/saved/pre-9.15.4 candidates — never treated as a
+   * violation (unknown ownership always passes, exactly like every other
+   * optional-field addition in this codebase).
+   */
+  ownerStayId?: string | null;
+  /** The owning stay's own anchor at discovery time — carried alongside ownerStayId purely for CrossStayOwnershipViolation's diagnostic distance fields; never used as a scheduling/legality signal on its own. */
+  ownerAnchor?: { lat: number; lon: number } | null;
+}
+
+/**
+ * Round 9.15 §F — a minimal, provider-neutral SINGLE-DAY nature/hiking
+ * experience abstraction. Deliberately NOT a redesign of TripRecommendation
+ * itself — an assembled experience is represented AS an ordinary
+ * TripRecommendation (real id/name/category/estimatedDurationMinutes/lat/
+ * lon) with this metadata attached via provenance.natureExperience, so
+ * every existing consumer (VisitScale classification, composition,
+ * backfill, legality, repair) handles it unchanged, with zero new parallel
+ * pipeline. Only fields genuinely derivable from real discovered components
+ * are populated; everything else is honestly `null`/`false`, never
+ * fabricated (spec §I: no invented route geometry).
+ */
+export type NatureExperienceType =
+  | "NATURE_SHORT_WALK"
+  | "NATURE_HALF_DAY_HIKE"
+  | "NATURE_FULL_DAY_HIKE"
+  | "SCENIC_NATURE_ROUTE"
+  | "SCENIC_DRIVE"
+  | "NATURE_EXCURSION";
+
+export type NatureSubPreference =
+  | "HIKING"
+  | "MOUNTAINS"
+  | "WATERFALLS"
+  | "COAST"
+  | "BEACHES"
+  | "LAKES_RIVERS"
+  | "WILDLIFE"
+  | "SCENIC_VIEWS"
+  | "SCENIC_DRIVES";
+
+export interface NatureExperienceMetadata {
+  experienceId: string;
+  experienceType: NatureExperienceType;
+  /** The real recommendationIds of every component this experience aggregates — never fabricated, always traceable back to a genuine discovered candidate. */
+  componentRecommendationIds: string[];
+  natureTypes: NatureSubPreference[];
+  startLocation: { lat: number; lon: number };
+  endLocation: { lat: number; lon: number };
+  /** From OSM `sac_scale`/`trail_visibility` when a component actually carries one — never inferred/guessed. */
+  difficulty: string | null;
+  /** From an OSM `distance` tag when a component actually carries one — never estimated from coordinates. */
+  distanceKm: number | null;
+  /** Always false in this round (Round 9.15 §I) — full route-relation geometry is not fetched; explicitly marked unavailable rather than fabricating a line between component points. */
+  routeGeometryAvailable: boolean;
+  /** Round 9.15.1 §G — truthful duration confidence: VERIFIED only when a real OSM distance tag backs the total, ESTIMATED when summed from per-type planning defaults, UNKNOWN reserved for a future evidence source not produced today. Never silently treated as more certain than it is. */
+  durationConfidence: "VERIFIED_DURATION" | "ESTIMATED_DURATION" | "UNKNOWN_DURATION";
+}
+
 export interface TripRecommendation {
   id: string;
   name: string;
   category: RecommendationCategory;
+  /** Round 9.6 §A — optional so every existing TripRecommendation stays valid; absent means "this predates provenance tracking", never treated as suspicious. */
+  provenance?: RealPlaceProvenance;
   location: string;
   shortDescription: string;
   estimatedDurationMinutes: number | null;
@@ -712,7 +817,15 @@ export interface AiItineraryRequest {
  * "real_place" by the one shared helper that reads this (isSyntheticScheduleItem,
  * itinerary-generation-constraints.ts), so nothing regresses silently.
  */
-export type ScheduleItemRole = "real_place" | "meal_opportunity" | "free_time" | "transit_practical";
+// Round 9.15.6.1 §B — "hotel_recovery" added narrowly for the one
+// synthetic block type that (unlike every other synthetic role above)
+// legitimately carries REAL, non-null coordinates (the stay's own hotel
+// anchor, needed for honest travel-time computation — spec §Z18A). Never
+// folded into "transit_practical" (a genuinely different concept: a
+// stay-to-stay transfer/logistics block, not an in-stay rest period) or
+// "free_time" (which this block is deliberately NOT — spec §Z18B's own
+// "distinguish PACING_BUFFER from HOTEL_RECOVERY from UNPLANNED_FREE_TIME").
+export type ScheduleItemRole = "real_place" | "meal_opportunity" | "free_time" | "transit_practical" | "hotel_recovery";
 
 export interface AiGeneratedItem {
   name: string;
@@ -1879,6 +1992,29 @@ const TRANSIT_MAX_KM_FOR_LEGALITY = 5;
  * than day_trip) falls through to the normal distance-to-existing-anchors
  * rule below, exactly as before this fix.
  */
+/**
+ * Round 9.15.4 §H/§I — the actual ownership question, distinct from (and
+ * checked ALONGSIDE, never instead of) isCandidateGeographicallyCompatibleWithDay's
+ * distance math: "did a DIFFERENT stay's own discovery pass find this
+ * candidate?" A flat 80km distance gate cannot express this — two
+ * genuinely distinct stays are routinely well within 80km of each other
+ * (Boston/Providence, ~66km) — so distance alone is not sufficient for
+ * this codebase's own "one day, one authoritative stay owner" invariant.
+ * Candidates with no recorded ownerStayId (manual/saved/pre-9.15.4) always
+ * pass — this never blocks on missing data, only on a POSITIVE mismatch.
+ * A day with no phaseId yet (predates ownership binding) also always
+ * passes, for the same reason.
+ */
+export function isCandidateOwnedByStay(
+  candidate: { provenance?: RealPlaceProvenance },
+  dayPhaseId: string | null | undefined
+): boolean {
+  const ownerStayId = candidate.provenance?.ownerStayId;
+  if (ownerStayId == null) return true;
+  if (dayPhaseId == null) return true;
+  return ownerStayId === dayPhaseId;
+}
+
 export function isCandidateGeographicallyCompatibleWithDay(
   candidate: { lat: number | null; lon: number | null; estimatedDurationMinutes?: number | null },
   existingAnchors: Array<{ lat: number | null; lon: number | null }>,

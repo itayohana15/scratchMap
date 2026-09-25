@@ -7,6 +7,7 @@ import { PhotoUploadDialog } from "@/components/gallery/photo-upload-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IsolatedText, isolateText } from "@/components/ui/isolated-text";
 import {
   Select,
   SelectContent,
@@ -186,7 +187,7 @@ function EntryCard({
                 <SelectItem value={NO_ACTIVITY_VALUE}>ללא פעילות מסוימת</SelectItem>
                 {dayItems.map((item) => (
                   <SelectItem key={item.id} value={item.id}>
-                    {item.name || "פעילות ללא שם"}
+                    {item.name ? <IsolatedText>{item.name}</IsolatedText> : "פעילות ללא שם"}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -403,7 +404,7 @@ export function TripJournalSection({ draft, onPatchDraft }: TripJournalSectionPr
                   <div key={group.dayId ?? "none"} className="space-y-2">
                     <h4 className="text-sm font-semibold text-foreground">
                       {group.label}
-                      {day ? ` — ${day.cityRegion || ""} · ${tripPhaseLabel(day.dayNumber, totalDays)}` : ""}
+                      {day ? ` — ${day.cityRegion ? isolateText(day.cityRegion) : ""} · ${tripPhaseLabel(day.dayNumber, totalDays)}` : ""}
                     </h4>
                     <div className="space-y-3">{group.entries.map(renderEntry)}</div>
                   </div>

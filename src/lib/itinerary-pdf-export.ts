@@ -59,14 +59,22 @@ function escapeHtml(value: string): string {
 /**
  * Bidi-isolates a real entity name (a POI, a city, a hotel) so the browser
  * never reorders its own internal word order just because it sits inside
- * this RTL document — the exact bug behind "York New"/"Francisco San" in
- * a real exported PDF. `<bdi>` (not a hardcoded `dir="ltr"`) lets the
- * browser auto-detect the name's own real direction instead of assuming
- * every name is English — the underlying string itself is never touched,
- * only how it's isolated for rendering.
+ * this RTL document — the exact bug behind "York New"/"Francisco San"/
+ * "Harbor Bar"/"Conway North" in a real exported PDF. `dir="auto"` (never a
+ * hardcoded `dir="ltr"`, which would itself mis-render a Hebrew name the
+ * same way) lets the browser auto-detect the name's own real direction
+ * instead of assuming every name is English — the underlying string itself
+ * is never touched, only how it's isolated for rendering.
+ *
+ * Round 9.10 — the `dir` attribute is now set EXPLICITLY rather than relied
+ * on as `<bdi>`'s own implicit default: the browser's *live* print-to-PDF
+ * rendering pass is a genuinely separate code path from normal on-screen
+ * rendering, and being explicit here removes any dependency on that path
+ * correctly special-casing a bare `<bdi>` tag's UA-default auto-direction
+ * the exact same way normal rendering does.
  */
 export function bidiName(value: string): string {
-  return `<bdi>${escapeHtml(value)}</bdi>`;
+  return `<bdi dir="auto">${escapeHtml(value)}</bdi>`;
 }
 
 export function itineraryDisplayTitle(itinerary: CountryItineraryRecord, countryName: string): string {

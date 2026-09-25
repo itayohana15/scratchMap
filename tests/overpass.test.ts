@@ -10,6 +10,12 @@ import {
   resetOverpassCallStats,
   queryNearbyRecommendations,
   queryNearbyRecommendationsDetailed,
+  beginOverpassSession,
+  endOverpassSession,
+  getOverpassCircuitState,
+  getOverpassSessionSummary,
+  classifyOverpassFailureReason,
+  MIN_OVERPASS_ATTEMPT_BUDGET_MS,
 } from "../src/lib/places/overpass";
 
 // Pure counter logic only — no real network call.
@@ -50,7 +56,18 @@ type MockBehavior =
   | { type: "success"; status?: number; body?: unknown }
   | { type: "http-error"; status: number }
   | { type: "network-error"; message?: string }
-  | { type: "hang" };
+  | { type: "hang" }
+  // Round 9.6.6 §8 test 1/2 — a genuinely stuck transport that never
+  // settles AND never reacts to AbortSignal at all (no listener attached),
+  // the exact real-world shape a stuck TCP connection can take. Distinct
+  // from "hang" above, which DOES resolve once abort() fires — this one
+  // must be bounded purely by the caller's own hard deadline race.
+  | { type: "hang-ignore-abort" }
+  // Round 9.6.6 §8 test 3/4 — settles long after any reasonable deadline,
+  // to prove a late settlement is safely absorbed and never mutates an
+  // already-returned result.
+  | { type: "late-reject"; delayMs: number; message?: string }
+  | { type: "late-success"; delayMs: number; body?: unknown };
 
 function createMockFetch(behaviors: MockBehavior[]) {
   const calls: MockCall[] = [];
@@ -70,6 +87,21 @@ function createMockFetch(behaviors: MockBehavior[]) {
           error.name = "AbortError";
           reject(error);
         });
+      });
+    }
+    if (behavior.type === "hang-ignore-abort") {
+      // Never resolves, never listens for abort at all — the exact "stuck
+      // TCP connection" shape AbortController alone cannot bound.
+      return new Promise<Response>(() => {});
+    }
+    if (behavior.type === "late-reject") {
+      return new Promise<Response>((_resolve, reject) => {
+        setTimeout(() => reject(new Error(behavior.message ?? "late simulated network error")), behavior.delayMs);
+      });
+    }
+    if (behavior.type === "late-success") {
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => resolve({ ok: true, status: 200, json: async () => behavior.body ?? { elements: [] } } as unknown as Response), behavior.delayMs);
       });
     }
     if (behavior.type === "network-error") {
@@ -245,4 +277,182 @@ test("Round 9.3.3: queryNearbyRecommendations (the never-throws wrapper) still r
   const { fetchImpl } = createMockFetch([{ type: "network-error" }, { type: "network-error" }]);
   const results = await queryNearbyRecommendations(10, 10, 5000, ["museum"], 5, { fetchImpl });
   assert.deepEqual(results, [], "existing callers of the plain function must see no behavior change");
+});
+
+/* ==================================================================== *
+ * ROUND 9.6.6 — OVERPASS LATENCY CONTAINMENT / FAIL-FAST BOUNDARY       *
+ * ==================================================================== */
+
+// Test 1 — fetch never resolves: caller returns within hard deadline.
+test("Round 9.6.6 test 1: a fetch that never resolves still returns within the hard deadline", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "hang-ignore-abort" }, { type: "hang-ignore-abort" }]);
+  const start = Date.now();
+  const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 60 });
+  const elapsed = Date.now() - start;
+  assert.equal(outcome.kind, "failure");
+  assert.ok(elapsed < 2000, `expected to return well within the hard deadline (2 endpoints x 60ms), took ${elapsed}ms`);
+});
+
+// Test 2 — fetch ignores AbortSignal entirely: caller still returns within hard deadline.
+test("Round 9.6.6 test 2: a fetch that ignores AbortSignal entirely still returns within the hard deadline", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "hang-ignore-abort" }]);
+  const start = Date.now();
+  const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 50, endpoints: ["https://only-endpoint.example/api"] });
+  const elapsed = Date.now() - start;
+  assert.equal(outcome.kind, "failure");
+  assert.equal(outcome.kind === "failure" ? outcome.failureCategory : null, "OVERPASS_TIMEOUT");
+  assert.ok(elapsed < 500, `must not wait materially beyond the configured 50ms deadline, took ${elapsed}ms`);
+});
+
+// Test 3 — late fetch rejection: no unhandled rejection.
+test("Round 9.6.6 test 3: a fetch that rejects long after the hard deadline never produces an unhandled rejection", async () => {
+  let unhandled = false;
+  const onUnhandled = () => { unhandled = true; };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { fetchImpl } = createMockFetch([{ type: "late-reject", delayMs: 150 }]);
+    const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 30, endpoints: ["https://only-endpoint.example/api"] });
+    assert.equal(outcome.kind, "failure");
+    // Give the late rejection time to actually fire and be (safely) absorbed.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(unhandled, false, "a late rejection from an already-abandoned attempt must never surface as an unhandled rejection");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+// Test 4 — late fetch success: cannot mutate already-completed discovery result.
+test("Round 9.6.6 test 4: a fetch that succeeds long after the hard deadline cannot change the already-returned result", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "late-success", delayMs: 150, body: { elements: [{ type: "node", lat: 1, lon: 1, tags: { name: "Late Place", tourism: "museum" } }] } }]);
+  const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 30, endpoints: ["https://only-endpoint.example/api"] });
+  assert.equal(outcome.kind, "failure", "the caller must have already moved on with a timeout result");
+  // Wait past the late success to confirm nothing retroactively changes.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(outcome.kind, "failure", "the already-returned outcome object must never be mutated by a later-settling promise");
+});
+
+// Test 5 — remaining global budget < configured timeout: effective timeout uses remaining budget.
+test("Round 9.6.6 test 5: a remaining session budget smaller than the configured timeout clamps the effective timeout", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "hang-ignore-abort" }]);
+  // Deliberately ABOVE MIN_OVERPASS_ATTEMPT_BUDGET_MS (2000ms) so this
+  // exercises the CLAMP specifically, distinct from test 6's "skip below
+  // the sane minimum" path — a budget below the minimum would short-circuit
+  // before ever reaching the effective-timeout computation at all.
+  const remainingBudgetMs = MIN_OVERPASS_ATTEMPT_BUDGET_MS + 500;
+  beginOverpassSession(Date.now() + remainingBudgetMs);
+  try {
+    const start = Date.now();
+    const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 20_000, endpoints: ["https://only-endpoint.example/api"] });
+    const elapsed = Date.now() - start;
+    assert.equal(outcome.kind, "failure");
+    assert.ok(elapsed < remainingBudgetMs + 1000, `effective timeout must have been clamped to the ~${remainingBudgetMs}ms remaining budget, not the configured 20s, took ${elapsed}ms`);
+  } finally {
+    endOverpassSession();
+  }
+});
+
+// Test 6 — zero remaining budget: no Overpass request starts.
+test("Round 9.6.6 test 6: a remaining session budget below the sane minimum skips the request entirely", async () => {
+  let called = false;
+  const fetchImpl = (async () => { called = true; return { ok: true, status: 200, json: async () => ({ elements: [] }) } as unknown as Response; }) as unknown as typeof fetch;
+  beginOverpassSession(Date.now() + 10); // far below MIN_OVERPASS_ATTEMPT_BUDGET_MS
+  try {
+    const outcome = await fetchOverpass("q", { fetchImpl });
+    assert.equal(outcome.kind, "failure");
+    assert.equal(outcome.kind === "failure" ? outcome.failureCategory : null, "OVERPASS_BUDGET_EXHAUSTED");
+    assert.equal(called, false, "no network request may even start when the remaining budget is below the sane minimum");
+  } finally {
+    endOverpassSession();
+  }
+});
+
+// Test 7 — repeated timeouts: generation-scoped circuit opens.
+test("Round 9.6.6 test 7: repeated timeout/network failures open the generation-scoped circuit", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "hang-ignore-abort" }]);
+  beginOverpassSession(null);
+  try {
+    assert.equal(getOverpassCircuitState(), "HEALTHY");
+    for (let i = 0; i < 4; i += 1) {
+      await fetchOverpass("q", { fetchImpl, timeoutMs: 20, endpoints: ["https://only-endpoint.example/api"] });
+    }
+    assert.equal(getOverpassCircuitState(), "UNAVAILABLE", "enough consecutive failures must open the circuit");
+  } finally {
+    endOverpassSession();
+  }
+});
+
+// Test 8 — circuit open: later stays/categories skip Overpass immediately.
+test("Round 9.6.6 test 8: once the circuit is open, a later call skips Overpass immediately with no network attempt", async () => {
+  let called = false;
+  const fetchImpl = (async () => { called = true; throw new Error("must never be called"); }) as unknown as typeof fetch;
+  beginOverpassSession(null);
+  try {
+    const { fetchImpl: hangingFetch } = createMockFetch([{ type: "hang-ignore-abort" }]);
+    for (let i = 0; i < 4; i += 1) {
+      await fetchOverpass("q", { fetchImpl: hangingFetch, timeoutMs: 20, endpoints: ["https://only-endpoint.example/api"] });
+    }
+    assert.equal(getOverpassCircuitState(), "UNAVAILABLE");
+    const start = Date.now();
+    const outcome = await fetchOverpass("q", { fetchImpl, timeoutMs: 20_000 });
+    const elapsed = Date.now() - start;
+    assert.equal(outcome.kind, "failure");
+    assert.equal(outcome.kind === "failure" ? outcome.failureCategory : null, "OVERPASS_CIRCUIT_OPEN");
+    assert.equal(called, false, "an open circuit must skip the network attempt entirely, not just fail fast after trying");
+    assert.ok(elapsed < 200, "a circuit-open skip must be immediate");
+  } finally {
+    endOverpassSession();
+  }
+});
+
+// Test 9 — new generation: circuit starts healthy again.
+test("Round 9.6.6 test 9: a new generation's Overpass session always starts HEALTHY regardless of a previous one's circuit state", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "hang-ignore-abort" }]);
+  beginOverpassSession(null);
+  for (let i = 0; i < 4; i += 1) {
+    await fetchOverpass("q", { fetchImpl, timeoutMs: 20, endpoints: ["https://only-endpoint.example/api"] });
+  }
+  assert.equal(getOverpassCircuitState(), "UNAVAILABLE");
+  endOverpassSession();
+
+  beginOverpassSession(null);
+  try {
+    assert.equal(getOverpassCircuitState(), "HEALTHY", "a later generation must never inherit a previous one's open circuit — no permanent/global blacklisting");
+  } finally {
+    endOverpassSession();
+  }
+});
+
+// Test 10 — HTTP 504: counted distinctly from timeout.
+test("Round 9.6.6 test 10: an HTTP 504 is classified distinctly from a timeout", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "http-error", status: 504 }, { type: "http-error", status: 504 }]);
+  beginOverpassSession(null);
+  try {
+    await fetchOverpass("q", { fetchImpl });
+    const summary = getOverpassSessionSummary();
+    assert.equal(summary.overpassHttpErrors, 2);
+    assert.equal(summary.overpassTimeouts, 0, "an HTTP error must never be counted as a timeout");
+  } finally {
+    endOverpassSession();
+  }
+});
+
+test("Round 9.6.6 test 10b: classifyOverpassFailureReason distinguishes every failure category", () => {
+  assert.equal(classifyOverpassFailureReason("timeout", undefined), "OVERPASS_TIMEOUT");
+  assert.equal(classifyOverpassFailureReason("HTTP 504", 504), "OVERPASS_HTTP_ERROR");
+  assert.equal(classifyOverpassFailureReason("some network failure", undefined), "OVERPASS_NETWORK_ERROR");
+  assert.equal(classifyOverpassFailureReason("budget_exhausted", undefined), "OVERPASS_BUDGET_EXHAUSTED");
+  assert.equal(classifyOverpassFailureReason("circuit_open", undefined), "OVERPASS_CIRCUIT_OPEN");
+});
+
+// Test 11 — genuine zero result: not classified as provider failure.
+test("Round 9.6.6 test 11: a genuine HTTP 200 with zero elements is never classified as a provider failure", async () => {
+  const { fetchImpl } = createMockFetch([{ type: "success", body: { elements: [] } }]);
+  const outcome = await queryNearbyRecommendationsDetailed(10, 10, 5000, ["museum"], 5, { fetchImpl });
+  assert.equal(outcome.providerFailed, false);
+  assert.equal(outcome.failureCategory, null, "only a real failure carries a failureCategory — a genuine empty answer must never be labeled OVERPASS_ZERO_RESULTS as if it were a failure state");
+});
+
+test("Round 9.6.6: MIN_OVERPASS_ATTEMPT_BUDGET_MS is a small, sane, positive bound", () => {
+  assert.ok(MIN_OVERPASS_ATTEMPT_BUDGET_MS > 0);
+  assert.ok(MIN_OVERPASS_ATTEMPT_BUDGET_MS < 10_000);
 });

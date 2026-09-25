@@ -13,8 +13,10 @@ import {
   findDefaultAirportForCountry,
 } from "@/lib/facts/airports-data";
 import { generateCountryItineraryPlan } from "@/lib/server/country-itinerary-generation";
+import { beginRealPlaceTrace, endRealPlaceTrace, generateRealPlaceTraceId } from "@/lib/server/real-place-qa";
 import {
   createEmptyFlightLeg,
+  getTripDayCount,
   type AiItineraryRequest,
   type RecommendationCategory,
   type TripFlightLeg,
@@ -129,6 +131,8 @@ interface Scenario {
   outboundArrivalTime?: string;
   returnDepartureTime?: string;
   extraRecommendations?: TripRecommendation[];
+  /** Applied under the scenario's own startDate/endDate/budget/travelers/flights, so those always win over any accidental overlap here. */
+  preferencesOverride?: Partial<TripPreferences>;
 }
 
 function buildScenarios(): Record<string, Scenario> {
@@ -202,6 +206,29 @@ function buildScenarios(): Record<string, Scenario> {
       budget: 6000,
       travelers: 2,
     },
+    // Round 9.6.1 — the 39-day New England + NYC scenario that originally
+    // exposed the planner-quality problems (Round 9.5.2), reconstructed as
+    // closely as the existing single-country harness allows: a long
+    // multi-region US trip, letting the REAL production stay-skeleton
+    // pipeline (proposeStaySkeletonWithGemini + real Nominatim resolution)
+    // derive the actual multi-city structure rather than hand-building a
+    // TripFrame here.
+    usNewEngland: {
+      key: "usNewEngland",
+      iso: "US",
+      countryName: "United States",
+      startDate: "2026-06-01",
+      endDate: "2026-07-09",
+      budget: 42000,
+      travelers: 2,
+      preferencesOverride: {
+        tripStyle: "sightseeing, culture, food, nature, coastal towns",
+        interests: "history, coastal towns, national parks, food, museums, local neighborhoods, lighthouses",
+        preferredRegions: "New England, New York City",
+        mustVisitPlaces: "Boston, Cape Cod, Portland Maine, Acadia National Park, New York City",
+        transportationPreferences: "mix of driving and public transport",
+      },
+    },
     arrivalDeparture: {
       key: "arrivalDeparture",
       iso: "GR",
@@ -263,6 +290,7 @@ async function runScenario(scenario: Scenario) {
 
   const preferences: TripPreferences = {
     ...BASE_PREFERENCES,
+    ...scenario.preferencesOverride,
     startDate: scenario.startDate,
     endDate: scenario.endDate,
     budget: scenario.budget,
@@ -283,12 +311,28 @@ async function runScenario(scenario: Scenario) {
     overpassAvailable,
   };
 
-  console.log("Generating itinerary (real Gemini calls, may take a while)...");
+  // Round 9.6.1 — this harness calls generateCountryItineraryPlan directly
+  // (bypassing generateAndStoreCountryItinerary, the real DB-writing entry
+  // point that normally opens the trace), so the trace context is opened
+  // here instead, using the exact same call shape, so PLANNER_QA_TRACE
+  // logs carry a real, correlatable traceId instead of "no-trace-context".
+  const traceId = generateRealPlaceTraceId();
+  beginRealPlaceTrace({
+    traceId,
+    countryIso: scenario.iso,
+    tripDays: getTripDayCount(scenario.startDate, scenario.endDate),
+    travelerCount: scenario.travelers,
+  });
+  console.log(`Generating itinerary (real Gemini calls, may take a while)... traceId=${traceId}`);
   const start = Date.now();
-  const result = await generateCountryItineraryPlan(payload);
-  const elapsedSeconds = ((Date.now() - start) / 1000).toFixed(1);
-  console.log(`Done in ${elapsedSeconds}s.`);
-  return result;
+  try {
+    const result = await generateCountryItineraryPlan(payload);
+    const elapsedSeconds = ((Date.now() - start) / 1000).toFixed(1);
+    console.log(`Done in ${elapsedSeconds}s.`);
+    return { result, traceId };
+  } finally {
+    endRealPlaceTrace();
+  }
 }
 
 async function main() {
@@ -303,11 +347,12 @@ async function main() {
       continue;
     }
     try {
-      const result = await runScenario(scenario);
+      const { result, traceId } = await runScenario(scenario);
       const fs = await import("node:fs/promises");
-      const outPath = `/tmp/claude-1000/-home-hilma-Desktop-scratchMap/5cbfe97d-b2b2-4556-b735-9f91521c79f0/scratchpad/qa-${scenario.key}.json`;
-      await fs.writeFile(outPath, JSON.stringify(result, null, 2), "utf8");
-      console.log(`Written to ${outPath}`);
+      const outDir = process.env.QA_OUTPUT_DIR ?? "/tmp/claude-1000/-home-hilma-Desktop-scratchMap/5cbfe97d-b2b2-4556-b735-9f91521c79f0/scratchpad";
+      const outPath = `${outDir}/qa-${scenario.key}.json`;
+      await fs.writeFile(outPath, JSON.stringify({ traceId, result }, null, 2), "utf8");
+      console.log(`Written to ${outPath} (traceId=${traceId})`);
     } catch (error) {
       console.error(`Scenario ${key} FAILED:`, error);
     }

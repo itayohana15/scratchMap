@@ -64,38 +64,38 @@ function buildItinerary(overrides: Partial<CountryItineraryRecord> = {}): Countr
 // English name must never be reordered by the fix itself; only wrapped
 // for correct bidi rendering.
 test("25. bidiName never reorders a multi-word English name — New York stays New York", () => {
-  assert.equal(bidiName("New York"), "<bdi>New York</bdi>");
+  assert.equal(bidiName("New York"), '<bdi dir="auto">New York</bdi>');
 });
 
 test("26. bidiName never reorders San Francisco", () => {
-  assert.equal(bidiName("San Francisco"), "<bdi>San Francisco</bdi>");
+  assert.equal(bidiName("San Francisco"), '<bdi dir="auto">San Francisco</bdi>');
 });
 
 test("27. bidiName never reorders Los Angeles", () => {
-  assert.equal(bidiName("Los Angeles"), "<bdi>Los Angeles</bdi>");
+  assert.equal(bidiName("Los Angeles"), '<bdi dir="auto">Los Angeles</bdi>');
 });
 
 test("28. bidiName never reorders New Orleans", () => {
-  assert.equal(bidiName("New Orleans"), "<bdi>New Orleans</bdi>");
+  assert.equal(bidiName("New Orleans"), '<bdi dir="auto">New Orleans</bdi>');
 });
 
 test("29. Hebrew surrounding text does not reverse the isolated English entity token", () => {
   const testDay = day({ title: "", cityRegion: "New York", accommodation: "" });
   const html = renderDay(testDay);
-  assert.ok(html.includes("<bdi>New York</bdi>"), "the city region must be isolated as one unbroken bdi run");
+  assert.ok(html.includes('<bdi dir="auto">New York</bdi>'), "the city region must be isolated as one unbroken bdi run");
   // The word order inside the isolated run itself must be untouched.
-  const bdiMatch = /<bdi>([^<]*)<\/bdi>/.exec(html);
+  const bdiMatch = /<bdi dir="auto">([^<]*)<\/bdi>/.exec(html);
   assert.equal(bdiMatch?.[1], "New York");
 });
 
 test("bidiName escapes HTML-unsafe characters the same way the rest of the export does", () => {
-  assert.equal(bidiName("Ben & Jerry's"), "<bdi>Ben &amp; Jerry&#039;s</bdi>");
+  assert.equal(bidiName("Ben & Jerry's"), '<bdi dir="auto">Ben &amp; Jerry&#039;s</bdi>');
 });
 
 test("renderItem isolates both the item name and its location text", () => {
   const html = renderItem(item({ name: "Golden Gate Bridge", location: "San Francisco, CA" }));
-  assert.ok(html.includes("<bdi>Golden Gate Bridge</bdi>"));
-  assert.ok(html.includes("<bdi>San Francisco, CA</bdi>"));
+  assert.ok(html.includes('<bdi dir="auto">Golden Gate Bridge</bdi>'));
+  assert.ok(html.includes('<bdi dir="auto">San Francisco, CA</bdi>'));
 });
 
 test("renderDay omits the QA_DEBUG_GEOGRAPHY overlay entirely when no geoDebugContext is given (the default, non-flagged path)", () => {
@@ -122,11 +122,11 @@ test("renderDay's QA_DEBUG_GEOGRAPHY overlay shows a dayTypeMismatch and bidi-is
   const html = renderDay(testDay, { previousDay, isFirstDay: false, isLastDay: false, geoResolutionOverride: null });
 
   assert.ok(html.includes("geo-debug"), "the overlay must render when a geoDebugContext is given");
-  assert.ok(html.includes("derivedDayType=<bdi>transfer</bdi>"), "English diagnostic tokens must get the same bdi isolation as any other foreign-language text in this RTL document");
-  assert.ok(html.includes("textualDayType=<bdi>normal</bdi>"));
+  assert.ok(html.includes('derivedDayType=<bdi dir="auto">transfer</bdi>'), "English diagnostic tokens must get the same bdi isolation as any other foreign-language text in this RTL document");
+  assert.ok(html.includes('textualDayType=<bdi dir="auto">normal</bdi>'));
   assert.ok(html.includes('<strong class="geo-debug-mismatch">dayTypeMismatch=TRUE</strong>'));
-  assert.ok(html.includes("<bdi>Invented Landmark</bdi>") && html.includes("<bdi>provider</bdi>"));
-  assert.ok(html.includes("<bdi>Unplaced Stop</bdi>") && html.includes("<bdi>unresolved</bdi>"));
+  assert.ok(html.includes('<bdi dir="auto">Invented Landmark</bdi>') && html.includes('<bdi dir="auto">provider</bdi>'));
+  assert.ok(html.includes('<bdi dir="auto">Unplaced Stop</bdi>') && html.includes('<bdi dir="auto">unresolved</bdi>'));
 });
 
 test("renderDay's overlay shows a real fuzzyName resolution when a geo-resolution.json override exists, and falls back cleanly without one", () => {
@@ -145,12 +145,12 @@ test("renderDay's overlay shows a real fuzzyName resolution when a geo-resolutio
   };
 
   const withOverride = renderDay(testDay, { previousDay: null, isFirstDay: true, isLastDay: false, geoResolutionOverride: overrideMap });
-  assert.ok(withOverride.includes("<bdi>fuzzyName</bdi>"), "a real override entry must surface the full taxonomy value in the rendered PDF");
+  assert.ok(withOverride.includes('<bdi dir="auto">fuzzyName</bdi>'), "a real override entry must surface the full taxonomy value in the rendered PDF");
 
   // No override file for this trip (the normal case) must never crash and
   // must fall back to the existing degraded computation.
   const withoutOverride = renderDay(testDay, { previousDay: null, isFirstDay: true, isLastDay: false, geoResolutionOverride: null });
-  assert.ok(withoutOverride.includes("<bdi>provider</bdi>"), "with no override, the degraded provider/unresolved computation is the only source");
+  assert.ok(withoutOverride.includes('<bdi dir="auto">provider</bdi>'), "with no override, the degraded provider/unresolved computation is the only source");
   assert.ok(!withoutOverride.includes("fuzzyName"));
 });
 
@@ -207,10 +207,10 @@ test("buildItineraryPdfHtml renders the N/M summary, a geoSource row, an unmatch
   assert.ok(html.includes("1/4 items matched"), "expected exactly 1 of the 4 real-place items to match the override");
 
   // 2. at least one item row with a real geoSource
-  assert.ok(html.includes("<bdi>fuzzyName</bdi>"), "the matched item's geoSource must render");
+  assert.ok(html.includes('<bdi dir="auto">fuzzyName</bdi>'), "the matched item's geoSource must render");
 
   // 3. at least one unmatched case
-  assert.ok(html.includes("<bdi>unmatched</bdi>"), "an item missing from the override file must render as unmatched");
+  assert.ok(html.includes('<bdi dir="auto">unmatched</bdi>'), "an item missing from the override file must render as unmatched");
 
   // 4. at least one dayTypeMismatch case
   assert.ok(
@@ -224,4 +224,128 @@ test("buildItineraryPdfHtml renders the N/M summary, a geoSource row, an unmatch
   console.log(html.slice(summaryStart, summaryStart + 160));
   console.log("---- day 2 geo-debug excerpt ----");
   console.log(html.slice(day2DebugStart, day2DebugStart + 900));
+});
+
+/* ==================================================================== *
+ * ROUND 9.10 — RTL/BIDI RENDERING CORRECTNESS                          *
+ *                                                                        *
+ * Real production evidence (Round 9.8's actual persisted itinerary,     *
+ * refetched — never regenerated): raw data is verified correct          *
+ * ("Bar Harbor", "North Conway", "New York" all stay exactly themselves *
+ * in cityRegion/accommodation/title/transportation fields), but the     *
+ * exported PDF and the on-screen itinerary reportedly rendered them     *
+ * reordered ("Harbor Bar", "Conway North"). Fixed at the rendering      *
+ * boundary only — bidiName()/IsolatedText/isolateText — never by        *
+ * touching the underlying strings.                                      *
+ * ==================================================================== */
+
+// Test A — Bar Harbor inside a Hebrew sentence (the exact real
+// day.accommodation shape: "לינה נוחה באזור Bar Harbor").
+test("Round 9.10 test A: Bar Harbor stays Bar Harbor inside a Hebrew accommodation sentence", () => {
+  const testDay = day({ title: "יום 14 בBar Harbor", cityRegion: "Bar Harbor", accommodation: "לינה נוחה באזור Bar Harbor" });
+  const html = renderDay(testDay);
+  assert.ok(html.includes('<bdi dir="auto">Bar Harbor</bdi>'), "Bar Harbor must be isolated as one unbroken bdi run");
+  const bdiMatches = [...html.matchAll(/<bdi dir="auto">([^<]*)<\/bdi>/g)].map((m) => m[1]);
+  assert.ok(bdiMatches.includes("Bar Harbor"), "internal word order must be exactly 'Bar Harbor', never 'Harbor Bar'");
+});
+
+// Test B — North Conway inside a Hebrew sentence (the exact real
+// day.title shape: "יום 20 בNorth Conway").
+test("Round 9.10 test B: North Conway stays North Conway inside a Hebrew day title", () => {
+  const testDay = day({ title: "יום 20 בNorth Conway", cityRegion: "North Conway", accommodation: "לינה נוחה באזור North Conway" });
+  const html = renderDay(testDay);
+  assert.ok(html.includes('<bdi dir="auto">North Conway</bdi>'), "North Conway must be isolated");
+  assert.ok(!html.includes("Conway North"), "must never appear as the reversed 'Conway North'");
+});
+
+// Test C — New York inside a Hebrew sentence.
+test("Round 9.10 test C: New York stays New York inside a Hebrew sentence", () => {
+  const testDay = day({ title: "יום 33 בNew York", cityRegion: "New York", accommodation: "לינה נוחה באזור New York" });
+  const html = renderDay(testDay);
+  assert.ok(html.includes('<bdi dir="auto">New York</bdi>'));
+  assert.ok(!html.includes("York New"));
+});
+
+// Test D — a long multi-word English POI (the exact real Round 9.8 name).
+test("Round 9.10 test D: a long multi-word English POI preserves full internal word order", () => {
+  const html = renderItem(item({ name: "Harvard Museum of Natural History", location: "Cambridge" }));
+  assert.ok(html.includes('<bdi dir="auto">Harvard Museum of Natural History</bdi>'));
+});
+
+test("Round 9.10 test D2: a second long multi-word English POI (Lower East Side Tenement Museum)", () => {
+  const html = renderItem(item({ name: "Lower East Side Tenement Museum", location: "New York" }));
+  assert.ok(html.includes('<bdi dir="auto">Lower East Side Tenement Museum</bdi>'));
+});
+
+// Test E — an English restaurant name.
+test("Round 9.10 test E: an English restaurant name is isolated correctly", () => {
+  const html = renderItem(item({ category: "restaurant", name: "Thurston's Lobster Pound", location: "Bar Harbor" }));
+  assert.ok(html.includes(bidiName("Thurston's Lobster Pound")));
+});
+
+// Test F — a Hebrew place name is unaffected by the SAME isolation mechanism.
+test("Round 9.10 test F: a Hebrew place name renders unchanged through the same isolation path", () => {
+  const testDay = day({ title: "", cityRegion: "בוסטון", accommodation: "לינה נוחה באזור בוסטון" });
+  const html = renderDay(testDay);
+  assert.ok(html.includes('<bdi dir="auto">בוסטון</bdi>'), "a Hebrew name goes through the identical dir=auto isolation, never a hardcoded dir=ltr that would break it");
+});
+
+// Test G — numeric time unchanged.
+test("Round 9.10 test G: a numeric time (09:00) is unaffected by bidi isolation", () => {
+  const html = renderItem(item({ name: "Sand Beach", plannedStartTime: "09:00" }));
+  assert.ok(html.includes("09:00"), "the time must still render exactly, unwrapped and unreordered");
+});
+
+// Test H — currency unchanged.
+test("Round 9.10 test H: currency formatting is unaffected by bidi isolation", () => {
+  const html = renderItem(item({ name: "Whale Watch Tour", approximatePrice: 150 }));
+  assert.ok(/₪|ILS|150/.test(html), "the price must still render, untouched by any bidi change");
+});
+
+// Tests I/J/K — real inter-stay transfer strings (exact Round 9.8 shape:
+// mode-prefixed Hebrew text + "Origin → Destination", all one opaque
+// item.name string). Isolated as ONE run — the arrow and both endpoints'
+// internal order must survive.
+test("Round 9.10 test I: Boston → Providence transfer order preserved", () => {
+  const html = renderItem(item({ category: "transportation", name: "רכבת: Boston → Providence" }));
+  assert.ok(html.includes('<bdi dir="auto">רכבת: Boston → Providence</bdi>'));
+  const bdiMatch = /<bdi dir="auto">([^<]*)<\/bdi>/.exec(html);
+  assert.equal(bdiMatch?.[1], "רכבת: Boston → Providence");
+});
+
+test("Round 9.10 test J: Providence → Bar Harbor transfer order preserved (the exact real Round 9.8 string)", () => {
+  const html = renderItem(item({ category: "transportation", name: "נסיעה ברכב: Providence → Bar Harbor" }));
+  const bdiMatch = /<bdi dir="auto">([^<]*)<\/bdi>/.exec(html);
+  assert.equal(bdiMatch?.[1], "נסיעה ברכב: Providence → Bar Harbor");
+  assert.ok(bdiMatch![1].indexOf("Providence") < bdiMatch![1].indexOf("Bar Harbor"), "Providence must appear before Bar Harbor");
+});
+
+test("Round 9.10 test K: Bar Harbor → North Conway transfer order preserved (the exact real Round 9.8 string)", () => {
+  const html = renderItem(item({ category: "transportation", name: "נסיעה ברכב: Bar Harbor → North Conway" }));
+  const bdiMatch = /<bdi dir="auto">([^<]*)<\/bdi>/.exec(html);
+  assert.equal(bdiMatch?.[1], "נסיעה ברכב: Bar Harbor → North Conway");
+});
+
+// Test L — mixed English + number name.
+test("Round 9.10 test L: a mixed English + number name is preserved exactly", () => {
+  const html = renderItem(item({ name: "Route 66 Diner" }));
+  assert.ok(html.includes('<bdi dir="auto">Route 66 Diner</bdi>'));
+});
+
+// Test M — punctuation around isolated LTR text (comma, ampersand).
+test("Round 9.10 test M: punctuation around an isolated name survives (comma, ampersand)", () => {
+  const html = renderItem(item({ name: "Ben & Jerry's", location: "Cambridge, MA" }));
+  assert.ok(html.includes(bidiName("Ben & Jerry's")));
+  assert.ok(html.includes(bidiName("Cambridge, MA")));
+});
+
+// Round 9.10 §B — refetched Round 9.8 raw-data invariant, exercised
+// directly against the real render functions (no regeneration involved).
+test("Round 9.10: the Round 9.8 refetched raw strings (Bar Harbor, North Conway) survive the full renderDay pipeline unchanged", () => {
+  for (const name of ["Bar Harbor", "North Conway", "New York", "Providence", "Philadelphia"]) {
+    const testDay = day({ title: `יום 1 ב${name}`, cityRegion: name, accommodation: `לינה נוחה באזור ${name}` });
+    const html = renderDay(testDay);
+    const matches = [...html.matchAll(/<bdi dir="auto">([^<]*)<\/bdi>/g)].map((m) => m[1]);
+    assert.ok(matches.includes(name), `${name} must appear as one unbroken, correctly-ordered bdi run`);
+  }
 });
